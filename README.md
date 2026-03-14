@@ -16,6 +16,13 @@ Most modern music players are Electron apps or .NET wrappers that eat 200MB of R
 
 ---
 
+## Screenshots
+
+> ![BillyPro Screenshot 1](screenshot_1.png)
+> ![BillyPro Screenshot 2](screenshot_2.png)
+
+---
+
 ## Features
 
 ### ⚡ Performance
@@ -55,12 +62,6 @@ Most modern music players are Electron apps or .NET wrappers that eat 200MB of R
 - Full tag viewer - title, artist, album, year, genre, comment
 - **Embedded artwork** display with save-to-file support
 - Bitrate, sample rate, channels, duration, file size at a glance
-
----
-
-## Screenshots
-
-> ![BillyPro Screenshot](screenshot_1.png)
 
 ---
 
