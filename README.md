@@ -1,3 +1,9 @@
+<p align="center">
+  <img src="logo.png" alt="BillyPro" width="120"/>
+</p>
+
+# BillyPro 🎵
+
 # BillyPro 🎵
 
 **A blazing-fast, lightweight music player for Windows - inspired by the legendary BillyMp3.**
