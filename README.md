@@ -60,7 +60,7 @@ Most modern music players are Electron apps or .NET wrappers that eat 200MB of R
 
 ## Screenshots
 
-> *Coming soon*
+> ![BillyPro Screenshot](screenshot_1.png)
 
 ---
 
