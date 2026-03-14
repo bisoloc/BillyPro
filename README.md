@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" alt="BillyPro" width="120"/>
+  <img src="logo.png" alt="BillyPro" width="240"/>
 </p>
 
 # BillyPro
