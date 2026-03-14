@@ -6,6 +6,8 @@
 
 **A blazing-fast, lightweight music player for Windows - inspired by the legendary BillyMp3.**
 
+[![Download](https://img.shields.io/badge/Download-Latest%20Release-orange?style=for-the-badge)](../../releases/latest)
+
 ![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Language](https://img.shields.io/badge/language-C%2B%2B-informational) ![RAM](https://img.shields.io/badge/RAM-%3C5MB-brightgreen) ![CPU](https://img.shields.io/badge/CPU-~0%25-brightgreen) ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 ---
