@@ -121,4 +121,19 @@ BillyPro is built on the principle that a music player should be invisible. You 
 
 ---
 
+## License
+
+BillyPro License
+
+Copyright (c) 2026
+
+Permission is granted to use, study, and modify this software for
+personal, educational, and non-commercial purposes.
+
+Commercial use, resale, sublicensing, or use of this software
+or its source code in any commercial product or service is
+strictly prohibited without explicit written permission.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+
 *BillyPro v0.2 - small by design.*
