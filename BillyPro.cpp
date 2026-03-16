@@ -1,4 +1,4 @@
-// BillyPro.cpp  -  Win32 + BASS audio player  v4
+// BillyPro.cpp  -  Win32 + BASS audio player  v0.4
 // Compile:
 //   cl BillyPro.cpp /W3 /O2 /link bass.lib User32.lib Gdi32.lib
 //          Comctl32.lib Shell32.lib Ole32.lib Winmm.lib Uxtheme.lib
@@ -21,6 +21,7 @@
 #include <commdlg.h>
 #include <cmath>
 #include <cwchar>
+#include <string>
 #include <vector>
 #include <algorithm>
 #include "bass.h"
@@ -34,6 +35,9 @@
 #pragma comment(lib, "Uxtheme.lib")
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "Comdlg32.lib")
+#pragma comment(lib, "dwmapi.lib")
+#include <dwmapi.h>
+#include <shobjidl.h>
 
 // ============================================================
 //  IDs
@@ -56,6 +60,8 @@
 #define ID_BTN_MONO         123
 #define ID_BTN_NORMALIZE    124
 #define ID_BTN_BASSBOOST    125
+#define ID_BTN_MEDIA        126
+#define ID_BTN_DSP          127
 #define IDM_HELP_CONTROLS   2302
 #define IDM_OPTIONS         2401
 #define IDM_OPTIONS_SHOW    2402
@@ -63,8 +69,9 @@
 // Context menu
 #define IDC_CTX_PLAY        301
 #define IDC_CTX_REMOVE      302
-#define IDC_CTX_PROPERTIES  303  // Windows shell Properties
-#define IDC_CTX_AUDIOINFO   304  // Our custom audio info dialog
+#define IDC_CTX_PROPERTIES    303  // Windows shell Properties
+#define IDC_CTX_AUDIOINFO     304  // Our custom audio info dialog
+#define IDC_CTX_OPENLOCATION  305  // Open containing folder in Explorer
 
 // Search dialog
 #define ID_SEARCH_EDIT      201
@@ -111,6 +118,8 @@
 #define IDT_PEAK_METER      4   // audio peak meter always-running
 #define WM_PLAYNEXT         (WM_APP + 1)
 #define WM_TRAYICON         (WM_APP + 2)
+#define WM_CONV_PROGRESS    (WM_APP + 3)   // wParam=files done, lParam=MAKELPARAM(fileIdx,total)
+#define WM_CONV_DONE        (WM_APP + 4)   // wParam=ok count, lParam=total
 #define ID_TRAY_RESTORE     601
 #define ID_TRAY_EXIT        602
 #ifndef IDC_STATIC
@@ -126,6 +135,27 @@
 #define IDM_PLAY_SHUFFLE    2105
 #define IDM_PLAY_REPEAT     2106
 #define IDM_HELP_ABOUT      2301
+// View menu
+#define IDM_VIEW_DARKMODE       2201
+// M3U playlist
+#define IDM_FILE_OPENM3U        2005
+#define IDM_FILE_SAVEM3U        2006
+// Options extras
+#define IDM_OPTIONS_FILEASSOC   2403
+#define IDM_OPTIONS_MULTIINST   2404
+// Hotkey IDs (for RegisterHotKey - must be unique)
+#define ID_HOTKEY_PLAYPAUSE     801
+#define ID_HOTKEY_NEXT          802
+#define ID_HOTKEY_PREV          803
+#define ID_HOTKEY_STOP          804
+// File association dialog controls
+#define ID_ASSOC_LIST           701
+#define ID_ASSOC_SELALL         702
+#define ID_ASSOC_NONE           703
+#define ID_ASSOC_APPLY          704
+#define ID_ASSOC_CLOSE          705
+// WM_COPYDATA payload ID for IPC (open file in existing instance)
+#define COPYDATAID_OPENFILE     1
 
 // Resource icon ID - matches BillyPro.rc: IDI_BILLYPRO ICON "BillyPro.ico"
 // Include resource.h if it's in your project, otherwise use the numeric ID from it.
@@ -139,6 +169,19 @@ static const Theme LIGHT = {
     0xF0F0F0, 0xFFFFFF, 0x1A1A1A, 0x505050,
     0x00D2781E, 0xCCCCCC,  // accent: blue #1E78D2
     0xE1E1E1, 0xADADAD, 0x1A1A1A
+};
+// Dark mode: charcoal background, off-white text, blue accent
+// COLORREFs are 0x00BBGGRR
+static const Theme DARK = {
+    0x00202020,  // bg       #202020
+    0x002A2A2A,  // bgList   #2A2A2A
+    0x00F0F0F0,  // text     #F0F0F0
+    0x00909090,  // textDim  #909090
+    0x00D2781E,  // accent   #1E78D2  (same blue)
+    0x00404040,  // seekTrk  #404040
+    0x00303030,  // btnFace  #303030
+    0x00585858,  // btnBorder #585858
+    0x00E8E8E8   // btnSym   #E8E8E8
 };
 
 
@@ -162,6 +205,7 @@ HWND hRepeatBtn = NULL;
 HWND hMonoBtn = NULL;
 HWND hNormalizeBtn = NULL;
 HWND hBassBoostBtn = NULL;
+HWND hMediaBtn     = NULL;
 HWND hVolumeCanvas = NULL;
 HWND hSeekCanvas = NULL;
 HWND hTimeCur = NULL;
@@ -178,14 +222,43 @@ bool    g_mono = false;
 bool    g_normalize = false;
 wchar_t g_iniPath[MAX_PATH] = L"";
 bool    g_bassBoost = false;
+wchar_t g_mediaFolder[MAX_PATH] = L"";   // first folder (kept in sync with g_mediaFolders[0])
+std::vector<std::wstring> g_mediaFolders; // all configured media root folders
+bool    g_mediaActive = false;
+bool    g_pitchEnabled = false;
+float   g_pitchSemitones = 0.0f;  // -12 to +12 semitones (CDJ-style: changes pitch + tempo)
 float   g_bbFreqLow = 30.0f;   // Hz
 float   g_bbFreqHigh = 100.0f;  // Hz
 float   g_bbGainDB = 5.0f;    // dB
 // Recording
 wchar_t g_recOutDir[MAX_PATH] = L"";
+// Extra DSP effects
+bool  g_dspReverb   = false;
+bool  g_dspSaturate = false;
+bool  g_dspVinyl    = false;
+bool  g_dspHifi     = false;
+bool  g_dspBypass   = false;   // true = DSP button bypasses all extra effects
+HWND  hDspBtn       = NULL;
+// Reverb params
+float g_revMix    = 8.0f;    // 0-100  wet %
+float g_revRoom   = 75.0f;   // 0-100  room size (maps to feedback 0.5-0.96)
+float g_revWidth  = 80.0f;   // 0-100  stereo width (0=mono reverb, 100=full stereo)
+// Saturation params
+float g_satDrive  = 1.6f;    // 1.0-5.0  drive
+float g_satLevel  = 72.0f;   // 0-100  output level %
+// Vinyl params
+float g_vinLpFreq = 17500.0f; // 2000-20000 Hz  LP cutoff
+float g_vinCrackle= 15.0f;   // 0-100  crackle amount
+// HiFi Amplifier params
+float g_hfiBassDb = 3.0f;    // 0-12 dB  bass shelf boost
+float g_hfiWarmth = 33.0f;   // 0-100  tube saturation %
 // DSP handles
-HDSP    g_dspMono = 0;
-HDSP    g_dspBass = 0;
+HDSP    g_dspMono   = 0;
+HDSP    g_dspBass   = 0;
+HDSP    g_dspRevHdl = 0;
+HDSP    g_dspSatHdl = 0;
+HDSP    g_dspVinHdl = 0;
+HDSP    g_dspHfiHdl = 0;
 
 bool    g_seekDragging = false;
 double  g_seekDragPos = 0.0;
@@ -201,28 +274,42 @@ float   g_peakHold = 0.0f;     // held peak marker 0..1
 
 bool    g_seekKeyHeld = false;
 int     g_seekKeyDir = 0;
+int     g_seekRepeatCount = 0;   // how many IDT_SEEK_REPEAT ticks have fired (for fast-seek)
+float   g_seekStep = 5.0f;   // seconds to skip with left/right arrow keys
 
 Theme   g_theme = LIGHT;
 
-static WNDPROC g_OldListProc = NULL;
-static WNDPROC g_OldBtnProc = NULL;
+static WNDPROC g_OldListProc   = NULL;
+static WNDPROC g_OldBtnProc    = NULL;
+static WNDPROC g_OldStatusProc = NULL;
 static HWND    g_hoveredBtn = NULL;
 
 static WNDPROC g_OldSearchProc = NULL;
 
 struct Track { wchar_t path[MAX_PATH]; wchar_t display[MAX_PATH]; };
 std::vector<Track> g_playlist;
+std::vector<Track> g_savedPlaylist;  // saved when media view is active
 std::vector<int>   g_shuffleOrder;
+struct UndoRemove { Track t; int idx; };
+std::vector<UndoRemove> g_undoRemove;  // last batch of removed tracks (for Ctrl+Z)
 int g_currentIndex = -1;
 
+struct MediaBrowserItem { wchar_t path[MAX_PATH]; wchar_t display[MAX_PATH]; bool isDir; };
+std::vector<MediaBrowserItem> g_browserItems;
+bool   g_browserActive = false;
+wchar_t g_browserPath[MAX_PATH] = {};
+
 // Right-click context track index
-int g_ctxTrackIndex = -1;
+int  g_ctxTrackIndex  = -1;
+bool g_ctxIsBrowser   = false;          // true when context menu was opened in browser mode
+wchar_t g_ctxFilePath[MAX_PATH] = {};   // file path for the right-clicked item (works in both modes)
 
 HFONT  g_fontUI = NULL;
 HFONT  g_fontMono = NULL;
 HFONT  g_fontBold = NULL;
-HBRUSH g_brBg = NULL;
+HBRUSH g_brBg   = NULL;
 HBRUSH g_brList = NULL;
+HBRUSH g_brMenu = NULL;
 
 HWND   g_hwndSearch = NULL;
 HWND   hSearchEdit = NULL;
@@ -237,7 +324,24 @@ static bool  g_lbDragMoved = false;  // did mouse move enough to be a drag?
 
 HWND   g_hwndInfo = NULL;   // audio info window
 HWND   g_hwndConvert = NULL; // convert window
-bool   g_trayAdded = false;  // system tray icon active
+static HANDLE g_convThread    = NULL;
+static bool   g_convRunning   = false;
+static bool   g_convAbort     = false;
+static DWORD  g_convStartTick = 0;
+bool   g_trayAdded    = false;   // system tray icon active
+bool   g_darkMode     = false;   // dark theme enabled
+bool   g_multiInst    = false;   // allow multiple instances (default: replace session)
+bool   g_dropAppend   = true;    // drag & drop appends to playlist (false = replace)
+HWND   g_hwndAssoc    = NULL;    // file associations dialog
+HWND   g_hwndOptions  = NULL;    // options dialog
+
+// Taskbar thumbnail toolbar (play/pause/skip controls)
+static ITaskbarList3* g_pTaskbar          = NULL;
+static HICON          g_thumbIcons[4]     = {};  // 0=prev, 1=play, 2=pause, 3=next
+static UINT           g_WM_TASKBARBUTTONCREATED = 0;
+#define THUMB_BTN_PREV   0
+#define THUMB_BTN_PLAY   1
+#define THUMB_BTN_NEXT   2
 
 // ============================================================
 //  Forward declarations
@@ -258,13 +362,18 @@ void UpdateVolume();
 void LayoutControls(HWND hwnd);
 
 void ApplyTheme();
+static void MenuInitOwnerDraw(HMENU hm);
 void RebuildShuffleOrder();
 void UpdateWindowTitle();
 void OpenSearchDialog();
 void OpenAudioInfoDialog(int trackIdx);
+void OpenAudioInfoForPath(const wchar_t* path);
 void ShowTrackContextMenu(HWND hwnd, int trackIdx, POINT pt);
 LRESULT CALLBACK SearchWndProc(HWND, UINT, WPARAM, LPARAM);
 void OpenConvertDialog();
+void OpenFileAssocDialog();
+void OpenOptionsDialog();
+void UpdateThumbButtons();
 // KEY FIX: global accelerator-style message pre-filter
 bool HandleGlobalKey(WPARAM vk);
 
@@ -275,7 +384,11 @@ static void FormatTime(double sec, wchar_t* out, size_t n)
 {
     if (sec < 0 || !_finite(sec)) { wcsncpy_s(out, n, L"--:--", _TRUNCATE); return; }
     int t = (int)sec;
-    swprintf_s(out, n, L"%d:%02d", t / 60, t % 60);
+    int h = t / 3600, m = (t % 3600) / 60, s = t % 60;
+    if (h > 0)
+        swprintf_s(out, n, L"%d:%02d:%02d", h, m, s);
+    else
+        swprintf_s(out, n, L"%d:%02d", m, s);
 }
 
 static const wchar_t* Filename(const wchar_t* p)
@@ -304,6 +417,130 @@ void ClearPlaylist()
 {
     g_playlist.clear(); g_shuffleOrder.clear(); g_currentIndex = -1;
     if (hListBox) SendMessage(hListBox, LB_RESETCONTENT, 0, 0);
+}
+
+// Returns true if 'dir' is one of the configured media root folders
+static bool IsMediaRoot(const wchar_t* dir)
+{
+    for (auto& f : g_mediaFolders)
+        if (_wcsicmp(dir, f.c_str()) == 0) return true;
+    return false;
+}
+
+// Media folder browser — fills listbox with folder contents (dirs first, then audio files).
+// Pass empty string "" to show the virtual root (all configured media folders).
+static void FillBrowser(const wchar_t* dirIn)
+{
+    // Make a local copy BEFORE clearing g_browserItems — the caller may have passed
+    // a pointer into the vector's storage (e.g. it.path), which would be invalidated
+    // by the clear() / push_back() calls below.
+    wchar_t dir[MAX_PATH];
+    wcsncpy_s(dir, dirIn, _TRUNCATE);
+
+    wcsncpy_s(g_browserPath, dir, _TRUNCATE);
+    g_browserItems.clear();
+    if (hListBox) SendMessage(hListBox, LB_RESETCONTENT, 0, 0);
+
+    // Virtual root: list all configured media folders as directory entries
+    if (dir[0] == L'\0') {
+        for (auto& f : g_mediaFolders) {
+            MediaBrowserItem it = {};
+            wcsncpy_s(it.path, f.c_str(), _TRUNCATE);
+            _snwprintf_s(it.display, _countof(it.display), _TRUNCATE, L"[+] %s", f.c_str());
+            it.isDir = true;
+            g_browserItems.push_back(it);
+            if (hListBox) SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)it.display);
+        }
+        return;
+    }
+
+    // "[..] go back" entry
+    if (IsMediaRoot(dir)) {
+        // At a root folder: go back to virtual root (only meaningful when multiple folders)
+        if (g_mediaFolders.size() > 1) {
+            MediaBrowserItem up = {}; wcscpy_s(up.display, L"[..] (go back)");
+            up.isDir = true; up.path[0] = L'\0'; // empty = virtual root
+            g_browserItems.push_back(up);
+            if (hListBox) SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)up.display);
+        }
+    } else {
+        // Inside a subfolder: go up to parent
+        MediaBrowserItem up = {}; wcscpy_s(up.display, L"[..] (go back)"); up.isDir = true;
+        wchar_t parent[MAX_PATH]; wcsncpy_s(parent, dir, _TRUNCATE);
+        wchar_t* sl = wcsrchr(parent, L'\\');
+        if (sl) *sl = L'\0';
+        wcsncpy_s(up.path, parent, _TRUNCATE);
+        g_browserItems.push_back(up);
+        if (hListBox) SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)up.display);
+    }
+
+    // Enumerate directories first
+    wchar_t pat[MAX_PATH + 4];
+    _snwprintf_s(pat, _countof(pat), _TRUNCATE, L"%s\\*", dir);
+    WIN32_FIND_DATA fd; HANDLE hf = FindFirstFile(pat, &fd);
+    if (hf != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.cFileName[0] == L'.') continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                MediaBrowserItem it = {};
+                _snwprintf_s(it.path, _countof(it.path), _TRUNCATE, L"%s\\%s", dir, fd.cFileName);
+                _snwprintf_s(it.display, _countof(it.display), _TRUNCATE, L"[+] %s", fd.cFileName);
+                it.isDir = true;
+                g_browserItems.push_back(it);
+                if (hListBox) SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)it.display);
+            }
+        } while (FindNextFile(hf, &fd));
+        FindClose(hf);
+    }
+
+    // Then audio files
+    hf = FindFirstFile(pat, &fd);
+    if (hf != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.cFileName[0] == L'.') continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            wchar_t full[MAX_PATH];
+            _snwprintf_s(full, _countof(full), _TRUNCATE, L"%s\\%s", dir, fd.cFileName);
+            if (IsAudio(full)) {
+                MediaBrowserItem it = {};
+                wcsncpy_s(it.path, full, _TRUNCATE);
+                wcsncpy_s(it.display, fd.cFileName, _TRUNCATE);
+                it.isDir = false;
+                g_browserItems.push_back(it);
+                if (hListBox) SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)it.display);
+            }
+        } while (FindNextFile(hf, &fd));
+        FindClose(hf);
+    }
+}
+
+// Navigate a browser item: enter folder or load/play audio file
+static void BrowserNavigate(int idx)
+{
+    if (idx < 0 || idx >= (int)g_browserItems.size()) return;
+    // Copy item by value — FillBrowser will clear g_browserItems, invalidating any reference/pointer into it
+    MediaBrowserItem it = g_browserItems[idx];
+    if (it.isDir) {
+        FillBrowser(it.path);
+    } else {
+        // Build playlist silently from browser audio files (for next/prev), stay in browser mode
+        wchar_t clickedPath[MAX_PATH]; wcsncpy_s(clickedPath, it.path, _TRUNCATE);
+        g_playlist.clear();
+        g_shuffleOrder.clear();
+        g_currentIndex = -1;
+        int foundIdx = -1;
+        for (auto& bi : g_browserItems) {
+            if (!bi.isDir) {
+                Track t = {}; wcsncpy_s(t.path, bi.path, _TRUNCATE);
+                wcsncpy_s(t.display, bi.display, _TRUNCATE);
+                if (_wcsicmp(t.path, clickedPath) == 0) foundIdx = (int)g_playlist.size();
+                g_playlist.push_back(t);
+            }
+        }
+        RebuildShuffleOrder();
+        // Play — g_browserActive stays true, so PlayIndex won't touch the listbox
+        if (foundIdx >= 0) PlayIndex(foundIdx);
+    }
 }
 
 void AddTrack(const wchar_t* path)
@@ -405,15 +642,253 @@ void CALLBACK DSP_BassBoost(HDSP handle, DWORD channel, void* buffer, DWORD leng
 }
 
 // ============================================================
+//  Extra DSP effects
+// ============================================================
+
+// --- Reverb (4 comb + 2 all-pass per channel, Freeverb stereo) ---
+// R channel uses +23-sample delay offsets so L and R tails diverge even on mono input
+static const int REV_COMB_L[4] = { 1557, 1617, 1491, 1422 };
+static const int REV_COMB_R[4] = { 1580, 1640, 1514, 1445 }; // +23 Freeverb offset
+static const int REV_AP_L[2]   = { 225, 341 };
+static const int REV_AP_R[2]   = { 236, 352 };                // +11 offset
+static float g_revCombBufL[4][1700]={}, g_revCombBufR[4][1700]={};
+static float g_revApBufL[2][400]={},    g_revApBufR[2][400]={};
+static int   g_revCombPosL[4]={}, g_revCombPosR[4]={};
+static int   g_revApPosL[2]={},   g_revApPosR[2]={};
+
+void CALLBACK DSP_Reverb(HDSP handle, DWORD channel, void* buffer, DWORD length, void* user)
+{
+    float* buf  = (float*)buffer;
+    DWORD  n    = length / sizeof(float);
+    float wet    = g_revMix   / 100.0f;
+    float fb     = 0.50f + (g_revRoom  / 100.0f) * 0.46f;  // 0.50-0.96
+    float wscale = g_revWidth / 200.0f;   // 0-0.5 for width matrix
+    float dry    = 1.0f - wet;
+    for (DWORD i = 0; i + 1 < n; i += 2) {
+        float inL = buf[i], inR = buf[i + 1];
+        float outL = 0, outR = 0;
+        for (int c = 0; c < 4; c++) {
+            float dL = g_revCombBufL[c][g_revCombPosL[c]];
+            float dR = g_revCombBufR[c][g_revCombPosR[c]];
+            g_revCombBufL[c][g_revCombPosL[c]] = inL + dL * fb;
+            g_revCombBufR[c][g_revCombPosR[c]] = inR + dR * fb;
+            if (++g_revCombPosL[c] >= REV_COMB_L[c]) g_revCombPosL[c] = 0;
+            if (++g_revCombPosR[c] >= REV_COMB_R[c]) g_revCombPosR[c] = 0;
+            outL += dL; outR += dR;
+        }
+        outL *= 0.25f; outR *= 0.25f;
+        for (int a = 0; a < 2; a++) {
+            float dL = g_revApBufL[a][g_revApPosL[a]];
+            float dR = g_revApBufR[a][g_revApPosR[a]];
+            g_revApBufL[a][g_revApPosL[a]] = outL + dL * 0.5f;
+            g_revApBufR[a][g_revApPosR[a]] = outR + dR * 0.5f;
+            if (++g_revApPosL[a] >= REV_AP_L[a]) g_revApPosL[a] = 0;
+            if (++g_revApPosR[a] >= REV_AP_R[a]) g_revApPosR[a] = 0;
+            outL = dL - outL * 0.5f;
+            outR = dR - outR * 0.5f;
+        }
+        // Width matrix: 0=mono reverb, 100=full L/R separation (great for mono→stereo)
+        float wL = outL * (0.5f + wscale) + outR * (0.5f - wscale);
+        float wR = outR * (0.5f + wscale) + outL * (0.5f - wscale);
+        buf[i]     = dry * inL + wet * wL;
+        buf[i + 1] = dry * inR + wet * wR;
+    }
+}
+
+// --- Saturation (soft-clip waveshaper, tube warmth) ---
+// Crossover LP state for saturation (200 Hz split)
+static float g_satLpL = 0, g_satLpR = 0;
+
+void CALLBACK DSP_Saturate(HDSP handle, DWORD channel, void* buffer, DWORD length, void* user)
+{
+    float* buf  = (float*)buffer;
+    DWORD  n    = length / sizeof(float);
+    float drive = g_satDrive;
+    float wet   = (g_satLevel / 100.0f) * 0.35f;  // full wet for highs
+    float dry   = 1.0f - wet;
+    // 1-pole LP at 200 Hz — splits bass from mids/highs
+    const float lpA = expf(-6.28318f * 200.0f / 44100.0f);  // ~0.972
+    for (DWORD i = 0; i + 1 < n; i += 2) {
+        float inL = buf[i], inR = buf[i + 1];
+        // Low band (under 200 Hz)
+        g_satLpL = lpA * g_satLpL + (1.0f - lpA) * inL;
+        g_satLpR = lpA * g_satLpR + (1.0f - lpA) * inR;
+        float loL = g_satLpL, loR = g_satLpR;
+        // High band (200 Hz and up)
+        float hiL = inL - loL, hiR = inR - loR;
+        // Saturate high band normally, low band at only 5%
+        float satHiL = hiL * drive; satHiL = satHiL / (1.0f + fabsf(satHiL));
+        float satHiR = hiR * drive; satHiR = satHiR / (1.0f + fabsf(satHiR));
+        float satLoL = loL * drive; satLoL = satLoL / (1.0f + fabsf(satLoL));
+        float satLoR = loR * drive; satLoR = satLoR / (1.0f + fabsf(satLoR));
+        buf[i]     = (hiL * dry + satHiL * wet) + (loL * 0.95f + satLoL * 0.05f);
+        buf[i + 1] = (hiR * dry + satHiR * wet) + (loR * 0.95f + satLoR * 0.05f);
+    }
+}
+
+// --- Vinyl Emulation (high-freq roll-off + smooth crackle pops + surface hiss + M-S stereo) ---
+static float g_vinLpL        = 0, g_vinLpR       = 0;
+static float g_vinHissL      = 0, g_vinHissR      = 0;
+static DWORD g_vinCrackTimer = 0;
+static float g_vinCrackEnvL  = 0, g_vinCrackEnvR  = 0;
+static float g_vinCrackDecay = 0.993f;
+// Subtle chorus on side channel (M-S stereo field)
+static float g_vinChorusBuf[1024] = {};
+static int   g_vinChorusPos  = 0;
+static float g_vinChorusLFO  = 0.0f;  // phase 0..1
+// Subtle pitch wobble on mid (mono)
+static float g_vinMidBuf[512] = {};
+static int   g_vinMidPos  = 0;
+static float g_vinMidLFO  = 0.5f;  // offset from side LFO to avoid sync
+
+void CALLBACK DSP_Vinyl(HDSP handle, DWORD channel, void* buffer, DWORD length, void* user)
+{
+    float* buf = (float*)buffer;
+    DWORD  n   = length / sizeof(float);
+
+    float freq       = max(500.0f, min(20000.0f, g_vinLpFreq));
+    float alpha      = expf(-6.28318f * freq / 44100.0f);
+    float crackScale = g_vinCrackle / 100.0f;
+    // Surface hiss amplitude: subtle baseline + crackle-scaled component
+    float hissAmp    = 0.0003f + crackScale * 0.0018f;
+    // Hiss LP alpha: ~5 kHz rolloff for warm surface noise character
+    const float hA   = expf(-6.28318f * 5000.0f / 44100.0f);
+
+    for (DWORD i = 0; i + 1 < n; i += 2) {
+        // HF roll-off on signal
+        g_vinLpL = alpha * g_vinLpL + (1.0f - alpha) * buf[i];
+        g_vinLpR = alpha * g_vinLpR + (1.0f - alpha) * buf[i + 1];
+        buf[i]     = g_vinLpL;
+        buf[i + 1] = g_vinLpR;
+
+        // ── M-S stereo field ──────────────────────────────────────────────
+        float mid  = (buf[i] + buf[i + 1]) * 0.5f;
+        float side = (buf[i] - buf[i + 1]) * 0.5f;
+
+        // Gentle saturation on mid (warm mono core, like a slightly overdriven tube)
+        mid = mid / (1.0f + fabsf(mid) * 0.5f) * 1.08f;
+
+        // Barely noticeable pitch wobble on mid — slow warble like an old turntable
+        g_vinMidBuf[g_vinMidPos] = mid;
+        float midLfo = sinf(g_vinMidLFO * 6.28318f);
+        g_vinMidLFO += 0.6f / 44100.0f;    // 0.6 Hz — slow wow, more noticeable
+        if (g_vinMidLFO >= 1.0f) g_vinMidLFO -= 1.0f;
+        float midDelay = 20.0f + midLfo * 18.0f;  // wider sweep, more pitch movement
+        int   md0  = (int)midDelay;
+        float mfrac = midDelay - (float)md0;
+        float m0 = g_vinMidBuf[(g_vinMidPos - md0 + 512) & 511];
+        float m1 = g_vinMidBuf[(g_vinMidPos - md0 - 1 + 512) & 511];
+        mid = m0 + mfrac * (m1 - m0);
+        g_vinMidPos = (g_vinMidPos + 1) & 511;
+
+        // Subtle chorus on side channel only (~2% depth, barely noticeable)
+        g_vinChorusBuf[g_vinChorusPos] = side;
+        float lfo = sinf(g_vinChorusLFO * 6.28318f);
+        g_vinChorusLFO += 0.35f / 44100.0f;   // 0.35 Hz LFO rate
+        if (g_vinChorusLFO >= 1.0f) g_vinChorusLFO -= 1.0f;
+        float delaySmp = 485.0f + lfo * 88.0f;  // ~11ms base ± 2ms depth
+        int   d0   = (int)delaySmp;
+        float frac = delaySmp - (float)d0;
+        float s0   = g_vinChorusBuf[(g_vinChorusPos - d0 + 1024) & 1023];
+        float s1   = g_vinChorusBuf[(g_vinChorusPos - d0 - 1 + 1024) & 1023];
+        float chorSide = s0 + frac * (s1 - s0);
+        g_vinChorusPos = (g_vinChorusPos + 1) & 1023;
+        side = side * 0.90f + chorSide * 0.10f;  // 10% wet
+
+        // Reconstruct L/R
+        buf[i]     = mid + side;
+        buf[i + 1] = mid - side;
+
+        if (crackScale > 0.0f) {
+            // Surface hiss: independent L/R noise through warm LP
+            float nL = ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+            float nR = ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+            g_vinHissL = hA * g_vinHissL + (1.0f - hA) * nL;
+            g_vinHissR = hA * g_vinHissR + (1.0f - hA) * nR;
+            buf[i]     += g_vinHissL * hissAmp;
+            buf[i + 1] += g_vinHissR * hissAmp;
+
+            // Crackle/pop envelope decay
+            g_vinCrackEnvL *= g_vinCrackDecay;
+            g_vinCrackEnvR *= g_vinCrackDecay;
+
+            // Apply crackle with warm soft-clip (removes harsh transient edge)
+            float cL = g_vinCrackEnvL, cR = g_vinCrackEnvR;
+            buf[i]     += cL / (1.0f + fabsf(cL) * 6.0f);
+            buf[i + 1] += cR / (1.0f + fabsf(cR) * 6.0f);
+
+            // Schedule next crackle event
+            if (g_vinCrackTimer == 0) {
+                // Interval: sparse at low crackle, denser at high — with wide randomness
+                DWORD baseInt = (DWORD)(44100.0f * 1.8f / max(0.01f, crackScale));
+                g_vinCrackTimer = baseInt / 3 + (DWORD)(rand() % (baseInt * 2 + 1));
+
+                // Amplitude varies per pop
+                float amp = crackScale * (0.03f + (rand() % 90) * 0.001f);
+
+                // Decay time: 20-100ms so crackles fade naturally, not click
+                int decaySmp = 880 + rand() % 3530;  // 20ms to 100ms @ 44100
+                g_vinCrackDecay = expf(-1.0f / (float)decaySmp);
+
+                // Side pop: one channel dominant, other gets warm bleed
+                float dominant = 0.55f + (rand() % 45) * 0.01f;   // 0.55-1.0
+                float bleed    = (rand() % 35) * 0.01f;            // 0.0-0.34
+                if (rand() & 1) {
+                    g_vinCrackEnvL += amp * dominant;
+                    g_vinCrackEnvR += amp * bleed;
+                } else {
+                    g_vinCrackEnvL += amp * bleed;
+                    g_vinCrackEnvR += amp * dominant;
+                }
+            }
+            if (g_vinCrackTimer > 0) g_vinCrackTimer--;
+        }
+    }
+}
+
+// --- HiFi Amplifier (warm bass shelf + soft saturation) ---
+static float g_hfiBssL = 0, g_hfiBssR = 0;
+
+void CALLBACK DSP_Hifi(HDSP handle, DWORD channel, void* buffer, DWORD length, void* user)
+{
+    float* buf = (float*)buffer;
+    DWORD  n   = length / sizeof(float);
+    const float alpha   = 0.9888f;   // 1-pole LP ~80 Hz @ 44100 Hz (fixed shelf freq)
+    float bassAdd = (powf(10.0f, g_hfiBassDb / 20.0f) - 1.0f);  // linear gain to add
+    float warmth  = (g_hfiWarmth / 100.0f) * 0.8f;               // 0-0.8 soft-clip coeff
+    for (DWORD i = 0; i + 1 < n; i += 2) {
+        float inL = buf[i], inR = buf[i + 1];
+        g_hfiBssL = alpha * g_hfiBssL + (1.0f - alpha) * inL;
+        g_hfiBssR = alpha * g_hfiBssR + (1.0f - alpha) * inR;
+        float outL = inL + g_hfiBssL * bassAdd;
+        float outR = inR + g_hfiBssR * bassAdd;
+        if (warmth > 0.0f) {
+            buf[i]     = outL / (1.0f + fabsf(outL) * warmth);
+            buf[i + 1] = outR / (1.0f + fabsf(outR) * warmth);
+        } else {
+            buf[i]     = outL;
+            buf[i + 1] = outR;
+        }
+    }
+}
+
+// ============================================================
 //  INI settings
 // ============================================================
 static void GetIniPath()
 {
     if (g_iniPath[0]) return;
-    wchar_t dir[MAX_PATH];
-    GetModuleFileName(NULL, dir, MAX_PATH);
-    wchar_t* sl = wcsrchr(dir, L'\\');
-    if (sl) sl[1] = 0;
+    wchar_t dir[MAX_PATH] = {};
+    // Store in %APPDATA%\BillyPro\ — no elevation needed
+    if (FAILED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, dir))) {
+        // Fallback: same directory as exe
+        GetModuleFileName(NULL, dir, MAX_PATH);
+        wchar_t* sl = wcsrchr(dir, L'\\'); if (sl) sl[1] = 0;
+    } else {
+        wcscat_s(dir, L"\\BillyPro");
+        CreateDirectoryW(dir, NULL);  // creates if not exists; no-op if already there
+        wcscat_s(dir, L"\\");
+    }
     wcscpy_s(g_iniPath, dir);
     wcscat_s(g_iniPath, L"BillyPro.ini");
 }
@@ -426,10 +901,40 @@ void SaveSettings()
     swprintf_s(buf, L"%.1f", g_bbFreqLow);        WritePrivateProfileString(L"DSP", L"BBFreqLow", buf, g_iniPath);
     swprintf_s(buf, L"%.1f", g_bbFreqHigh);       WritePrivateProfileString(L"DSP", L"BBFreqHigh", buf, g_iniPath);
     swprintf_s(buf, L"%.1f", g_bbGainDB);         WritePrivateProfileString(L"DSP", L"BBGainDB", buf, g_iniPath);
-    swprintf_s(buf, L"%d", (int)g_mono);        WritePrivateProfileString(L"DSP", L"Mono", buf, g_iniPath);
-    swprintf_s(buf, L"%d", (int)g_normalize);   WritePrivateProfileString(L"DSP", L"Normalize", buf, g_iniPath);
+    swprintf_s(buf, L"%d", (int)g_mono);        WritePrivateProfileString(L"DSP", L"Mono",     buf, g_iniPath);
+    swprintf_s(buf, L"%d", (int)g_normalize);   WritePrivateProfileString(L"DSP", L"Normalize",buf, g_iniPath);
+    swprintf_s(buf, L"%d", (int)g_dspReverb);   WritePrivateProfileString(L"DSP", L"Reverb",   buf, g_iniPath);
+    swprintf_s(buf, L"%d", (int)g_dspSaturate); WritePrivateProfileString(L"DSP", L"Saturate", buf, g_iniPath);
+    swprintf_s(buf, L"%d", (int)g_dspVinyl);    WritePrivateProfileString(L"DSP", L"Vinyl",    buf, g_iniPath);
+    swprintf_s(buf, L"%d", (int)g_dspHifi);     WritePrivateProfileString(L"DSP", L"Hifi",     buf, g_iniPath);
+    swprintf_s(buf, L"%.1f", g_revMix);     WritePrivateProfileString(L"DSP", L"RevMix",    buf, g_iniPath);
+    swprintf_s(buf, L"%.1f", g_revRoom);    WritePrivateProfileString(L"DSP", L"RevRoom",   buf, g_iniPath);
+    swprintf_s(buf, L"%.1f", g_revWidth);   WritePrivateProfileString(L"DSP", L"RevWidth",  buf, g_iniPath);
+    swprintf_s(buf, L"%.2f", g_satDrive);   WritePrivateProfileString(L"DSP", L"SatDrive",  buf, g_iniPath);
+    swprintf_s(buf, L"%.1f", g_satLevel);   WritePrivateProfileString(L"DSP", L"SatLevel",  buf, g_iniPath);
+    swprintf_s(buf, L"%.0f", g_vinLpFreq);  WritePrivateProfileString(L"DSP", L"VinFreq",   buf, g_iniPath);
+    swprintf_s(buf, L"%.1f", g_vinCrackle); WritePrivateProfileString(L"DSP", L"VinCrackle",buf, g_iniPath);
+    swprintf_s(buf, L"%.2f", g_hfiBassDb);  WritePrivateProfileString(L"DSP", L"HfiBass",   buf, g_iniPath);
+    swprintf_s(buf, L"%.1f", g_hfiWarmth);  WritePrivateProfileString(L"DSP", L"HfiWarmth", buf, g_iniPath);
     // Recording output dir
     WritePrivateProfileString(L"Paths", L"RecordOutDir", g_recOutDir, g_iniPath);
+    // UI prefs
+    swprintf_s(buf, L"%d", (int)g_darkMode);   WritePrivateProfileString(L"UI", L"DarkMode",      buf, g_iniPath);
+    swprintf_s(buf, L"%d", (int)g_multiInst);  WritePrivateProfileString(L"UI", L"MultiInstance", buf, g_iniPath);
+    swprintf_s(buf, L"%d", (int)g_dropAppend); WritePrivateProfileString(L"UI", L"DropAppend",    buf, g_iniPath);
+    swprintf_s(buf, L"%d", (int)g_shuffle);    WritePrivateProfileString(L"UI", L"Shuffle",       buf, g_iniPath);
+    swprintf_s(buf, L"%d", (int)g_repeat);     WritePrivateProfileString(L"UI", L"Repeat",        buf, g_iniPath);
+    swprintf_s(buf, L"%.1f", g_seekStep);      WritePrivateProfileString(L"UI", L"SeekStep",      buf, g_iniPath);
+    // Save all media folders as pipe-separated list
+    {
+        std::wstring joined;
+        for (auto& f : g_mediaFolders) { if (!joined.empty()) joined += L'|'; joined += f; }
+        WritePrivateProfileString(L"Paths", L"MediaFolders", joined.c_str(), g_iniPath);
+        // Keep legacy key in sync (first folder)
+        WritePrivateProfileString(L"Paths", L"MediaFolder", g_mediaFolder, g_iniPath);
+    }
+    swprintf_s(buf, L"%d", (int)g_pitchEnabled); WritePrivateProfileString(L"Pitch", L"Enabled", buf, g_iniPath);
+    swprintf_s(buf, L"%.2f", g_pitchSemitones);  WritePrivateProfileString(L"Pitch", L"Semitones", buf, g_iniPath);
 }
 
 void LoadSettings()
@@ -442,25 +947,153 @@ void LoadSettings()
     g_bbFreqLow = GETF(L"DSP", L"BBFreqLow", 30.0);
     g_bbFreqHigh = GETF(L"DSP", L"BBFreqHigh", 100.0);
     g_bbGainDB = GETF(L"DSP", L"BBGainDB", 5.0);
-    g_mono = GETI(L"DSP", L"Mono", 0) != 0;
-    g_normalize = GETI(L"DSP", L"Normalize", 0) != 0;
+    g_mono        = GETI(L"DSP", L"Mono",     0) != 0;
+    g_normalize   = GETI(L"DSP", L"Normalize",0) != 0;
+    g_dspReverb   = GETI(L"DSP", L"Reverb",   0) != 0;
+    g_dspSaturate = GETI(L"DSP", L"Saturate", 0) != 0;
+    g_dspVinyl    = GETI(L"DSP", L"Vinyl",    0) != 0;
+    g_dspHifi     = GETI(L"DSP", L"Hifi",     0) != 0;
+    g_revMix     = GETF(L"DSP", L"RevMix",    8.0);
+    g_revRoom    = GETF(L"DSP", L"RevRoom",   75.0);
+    g_revWidth   = GETF(L"DSP", L"RevWidth",  80.0);
+    g_satDrive   = GETF(L"DSP", L"SatDrive",  1.6);
+    g_satLevel   = GETF(L"DSP", L"SatLevel",  72.0);
+    g_vinLpFreq  = GETF(L"DSP", L"VinFreq",   17500.0);
+    g_vinCrackle = GETF(L"DSP", L"VinCrackle",15.0);
+    g_hfiBassDb  = GETF(L"DSP", L"HfiBass",   3.0);
+    g_hfiWarmth  = GETF(L"DSP", L"HfiWarmth", 33.0);
     GetPrivateProfileString(L"Paths", L"RecordOutDir", L"", g_recOutDir, MAX_PATH, g_iniPath);
+    g_darkMode   = GETI(L"UI", L"DarkMode",      0) != 0;
+    g_multiInst  = GETI(L"UI", L"MultiInstance", 0) != 0;
+    g_dropAppend = GETI(L"UI", L"DropAppend",    1) != 0;
+    g_shuffle    = GETI(L"UI", L"Shuffle",       0) != 0;
+    g_repeat     = GETI(L"UI", L"Repeat",        0) != 0;
+    g_seekStep   = GETF(L"UI", L"SeekStep",      5.0);
+    if (g_seekStep < 1.0f) g_seekStep = 1.0f;
+    // Load media folders — try new pipe-separated key first, fall back to legacy single key
+    g_mediaFolders.clear();
+    {
+        wchar_t foldersRaw[4096] = {};
+        GetPrivateProfileString(L"Paths", L"MediaFolders", L"", foldersRaw, _countof(foldersRaw), g_iniPath);
+        if (foldersRaw[0]) {
+            // Split on '|'
+            wchar_t* ctx = nullptr;
+            wchar_t* tok = wcstok_s(foldersRaw, L"|", &ctx);
+            while (tok) {
+                if (tok[0]) g_mediaFolders.push_back(tok);
+                tok = wcstok_s(nullptr, L"|", &ctx);
+            }
+        } else {
+            // Legacy: single MediaFolder key
+            GetPrivateProfileString(L"Paths", L"MediaFolder", L"", g_mediaFolder, MAX_PATH, g_iniPath);
+            if (g_mediaFolder[0]) g_mediaFolders.push_back(g_mediaFolder);
+        }
+        // Keep g_mediaFolder in sync with first entry
+        if (!g_mediaFolders.empty())
+            wcsncpy_s(g_mediaFolder, g_mediaFolders[0].c_str(), _TRUNCATE);
+        else
+            g_mediaFolder[0] = L'\0';
+    }
+    g_pitchEnabled  = GETI(L"Pitch", L"Enabled",   0) != 0;
+    g_pitchSemitones = GETF(L"Pitch", L"Semitones", 0.0);
+    g_pitchSemitones = max(-12.0f, min(12.0f, g_pitchSemitones));
 #undef GETI
 #undef GETF
 }
 
 
+// ============================================================
+//  M3U Playlist save / load
+// ============================================================
+static void SavePlaylistM3U(HWND hwndParent)
+{
+    if (g_playlist.empty()) {
+        MessageBox(hwndParent, L"Playlist is empty.", L"Save Playlist", MB_ICONWARNING);
+        return;
+    }
+    OPENFILENAME ofn = {}; ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwndParent;
+    wchar_t path[MAX_PATH] = L"playlist.m3u";
+    ofn.lpstrFilter  = L"M3U Playlist\0*.m3u\0All Files\0*.*\0";
+    ofn.lpstrFile    = path;
+    ofn.nMaxFile     = MAX_PATH;
+    ofn.lpstrDefExt  = L"m3u";
+    ofn.Flags        = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if (!GetSaveFileName(&ofn)) return;
+
+    FILE* f = nullptr; _wfopen_s(&f, path, L"w,ccs=UTF-8");
+    if (!f) { MessageBox(hwndParent, L"Cannot open file for writing.", L"Save Playlist", MB_ICONERROR); return; }
+    fwprintf(f, L"#EXTM3U\r\n");
+    for (auto& t : g_playlist)
+        fwprintf(f, L"#EXTINF:-1,%s\r\n%s\r\n", t.display, t.path);
+    fclose(f);
+    wchar_t msg[MAX_PATH + 64];
+    swprintf_s(msg, L"Saved %d track(s) to playlist.", (int)g_playlist.size());
+    MessageBox(hwndParent, msg, L"Save Playlist", MB_ICONINFORMATION);
+}
+
+static bool IsM3U(const wchar_t* p)
+{
+    const wchar_t* e = wcsrchr(p, L'.');
+    return e && (_wcsicmp(e, L".m3u") == 0 || _wcsicmp(e, L".m3u8") == 0);
+}
+
+// Load an M3U file from a known path; appends or replaces based on g_dropAppend
+static void LoadM3UFromPath(const wchar_t* path, bool append = false)
+{
+    FILE* f = nullptr; _wfopen_s(&f, path, L"r,ccs=UTF-8");
+    if (!f) return;
+    if (!append) ClearPlaylist();
+    wchar_t line[MAX_PATH * 2];
+    while (fgetws(line, _countof(line), f)) {
+        int len = (int)wcslen(line);
+        while (len > 0 && (line[len-1] == L'\r' || line[len-1] == L'\n')) line[--len] = 0;
+        if (len == 0 || line[0] == L'#') continue;
+        if (GetFileAttributesW(line) != INVALID_FILE_ATTRIBUTES && IsAudio(line))
+            AddTrack(line);
+    }
+    fclose(f);
+    RebuildShuffleOrder();
+    if (!g_playlist.empty() && g_currentIndex < 0) {
+        g_currentIndex = 0; SendMessage(hListBox, LB_SETCURSEL, 0, 0);
+    }
+    UpdateStatusBar();
+}
+
+static void LoadPlaylistM3U(HWND hwndParent)
+{
+    OPENFILENAME ofn = {}; ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwndParent;
+    wchar_t path[MAX_PATH] = L"";
+    ofn.lpstrFilter = L"M3U Playlist\0*.m3u;*.m3u8\0All Files\0*.*\0";
+    ofn.lpstrFile   = path;
+    ofn.nMaxFile    = MAX_PATH;
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileName(&ofn)) return;
+    LoadM3UFromPath(path, false);
+}
+
 void ApplyDSP()
 {
     if (!currentStream) return;
-    // Remove existing DSP
-    if (g_dspMono) { BASS_ChannelRemoveDSP(currentStream, g_dspMono);   g_dspMono = 0; }
-    if (g_dspBass) { BASS_ChannelRemoveDSP(currentStream, g_dspBass);   g_dspBass = 0; }
+    // Remove all DSP
+    if (g_dspMono)   { BASS_ChannelRemoveDSP(currentStream, g_dspMono);   g_dspMono   = 0; }
+    if (g_dspBass)   { BASS_ChannelRemoveDSP(currentStream, g_dspBass);   g_dspBass   = 0; }
+    if (g_dspRevHdl) { BASS_ChannelRemoveDSP(currentStream, g_dspRevHdl); g_dspRevHdl = 0; }
+    if (g_dspSatHdl) { BASS_ChannelRemoveDSP(currentStream, g_dspSatHdl); g_dspSatHdl = 0; }
+    if (g_dspVinHdl) { BASS_ChannelRemoveDSP(currentStream, g_dspVinHdl); g_dspVinHdl = 0; }
+    if (g_dspHfiHdl) { BASS_ChannelRemoveDSP(currentStream, g_dspHfiHdl); g_dspHfiHdl = 0; }
     // Reapply
-    if (g_mono)
-        g_dspMono = BASS_ChannelSetDSP(currentStream, DSP_Mono, NULL, 1);
-    if (g_bassBoost)
-        g_dspBass = BASS_ChannelSetDSP(currentStream, DSP_BassBoost, NULL, 2);
+    if (g_mono)        g_dspMono   = BASS_ChannelSetDSP(currentStream, DSP_Mono,     NULL, 1);
+    if (g_bassBoost)   g_dspBass   = BASS_ChannelSetDSP(currentStream, DSP_BassBoost,NULL, 2);
+    if (!g_dspBypass) {
+        if (g_dspReverb)   g_dspRevHdl = BASS_ChannelSetDSP(currentStream, DSP_Reverb,  NULL, 3);
+        if (g_dspSaturate) g_dspSatHdl = BASS_ChannelSetDSP(currentStream, DSP_Saturate,NULL, 4);
+        if (g_dspVinyl)    g_dspVinHdl = BASS_ChannelSetDSP(currentStream, DSP_Vinyl,   NULL, 5);
+        if (g_dspHifi)     g_dspHfiHdl = BASS_ChannelSetDSP(currentStream, DSP_Hifi,    NULL, 6);
+    }
+    // Update DSP button visibility
+    if (g_hwnd) LayoutControls(g_hwnd);
     // Normalization: quick-scan peak and adjust volume
     if (g_normalize) {
         HSTREAM scan = BASS_StreamCreateFile(FALSE,
@@ -472,7 +1105,7 @@ void ApplyDSP()
             DWORD got;
             int chunks = 0;
             while (chunks < 200 &&
-                (got = BASS_ChannelGetData(scan, fbuf, sizeof(fbuf))) > 0) {
+                (got = BASS_ChannelGetData(scan, fbuf, sizeof(fbuf))) != (DWORD)-1 && got > 0) {
                 DWORD n = got / sizeof(float);
                 for (DWORD j = 0; j < n; j++) {
                     float a = fabsf(fbuf[j]);
@@ -488,6 +1121,24 @@ void ApplyDSP()
     }
     else {
         BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_VOL, currentVolume);
+    }
+}
+
+// ============================================================
+//  Pitch (CDJ-style: changes pitch + tempo together via sample rate)
+// ============================================================
+void ApplyPitch()
+{
+    if (!currentStream) return;
+    if (g_pitchEnabled && g_pitchSemitones != 0.0f) {
+        BASS_CHANNELINFO ci = {};
+        BASS_ChannelGetInfo(currentStream, &ci);
+        float origFreq = (float)ci.freq;
+        float newFreq  = origFreq * (float)pow(2.0, g_pitchSemitones / 12.0);
+        BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_FREQ, newFreq);
+    } else {
+        // Reset to default (0 = original freq)
+        BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_FREQ, 0);
     }
 }
 
@@ -533,6 +1184,7 @@ void StopAudio()
     if (hVolumeCanvas) InvalidateRect(hVolumeCanvas, NULL, FALSE);
     UpdatePlayBtn();
     UpdateStatusBar();
+    UpdateThumbButtons();
     SetWindowText(g_hwnd, APP_TITLE);
 }
 
@@ -553,15 +1205,24 @@ void UpdateVolume()
     }
 }
 
+// Speed ratio introduced by pitch shift (>1 = faster, <1 = slower)
+static double GetPitchSpeedRatio()
+{
+    if (!g_pitchEnabled || g_pitchSemitones == 0.0f) return 1.0;
+    return pow(2.0, g_pitchSemitones / 12.0);
+}
+
 void SeekToSeconds(double sec)
 {
     if (!currentStream) return;
     if (sec < 0) sec = 0;
-    double lenS = BASS_ChannelBytes2Seconds(currentStream,
+    // sec is display-time (pitch-adjusted); convert back to raw sample-time for BASS
+    double rawSec = sec * GetPitchSpeedRatio();
+    double rawLen = BASS_ChannelBytes2Seconds(currentStream,
         BASS_ChannelGetLength(currentStream, BASS_POS_BYTE));
-    if (sec > lenS) sec = lenS;
+    if (rawSec > rawLen) rawSec = rawLen;
     BASS_ChannelSetPosition(currentStream,
-        BASS_ChannelSeconds2Bytes(currentStream, sec), BASS_POS_BYTE);
+        BASS_ChannelSeconds2Bytes(currentStream, rawSec), BASS_POS_BYTE);
     UpdateTimeDisplays();
     if (hSeekCanvas) InvalidateRect(hSeekCanvas, NULL, FALSE);
 }
@@ -571,6 +1232,7 @@ static double GetTrackLength()
     if (!currentStream) return 1.0;
     double s = BASS_ChannelBytes2Seconds(currentStream,
         BASS_ChannelGetLength(currentStream, BASS_POS_BYTE));
+    s /= GetPitchSpeedRatio();   // actual playback duration after speed change
     return (s > 0) ? s : 1.0;
 }
 
@@ -578,7 +1240,8 @@ static double GetPlayPos()
 {
     if (!currentStream) return 0.0;
     return BASS_ChannelBytes2Seconds(currentStream,
-        BASS_ChannelGetPosition(currentStream, BASS_POS_BYTE));
+        BASS_ChannelGetPosition(currentStream, BASS_POS_BYTE))
+        / GetPitchSpeedRatio();  // actual elapsed time
 }
 
 void UpdateTimeDisplays()
@@ -617,10 +1280,13 @@ void PlayIndex(int idx)
     if (idx < 0 || idx >= (int)g_playlist.size()) return;
     StopAudio();
     g_currentIndex = idx;
-    SendMessage(hListBox, LB_SETSEL, FALSE, (LPARAM)-1);
-    SendMessage(hListBox, LB_SETSEL, TRUE, (LPARAM)idx);
-    SendMessage(hListBox, LB_SETCURSEL, idx, 0);
-    SendMessage(hListBox, LB_SETTOPINDEX, max(0, idx - 3), 0);
+    if (!g_browserActive) {
+        // Normal mode: highlight and scroll the playlist listbox
+        SendMessage(hListBox, LB_SETSEL, FALSE, (LPARAM)-1);
+        SendMessage(hListBox, LB_SETSEL, TRUE, (LPARAM)idx);
+        SendMessage(hListBox, LB_SETCURSEL, idx, 0);
+        SendMessage(hListBox, LB_SETTOPINDEX, max(0, idx - 3), 0);
+    }
 
     currentStream = BASS_StreamCreateFile(FALSE, g_playlist[idx].path, 0, 0, BASS_UNICODE | BASS_SAMPLE_FLOAT);
     if (!currentStream) {
@@ -631,24 +1297,26 @@ void PlayIndex(int idx)
         return;
     }
     BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_VOL, currentVolume);
-
-    double lenS = BASS_ChannelBytes2Seconds(currentStream,
-        BASS_ChannelGetLength(currentStream, BASS_POS_BYTE));
+    BASS_ChannelSetSync(currentStream, BASS_SYNC_END, 0, EndSyncProc, g_hwnd);
+    ApplyDSP();
+    ApplyPitch();
+    // Resize time labels to fit the track's duration (handles hours-long files)
+    if (g_hwnd) LayoutControls(g_hwnd);
+    // Update total time display AFTER ApplyPitch so it reflects the pitch-adjusted duration
     if (hTimeTot) {
         wchar_t buf[32], tot[40];
-        FormatTime(lenS, buf, _countof(buf));
+        FormatTime(GetTrackLength(), buf, _countof(buf));
         swprintf_s(tot, L"/ %s", buf);
         SetWindowText(hTimeTot, tot);
     }
-    BASS_ChannelSetSync(currentStream, BASS_SYNC_END | BASS_SYNC_MIXTIME, 0, EndSyncProc, g_hwnd);
-    ApplyDSP();
     BASS_ChannelPlay(currentStream, FALSE);
-    SetTimer(g_hwnd, IDT_PLAYBACK, 100, NULL);
+    SetTimer(g_hwnd, IDT_PLAYBACK, 16, NULL);
     SetTimer(g_hwnd, IDT_PEAK_METER, 50, NULL);
 
     UpdatePlayBtn();
     UpdateStatusBar();
     UpdateWindowTitle();
+    UpdateThumbButtons();
     UpdateTimeDisplays();
     if (hSeekCanvas)   InvalidateRect(hSeekCanvas, NULL, FALSE);
     if (hVolumeCanvas) InvalidateRect(hVolumeCanvas, NULL, FALSE);
@@ -667,10 +1335,11 @@ void TogglePlayPause()
     }
     else {
         BASS_ChannelPlay(currentStream, FALSE);
-        SetTimer(g_hwnd, IDT_PLAYBACK, 100, NULL);
+        SetTimer(g_hwnd, IDT_PLAYBACK, 16, NULL);
     }
     UpdatePlayBtn();
     UpdateStatusBar();
+    UpdateThumbButtons();
 }
 
 void PlayNext()
@@ -847,6 +1516,7 @@ void UpdateStatusBar()
     }
     SendMessage(hStatus, SB_SETTEXT, 0, (LPARAM)left);
     SendMessage(hStatus, SB_SETTEXT, 1, (LPARAM)right);
+    if (g_darkMode) InvalidateRect(hStatus, NULL, FALSE);  // force subclass repaint
     UpdateTrayTooltip();
 }
 
@@ -974,7 +1644,7 @@ static void PaintVolBar(HWND hwnd)
         }
         else {
             // Empty segment: dim square outline only
-            HPEN pen = CreatePen(PS_SOLID, 1, 0xBBBBBB);
+            HPEN pen = CreatePen(PS_SOLID, 1, g_darkMode ? 0x404040 : 0xBBBBBB);
             HPEN op = (HPEN)SelectObject(dc, pen);
             SelectObject(dc, GetStockObject(NULL_BRUSH));
             Rectangle(dc, sr.left, sr.top, sr.right, sr.bottom);
@@ -1100,7 +1770,7 @@ static void VBar(HDC dc, int cx, int cy, int h2, COLORREF c)
     HBRUSH br = CreateSolidBrush(c); FillRect(dc, &r, br); DeleteObject(br);
 }
 
-enum BtnType { BTN_PREV, BTN_PLAY, BTN_PAUSE, BTN_STOP, BTN_NEXT, BTN_SHUFFLE, BTN_REPEAT, BTN_MONO, BTN_NORMALIZE, BTN_BASSBOOST };
+enum BtnType { BTN_PREV, BTN_PLAY, BTN_PAUSE, BTN_STOP, BTN_NEXT, BTN_SHUFFLE, BTN_REPEAT, BTN_MONO, BTN_NORMALIZE, BTN_BASSBOOST, BTN_MEDIA, BTN_DSP };
 
 static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
 {
@@ -1111,6 +1781,8 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
         || (type == BTN_MONO && g_mono)
         || (type == BTN_NORMALIZE && g_normalize)
         || (type == BTN_BASSBOOST && g_bassBoost)
+        || (type == BTN_MEDIA && g_mediaActive)
+        || (type == BTN_DSP && !g_dspBypass && (g_dspReverb || g_dspSaturate || g_dspVinyl || g_dspHifi))
         ;
 
     // No border - Billy style. Hover = light blue tint, pressed = slightly darker.
@@ -1171,10 +1843,12 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
     case BTN_MONO:
     case BTN_NORMALIZE:
     case BTN_BASSBOOST:
+    case BTN_DSP:
     case BTN_SHUFFLE:
-    case BTN_REPEAT: {
-        sym = (pressed || toggled) ? 0xFFFFFF : 0x000000; // black text for these
-        // Shuffle/Repeat keep a visible border
+    case BTN_REPEAT:
+    case BTN_MEDIA: {
+        sym = (pressed || toggled) ? 0xFFFFFF : g_theme.text;  // use theme color so dark mode works
+        // Buttons keep a visible border
         HPEN spn = CreatePen(PS_SOLID, 1, g_theme.btnBorder);
         HPEN sop = (HPEN)SelectObject(dc, spn);
         SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -1190,8 +1864,10 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
         case BTN_SHUFFLE:    lbl = L"Shuffle"; break;
         case BTN_REPEAT:     lbl = L"Repeat";  break;
         case BTN_MONO:       lbl = L"Mono";    break;
-        case BTN_NORMALIZE: lbl = L"Norm";    break;
+        case BTN_NORMALIZE:  lbl = L"Norm";    break;
         case BTN_BASSBOOST:  lbl = L"BassBoost"; break;
+        case BTN_MEDIA:      lbl = g_mediaActive ? L"\u2605" : L"\u2606"; break;  // ★ / ☆
+        case BTN_DSP:        lbl = L"DSP";     break;
         default:             lbl = L"";        break;
         }
         DrawText(dc, lbl, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -1247,6 +1923,9 @@ static void ReorderTrack(int srcIdx, int destIdx)
     g_playlist.erase(g_playlist.begin() + srcIdx);
     g_playlist.insert(g_playlist.begin() + destIdx, t);
 
+    // Save scroll position so the view doesn't reset to top
+    int topIdx = (int)SendMessage(hListBox, LB_GETTOPINDEX, 0, 0);
+
     // Rebuild listbox entirely (simplest & correct)
     SendMessage(hListBox, LB_RESETCONTENT, 0, 0);
     for (auto& tr : g_playlist)
@@ -1264,6 +1943,8 @@ static void ReorderTrack(int srcIdx, int destIdx)
     }
 
     SendMessage(hListBox, LB_SETCURSEL, destIdx, 0);
+    // Restore scroll position — keep view stable
+    SendMessage(hListBox, LB_SETTOPINDEX, topIdx, 0);
     RebuildShuffleOrder();
     UpdateStatusBar();
 }
@@ -1277,7 +1958,10 @@ LRESULT CALLBACK ListBoxProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         if (wParam == VK_RETURN) {
             int s = (int)SendMessage(hwnd, LB_GETCURSEL, 0, 0);
-            if (s != LB_ERR) PlayIndex(s);
+            if (s != LB_ERR) {
+                if (g_browserActive) BrowserNavigate(s);
+                else PlayIndex(s);
+            }
             return 0;
         }
         if (wParam == VK_DELETE) {
@@ -1290,6 +1974,12 @@ LRESULT CALLBACK ListBoxProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 int s = (int)SendMessage(hwnd, LB_GETCURSEL, 0, 0);
                 if (s != LB_ERR) toDelete.push_back(s);
             }
+            // Save undo state (forward order before reverse-sort)
+            g_undoRemove.clear();
+            std::sort(toDelete.begin(), toDelete.end());
+            for (int idx : toDelete)
+                if (idx >= 0 && idx < (int)g_playlist.size())
+                    g_undoRemove.push_back({g_playlist[idx], idx});
             std::sort(toDelete.begin(), toDelete.end(), std::greater<int>());
             bool stopNeeded = false;
             for (int idx : toDelete) {
@@ -1305,6 +1995,20 @@ LRESULT CALLBACK ListBoxProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (!g_playlist.empty())
                 SendMessage(hwnd, LB_SETCURSEL, max(0, g_currentIndex), 0);
             UpdateStatusBar();
+            return 0;
+        }
+        if (wParam == 'Z' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            // Undo last remove — re-insert tracks in forward order
+            if (!g_undoRemove.empty()) {
+                for (auto& u : g_undoRemove) {
+                    int ins = min(u.idx, (int)g_playlist.size());
+                    g_playlist.insert(g_playlist.begin() + ins, u.t);
+                    SendMessage(hwnd, LB_INSERTSTRING, ins, (LPARAM)u.t.display);
+                }
+                g_undoRemove.clear();
+                RebuildShuffleOrder();
+                UpdateStatusBar();
+            }
             return 0;
         }
         if (wParam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000)) {
@@ -1374,9 +2078,13 @@ LRESULT CALLBACK ListBoxProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 ReorderTrack(from, to);
             }
             else if (!g_lbDragMoved) {
-                // Plain click (no drag): play on double-click is handled by LBN_DBLCLK
-                // Just keep the selection on the clicked item
+                // Plain click (no drag)
                 SendMessage(hwnd, LB_SETCURSEL, from, 0);
+                // In browser mode, single-click navigates into folders
+                if (g_browserActive && from >= 0 && from < (int)g_browserItems.size()
+                    && g_browserItems[from].isDir) {
+                    BrowserNavigate(from);
+                }
             }
             return 0;
         }
@@ -1393,12 +2101,35 @@ LRESULT CALLBACK ListBoxProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         int idx = (int)SendMessage(hwnd, LB_ITEMFROMPOINT, 0, MAKELPARAM(pt.x, pt.y));
         if (HIWORD(idx)) idx = LB_ERR;
-        if (idx != LB_ERR && idx < (int)g_playlist.size()) {
+        if (idx == LB_ERR) return 0;
+
+        if (g_browserActive) {
+            // Browser mode: work against g_browserItems, skip dir items
+            if (idx >= (int)g_browserItems.size() || g_browserItems[idx].isDir) return 0;
+            SendMessage(hwnd, LB_SETCURSEL, idx, 0);
+            g_ctxIsBrowser = true;
+            g_ctxTrackIndex = idx;
+            wcsncpy_s(g_ctxFilePath, g_browserItems[idx].path, _TRUNCATE);
+            POINT screen = pt; ClientToScreen(hwnd, &screen);
+            // Browser context: Play, Audio Info, Open File Location (no Remove)
+            HMENU hMenu = CreatePopupMenu();
+            AppendMenu(hMenu, MF_STRING, IDC_CTX_PLAY,        L"Play");
+            AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+            AppendMenu(hMenu, MF_STRING, IDC_CTX_AUDIOINFO,    L"Audio Information...");
+            AppendMenu(hMenu, MF_STRING, IDC_CTX_PROPERTIES,   L"Properties...");
+            AppendMenu(hMenu, MF_STRING, IDC_CTX_OPENLOCATION, L"Open File Location");
+            TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, screen.x, screen.y, 0, g_hwnd, NULL);
+            DestroyMenu(hMenu);
+        } else {
+            // Normal mode: work against g_playlist
+            if (idx >= (int)g_playlist.size()) return 0;
             if (SendMessage(hwnd, LB_GETSEL, idx, 0) == 0) {
                 SendMessage(hwnd, LB_SETSEL, FALSE, (LPARAM)-1);
                 SendMessage(hwnd, LB_SETSEL, TRUE, idx);
             }
             SendMessage(hwnd, LB_SETCURSEL, idx, 0);
+            g_ctxIsBrowser = false;
+            wcsncpy_s(g_ctxFilePath, g_playlist[idx].path, _TRUNCATE);
             POINT screen = pt; ClientToScreen(hwnd, &screen);
             ShowTrackContextMenu(hwnd, idx, screen);
         }
@@ -1415,12 +2146,15 @@ void ShowTrackContextMenu(HWND hwnd, int trackIdx, POINT pt)
 {
     if (trackIdx < 0 || trackIdx >= (int)g_playlist.size()) return;
     g_ctxTrackIndex = trackIdx;
+    g_ctxIsBrowser  = false;
+    wcsncpy_s(g_ctxFilePath, g_playlist[trackIdx].path, _TRUNCATE);
 
     HMENU hMenu = CreatePopupMenu();
     AppendMenu(hMenu, MF_STRING, IDC_CTX_PLAY, L"Play");
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenu(hMenu, MF_STRING, IDC_CTX_AUDIOINFO, L"Audio Information...");
-    AppendMenu(hMenu, MF_STRING, IDC_CTX_PROPERTIES, L"Properties...");
+    AppendMenu(hMenu, MF_STRING, IDC_CTX_AUDIOINFO,    L"Audio Information...");
+    AppendMenu(hMenu, MF_STRING, IDC_CTX_PROPERTIES,   L"Properties...");
+    AppendMenu(hMenu, MF_STRING, IDC_CTX_OPENLOCATION, L"Open File Location");
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hMenu, MF_STRING, IDC_CTX_REMOVE, L"Remove from playlist");
 
@@ -1441,7 +2175,8 @@ static void TagToWide(const char* tag, wchar_t* out, size_t n)
 }
 
 struct AudioInfoData {
-    int trackIdx;
+    int     trackIdx;               // playlist index (-1 when opened from browser)
+    wchar_t path[MAX_PATH];         // file path (always valid)
 };
 
 // Artwork raw bytes for drag/drop export
@@ -1579,19 +2314,91 @@ static HBITMAP LoadEmbeddedArtworkSized(HSTREAM stream, int size)
     return NULL;
 }
 
+// Write ID3v2.3 tags to an MP3 file (re-writes the header, preserves audio data)
+static bool WriteID3v2ToMP3(const wchar_t* path,
+    const wchar_t* title, const wchar_t* artist, const wchar_t* album,
+    const wchar_t* year,  const wchar_t* track,  const wchar_t* genre)
+{
+    // Read file
+    HANDLE hf = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER fs; GetFileSizeEx(hf, &fs);
+    if (fs.QuadPart > 500LL * 1024 * 1024) { CloseHandle(hf); return false; } // 500 MB guard
+
+    // Find start of audio data — skip existing ID3v2 header
+    BYTE hdr[10]; DWORD rd;
+    ReadFile(hf, hdr, 10, &rd, NULL);
+    DWORD audioOffset = 0;
+    if (rd == 10 && memcmp(hdr, "ID3", 3) == 0) {
+        DWORD sz = ((DWORD)(hdr[6] & 0x7F) << 21) | ((DWORD)(hdr[7] & 0x7F) << 14) |
+                   ((DWORD)(hdr[8] & 0x7F) << 7)  | (hdr[9] & 0x7F);
+        audioOffset = 10 + sz;
+    }
+    DWORD audioSize = (audioOffset < (DWORD)fs.QuadPart) ? ((DWORD)fs.QuadPart - audioOffset) : 0;
+    std::vector<BYTE> audio(audioSize);
+    SetFilePointer(hf, audioOffset, NULL, FILE_BEGIN);
+    ReadFile(hf, audio.data(), audioSize, &rd, NULL);
+    CloseHandle(hf);
+
+    // Build ID3v2.3 frames (UTF-8 encoding byte = 3)
+    std::vector<BYTE> frames;
+    struct TagEntry { const char* id; const wchar_t* val; };
+    TagEntry tags[] = {
+        {"TIT2", title}, {"TPE1", artist}, {"TALB", album},
+        {"TYER", year},  {"TRCK", track},  {"TCON", genre}
+    };
+    for (auto& te : tags) {
+        if (!te.val || !te.val[0]) continue;
+        int utfN = WideCharToMultiByte(CP_UTF8, 0, te.val, -1, NULL, 0, NULL, NULL);
+        if (utfN <= 1) continue;
+        std::vector<char> utf(utfN);
+        WideCharToMultiByte(CP_UTF8, 0, te.val, -1, utf.data(), utfN, NULL, NULL);
+        DWORD fds = 1 + (DWORD)(utfN - 1); // enc byte + string (no null term)
+        for (int c = 0; c < 4; c++) frames.push_back((BYTE)te.id[c]);
+        frames.push_back((BYTE)((fds >> 24) & 0xFF));
+        frames.push_back((BYTE)((fds >> 16) & 0xFF));
+        frames.push_back((BYTE)((fds >> 8)  & 0xFF));
+        frames.push_back((BYTE)(fds & 0xFF));
+        frames.push_back(0); frames.push_back(0); // flags
+        frames.push_back(3); // UTF-8
+        for (int i = 0; i < utfN - 1; i++) frames.push_back((BYTE)utf[i]);
+    }
+
+    // 256-byte padding
+    DWORD padSz = 256;
+    DWORD bodySize = (DWORD)frames.size() + padSz;
+    BYTE ss[4] = { (BYTE)((bodySize >> 21) & 0x7F), (BYTE)((bodySize >> 14) & 0x7F),
+                   (BYTE)((bodySize >> 7)  & 0x7F), (BYTE)(bodySize & 0x7F) };
+
+    hf = CreateFile(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+    DWORD wr;
+    BYTE id3hdr[10] = {'I','D','3', 3, 0, 0, ss[0], ss[1], ss[2], ss[3]};
+    WriteFile(hf, id3hdr, 10, &wr, NULL);
+    if (!frames.empty()) WriteFile(hf, frames.data(), (DWORD)frames.size(), &wr, NULL);
+    std::vector<BYTE> pad(padSz, 0);
+    WriteFile(hf, pad.data(), padSz, &wr, NULL);
+    if (!audio.empty()) WriteFile(hf, audio.data(), audioSize, &wr, NULL);
+    CloseHandle(hf);
+    return true;
+}
+
 static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     static HBITMAP hArt = NULL;
     static int     s_trackIdx = -1;
+    static wchar_t s_filePath[MAX_PATH] = {};
     static bool    s_artDragging = false;
 
     switch (msg) {
     case WM_CREATE: {
+        if (g_darkMode) { BOOL d2 = TRUE; DwmSetWindowAttribute(hwnd, 20, &d2, sizeof(d2)); DwmSetWindowAttribute(hwnd, 19, &d2, sizeof(d2)); }
         AudioInfoData* d = (AudioInfoData*)((CREATESTRUCT*)lParam)->lpCreateParams;
         s_trackIdx = d->trackIdx;
+        wcsncpy_s(s_filePath, d->path, _TRUNCATE);
         FreeArtBytes();
 
-        HSTREAM s = BASS_StreamCreateFile(FALSE, g_playlist[s_trackIdx].path, 0, 0,
+        HSTREAM s = BASS_StreamCreateFile(FALSE, s_filePath, 0, 0,
             BASS_UNICODE | BASS_STREAM_DECODE);
 
         HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
@@ -1645,7 +2452,7 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             int mm = (int)(lenS / 60), ss = (int)lenS % 60;
 
             WIN32_FILE_ATTRIBUTE_DATA fa = {};
-            GetFileAttributesEx(g_playlist[s_trackIdx].path, GetFileExInfoStandard, &fa);
+            GetFileAttributesEx(s_filePath, GetFileExInfoStandard, &fa);
             ULONGLONG fsz = ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
 
             if (brate > 0)
@@ -1662,7 +2469,7 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         ry += 58;
 
         // File path (read-only, full path)
-        HWND hPath = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", g_playlist[s_trackIdx].path,
+        HWND hPath = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", s_filePath,
             WS_CHILD | WS_VISIBLE | ES_READONLY | ES_AUTOHSCROLL,
             rx, ry, rw, 22, hwnd, (HMENU)IDC_STATIC, hInst, NULL);
         SendMessage(hPath, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
@@ -1772,14 +2579,16 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         // Artwork click does nothing - use Save Artwork button to save
         break;
 
-    case WM_CTLCOLORSTATIC: {
+    case WM_ERASEBKGND: {
+        HDC dc = (HDC)wParam; RECT rc; GetClientRect(hwnd, &rc);
+        FillRect(dc, &rc, g_brBg); return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT: {
         HDC dc = (HDC)wParam;
         SetTextColor(dc, g_theme.text);
-        SetBkColor(dc, 0xFFFFFF);
-        static HBRUSH brs = NULL;
-        if (brs) DeleteObject(brs);
-        brs = CreateSolidBrush(0xFFFFFF);
-        return (LRESULT)brs;
+        SetBkColor(dc, g_theme.bg);
+        return (LRESULT)g_brBg;
     }
 
     case WM_COMMAND:
@@ -1826,22 +2635,29 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             break;
         }
         case ID_INFO_SAVE_TAGS: {
-            // Collect fields and inform (full write needs TagLib)
+            if (!s_filePath[0]) break;
             wchar_t title[256], artist[256], album[256], year[16], track[16], genre[128];
-            GetDlgItemText(hwnd, ID_INFO_TITLE, title, 256);
+            GetDlgItemText(hwnd, ID_INFO_TITLE,  title,  256);
             GetDlgItemText(hwnd, ID_INFO_ARTIST, artist, 256);
-            GetDlgItemText(hwnd, ID_INFO_ALBUM, album, 256);
-            GetDlgItemText(hwnd, ID_INFO_YEAR, year, 16);
-            GetDlgItemText(hwnd, ID_INFO_TRACK, track, 16);
-            GetDlgItemText(hwnd, ID_INFO_GENRE, genre, 128);
-            wchar_t msg2[1024];
-            swprintf_s(msg2,
-                L"Tag data collected:\n"
-                L"Title:  %s\nArtist: %s\nAlbum:  %s\n"
-                L"Year:   %s\nTrack:  %s\nGenre:  %s\n\n"
-                L"Full ID3 write requires TagLib integration.",
-                title, artist, album, year, track, genre);
-            MessageBox(hwnd, msg2, L"Save Tags", MB_ICONINFORMATION);
+            GetDlgItemText(hwnd, ID_INFO_ALBUM,  album,  256);
+            GetDlgItemText(hwnd, ID_INFO_YEAR,   year,   16);
+            GetDlgItemText(hwnd, ID_INFO_TRACK,  track,  16);
+            GetDlgItemText(hwnd, ID_INFO_GENRE,  genre,  128);
+            const wchar_t* ext = wcsrchr(s_filePath, L'.');
+            if (ext && _wcsicmp(ext, L".mp3") == 0) {
+                // Stop playback if this file is currently open (can't write while open)
+                bool wasPlaying = (s_trackIdx >= 0 && g_currentIndex == s_trackIdx && currentStream != 0);
+                if (wasPlaying) StopAudio();
+                if (WriteID3v2ToMP3(s_filePath, title, artist, album, year, track, genre)) {
+                    MessageBox(hwnd, L"Tags saved successfully.", L"Save Tags", MB_ICONINFORMATION);
+                    if (wasPlaying) PlayIndex(s_trackIdx);
+                } else {
+                    MessageBox(hwnd, L"Failed to write tags.\nMake sure the file is not read-only.", L"Save Tags", MB_ICONERROR);
+                    if (wasPlaying) PlayIndex(s_trackIdx);
+                }
+            } else {
+                MessageBox(hwnd, L"Tag writing is supported for MP3 files only.\nFLAC/OGG require an external tool.", L"Save Tags", MB_ICONWARNING);
+            }
             break;
         }
         }
@@ -1863,15 +2679,11 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-void OpenAudioInfoDialog(int trackIdx)
+static void OpenAudioInfoForData(AudioInfoData& d)
 {
-    if (trackIdx < 0 || trackIdx >= (int)g_playlist.size()) return;
     if (g_hwndInfo && IsWindow(g_hwndInfo)) {
         SetForegroundWindow(g_hwndInfo); return;
     }
-
-    static AudioInfoData d;
-    d.trackIdx = trackIdx;
 
     HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(g_hwnd, GWLP_HINSTANCE);
 
@@ -1882,6 +2694,7 @@ void OpenAudioInfoDialog(int trackIdx)
         wc.lpfnWndProc = InfoWndProc; wc.hInstance = hInst;
         wc.lpszClassName = INFO_CLASS;
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_BILLYPRO));
         wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
         RegisterClass(&wc);
         registered = true;
@@ -1901,6 +2714,24 @@ void OpenAudioInfoDialog(int trackIdx)
         dw, dh, SWP_NOZORDER);
 }
 
+void OpenAudioInfoDialog(int trackIdx)
+{
+    if (trackIdx < 0 || trackIdx >= (int)g_playlist.size()) return;
+    static AudioInfoData d;
+    d.trackIdx = trackIdx;
+    wcsncpy_s(d.path, g_playlist[trackIdx].path, _TRUNCATE);
+    OpenAudioInfoForData(d);
+}
+
+void OpenAudioInfoForPath(const wchar_t* path)
+{
+    if (!path || !path[0]) return;
+    static AudioInfoData d;
+    d.trackIdx = -1;
+    wcsncpy_s(d.path, path, _TRUNCATE);
+    OpenAudioInfoForData(d);
+}
+
 // ============================================================
 //  Convert Dialog
 //  Bulk audio file converter with format/quality options
@@ -1910,10 +2741,266 @@ struct ConvItem { wchar_t path[MAX_PATH]; wchar_t display[MAX_PATH]; };
 static std::vector<ConvItem> g_convItems;
 static wchar_t g_convOutDir[MAX_PATH] = L"";
 
+// ---- Conversion thread data ----
+struct ConvThreadData {
+    HWND                  hwnd;
+    std::vector<ConvItem> items;
+    wchar_t               outDir[MAX_PATH];
+    int                   fmt;           // 0=mp3,1=wav,2=flac,3=ogg,4=m4a
+    wchar_t               qualArgs[64];  // ffmpeg quality args, e.g. "-b:a 320k"
+    int                   wavBitDepth;   // WAV only: 16, 24, or 32
+    bool                  normalize;
+    bool                  copyMeta;
+};
+
+// Decode src to a 16-bit PCM WAV file via BASS (no external encoder needed)
+static bool ConvWriteWav(const wchar_t* src, const wchar_t* dst, bool normalize, int bitDepth = 16)
+{
+    if (bitDepth != 16 && bitDepth != 24 && bitDepth != 32) bitDepth = 16;
+    HSTREAM stream = BASS_StreamCreateFile(FALSE, src, 0, 0,
+        BASS_STREAM_DECODE | BASS_UNICODE | BASS_SAMPLE_FLOAT);
+    if (!stream) return false;
+
+    BASS_CHANNELINFO info = {};
+    BASS_ChannelGetInfo(stream, &info);
+
+    WORD  channels      = (WORD)info.chans;
+    DWORD sampleRate    = info.freq;
+    WORD  bitsPerSample = (WORD)bitDepth;
+    DWORD byteRate      = sampleRate * channels * (bitsPerSample / 8);
+    WORD  blockAlign    = channels * (bitsPerSample / 8);
+    WORD  fmtTag        = (bitDepth == 32) ? 3 : 1; // 3=IEEE_FLOAT, 1=PCM
+
+    // Buffer: 32768 bytes of float data at a time (safe: no overlap with BASS_DATA_FLOAT=0x40000000)
+    static const DWORD FBUF_BYTES = 32768;
+    float fbuf[FBUF_BYTES / sizeof(float)];
+
+    // Optional first pass: find peak level for normalization
+    float gainFactor = 1.0f;
+    if (normalize) {
+        float peak = 0.0f;
+        DWORD read;
+        while ((read = BASS_ChannelGetData(stream, fbuf, FBUF_BYTES | BASS_DATA_FLOAT)) != (DWORD)-1 && read > 0) {
+            int count = (int)(read / sizeof(float));
+            for (int i = 0; i < count; i++) {
+                float s = fabsf(fbuf[i]);
+                if (s > peak) peak = s;
+            }
+        }
+        if (peak > 0.001f) gainFactor = 0.98f / peak;
+        // Reopen for the writing pass
+        BASS_StreamFree(stream);
+        stream = BASS_StreamCreateFile(FALSE, src, 0, 0,
+            BASS_STREAM_DECODE | BASS_UNICODE | BASS_SAMPLE_FLOAT);
+        if (!stream) return false;
+    }
+
+    FILE* f = nullptr;
+    _wfopen_s(&f, dst, L"wb");
+    if (!f) { BASS_StreamFree(stream); return false; }
+
+    // Write placeholder WAV header (sizes filled in after encoding)
+    fwrite("RIFF", 1, 4, f);
+    DWORD riffSize = 0;          fwrite(&riffSize, 4, 1, f);
+    fwrite("WAVE", 1, 4, f);
+    fwrite("fmt ", 1, 4, f);
+    DWORD fmtSize = 16;          fwrite(&fmtSize,  4, 1, f);
+                                 fwrite(&fmtTag,    2, 1, f);
+    fwrite(&channels,      2, 1, f);
+    fwrite(&sampleRate,    4, 1, f);
+    fwrite(&byteRate,      4, 1, f);
+    fwrite(&blockAlign,    2, 1, f);
+    fwrite(&bitsPerSample, 2, 1, f);
+    fwrite("data", 1, 4, f);
+    DWORD dataSize = 0;
+    long  dataSizePos = ftell(f); fwrite(&dataSize, 4, 1, f);
+
+    // Second (or only) pass: decode and write samples at requested bit depth
+    DWORD read;
+    DWORD totalData = 0;
+    while ((read = BASS_ChannelGetData(stream, fbuf, FBUF_BYTES | BASS_DATA_FLOAT)) != (DWORD)-1 && read > 0) {
+        int count = (int)(read / sizeof(float));
+        if (bitDepth == 32) {
+            // 32-bit IEEE float — write float buffer directly (apply gain)
+            for (int i = 0; i < count; i++) {
+                fbuf[i] *= gainFactor;
+                if (fbuf[i] >  1.0f) fbuf[i] =  1.0f;
+                if (fbuf[i] < -1.0f) fbuf[i] = -1.0f;
+            }
+            DWORD written = (DWORD)fwrite(fbuf, sizeof(float), count, f) * sizeof(float);
+            totalData += written;
+        } else if (bitDepth == 24) {
+            // 24-bit PCM — 3 bytes per sample
+            for (int i = 0; i < count; i++) {
+                float s = fbuf[i] * gainFactor;
+                if (s >  1.0f) s =  1.0f;
+                if (s < -1.0f) s = -1.0f;
+                int32_t v = (int32_t)(s * 8388607.0f);
+                uint8_t b[3] = { (uint8_t)(v & 0xFF), (uint8_t)((v >> 8) & 0xFF), (uint8_t)((v >> 16) & 0xFF) };
+                fwrite(b, 1, 3, f);
+                totalData += 3;
+            }
+        } else {
+            // 16-bit PCM
+            short sbuf[FBUF_BYTES / sizeof(float)];
+            for (int i = 0; i < count; i++) {
+                float s = fbuf[i] * gainFactor;
+                if (s >  1.0f) s =  1.0f;
+                if (s < -1.0f) s = -1.0f;
+                sbuf[i] = (short)(s * 32767.0f);
+            }
+            DWORD written = (DWORD)fwrite(sbuf, 2, count, f) * 2;
+            totalData += written;
+        }
+    }
+
+    // Patch RIFF and data chunk sizes
+    fseek(f, 4, SEEK_SET);
+    DWORD riffFinal = 36 + totalData; fwrite(&riffFinal, 4, 1, f);
+    fseek(f, dataSizePos, SEEK_SET);  fwrite(&totalData, 4, 1, f);
+
+    fclose(f);
+    BASS_StreamFree(stream);
+    return (totalData > 0);
+}
+
+// Search for ffmpeg.exe next to the exe, then in PATH
+static bool ConvFindFfmpeg(wchar_t* outPath, int maxLen)
+{
+    wchar_t exeDir[MAX_PATH];
+    GetModuleFileNameW(NULL, exeDir, MAX_PATH);
+    wchar_t* slash = wcsrchr(exeDir, L'\\');
+    if (slash) { slash[1] = 0; swprintf_s(outPath, maxLen, L"%sffmpeg.exe", exeDir); }
+    else        { wcsncpy_s(outPath, maxLen, L"ffmpeg.exe", _TRUNCATE); }
+    if (GetFileAttributesW(outPath) != INVALID_FILE_ATTRIBUTES) return true;
+
+    wchar_t found[MAX_PATH];
+    if (SearchPathW(NULL, L"ffmpeg", L".exe", MAX_PATH, found, NULL)) {
+        wcsncpy_s(outPath, maxLen, found, _TRUNCATE);
+        return true;
+    }
+    return false;
+}
+
+// Run ffmpeg to encode src->dst with the given bitrate (and optional loudnorm)
+static bool ConvRunFfmpeg(const wchar_t* ffmpeg, const wchar_t* src, const wchar_t* dst,
+                           const wchar_t* qualArgs, bool normalize)
+{
+    wchar_t cmd[MAX_PATH * 3 + 256];
+    if (normalize)
+        swprintf_s(cmd, ARRAYSIZE(cmd),
+            L"\"%s\" -y -i \"%s\" -af loudnorm %s \"%s\"",
+            ffmpeg, src, qualArgs, dst);
+    else
+        swprintf_s(cmd, ARRAYSIZE(cmd),
+            L"\"%s\" -y -i \"%s\" %s \"%s\"",
+            ffmpeg, src, qualArgs, dst);
+
+    STARTUPINFOW si = {}; si.cb = sizeof(si);
+    si.dwFlags     = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+        return false;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (exitCode == 0);
+}
+
+// Background conversion thread
+static DWORD WINAPI ConvThreadProc(LPVOID param)
+{
+    ConvThreadData* d = (ConvThreadData*)param;
+    int total = (int)d->items.size();
+    int ok    = 0;
+
+    const wchar_t* exts[] = { L"mp3", L"wav", L"flac", L"ogg", L"m4a" };
+    const wchar_t* ext    = exts[d->fmt];
+    bool needFfmpeg = (d->fmt != 1); // WAV=1 is handled natively
+
+    wchar_t ffmpegPath[MAX_PATH] = L"";
+    bool hasFfmpeg = needFfmpeg ? ConvFindFfmpeg(ffmpegPath, MAX_PATH) : false;
+
+    for (int i = 0; i < total; i++) {
+        if (g_convAbort) break;
+
+        // Post progress (percent = files completed so far)
+        int pct = (i * 100) / total;
+        PostMessage(d->hwnd, WM_CONV_PROGRESS, (WPARAM)pct,
+                    (LPARAM)MAKELPARAM((WORD)(i + 1), (WORD)total));
+
+        // Build output path: strip extension, replace with target ext
+        const wchar_t* fn = Filename(d->items[i].path);
+        wchar_t base[MAX_PATH]; wcsncpy_s(base, fn, _TRUNCATE);
+        wchar_t* dot = wcsrchr(base, L'.'); if (dot) *dot = 0;
+
+        wchar_t outPath[MAX_PATH];
+        swprintf_s(outPath, ARRAYSIZE(outPath), L"%s\\%s.%s", d->outDir, base, ext);
+
+        bool success = false;
+        if (d->fmt == 1) {
+            // WAV: native BASS decode, no external tool needed
+            success = ConvWriteWav(d->items[i].path, outPath, d->normalize, d->wavBitDepth);
+        } else if (hasFfmpeg) {
+            success = ConvRunFfmpeg(ffmpegPath, d->items[i].path, outPath, d->qualArgs, d->normalize);
+        } else {
+            // No ffmpeg — fall back to WAV
+            wchar_t wavOut[MAX_PATH];
+            swprintf_s(wavOut, ARRAYSIZE(wavOut), L"%s\\%s.wav", d->outDir, base);
+            success = ConvWriteWav(d->items[i].path, wavOut, d->normalize, 16);
+        }
+        if (success) ok++;
+    }
+
+    PostMessage(d->hwnd, WM_CONV_DONE, (WPARAM)ok, (LPARAM)total);
+    delete d;
+    return 0;
+}
+
+// Repopulate the Quality combobox based on selected output format
+static void UpdateConvQuality(HWND hwndConv, int fmt)
+{
+    HWND hQ = GetDlgItem(hwndConv, ID_CONV_QUALITY);
+    if (!hQ) return;
+    SendMessage(hQ, CB_RESETCONTENT, 0, 0);
+    switch (fmt) {
+    case 0: // MP3
+    case 4: // AAC/M4A — same kbps options
+        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)L"320 kbps (Best)");
+        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)L"256 kbps (High)");
+        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)L"192 kbps (Good)");
+        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)L"128 kbps (Standard)");
+        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)L"96 kbps (Compact)");
+        break;
+    case 1: // WAV
+        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)L"16-bit PCM (Standard)");
+        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)L"24-bit PCM (High Quality)");
+        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)L"32-bit Float (Lossless)");
+        break;
+    case 2: // FLAC
+        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)L"Level 8 - Best compression");
+        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)L"Level 5 - Default");
+        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)L"Level 0 - Fastest");
+        break;
+    case 3: // OGG Vorbis
+        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)L"Q10 (Best)");
+        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)L"Q8 (High)");
+        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)L"Q6 (Good)");
+        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)L"Q4 (Standard)");
+        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)L"Q2 (Compact)");
+        break;
+    }
+    SendMessage(hQ, CB_SETCURSEL, 0, 0);
+}
+
 static LRESULT CALLBACK ConvertWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
     case WM_CREATE: {
+        if (g_darkMode) { BOOL dk = TRUE; DwmSetWindowAttribute(hwnd, 20, &dk, sizeof(dk)); DwmSetWindowAttribute(hwnd, 19, &dk, sizeof(dk)); }
         HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
         int cw = 700, ch = 580; (void)ch;
 
@@ -1975,12 +3062,7 @@ static LRESULT CALLBACK ConvertWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         HWND hQual = CreateWindow(L"COMBOBOX", NULL,
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 338, fo, 160, 120, hwnd, (HMENU)ID_CONV_QUALITY, hInst, NULL);
         SendMessage(hQual, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-        SendMessage(hQual, CB_ADDSTRING, 0, (LPARAM)L"320 kbps (Best)");
-        SendMessage(hQual, CB_ADDSTRING, 0, (LPARAM)L"256 kbps (High)");
-        SendMessage(hQual, CB_ADDSTRING, 0, (LPARAM)L"192 kbps (Good)");
-        SendMessage(hQual, CB_ADDSTRING, 0, (LPARAM)L"128 kbps (Standard)");
-        SendMessage(hQual, CB_ADDSTRING, 0, (LPARAM)L"96 kbps (Compact)");
-        SendMessage(hQual, CB_SETCURSEL, 0, 0);
+        UpdateConvQuality(hwnd, 0); // populate quality options for MP3 (default)
 
         HWND hNorm = CreateWindow(L"BUTTON", L"Normalize audio levels",
             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 510, fo + 2, 150, 18, hwnd, (HMENU)ID_CONV_NORMALIZE, hInst, NULL);
@@ -2017,9 +3099,66 @@ static LRESULT CALLBACK ConvertWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         }
         wchar_t sb[64]; swprintf_s(sb, L"%d files loaded from current playlist.", (int)g_convItems.size());
         SetDlgItemText(hwnd, ID_CONV_STATUS, sb);
+
+        DragAcceptFiles(hwnd, TRUE);  // enable drag & drop onto the convert window
+        break;
+    }
+    case WM_DROPFILES: {
+        HDROP hd = (HDROP)wParam;
+        UINT n = DragQueryFile(hd, 0xFFFFFFFF, NULL, 0);
+        HWND hList = GetDlgItem(hwnd, ID_CONV_LIST);
+        int added = 0;
+        for (UINT i = 0; i < n; i++) {
+            wchar_t p[MAX_PATH]; DragQueryFile(hd, i, p, MAX_PATH);
+            DWORD attr = GetFileAttributes(p);
+            if (attr == INVALID_FILE_ATTRIBUTES) continue;
+            if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+                // Add all audio files in the dropped folder
+                wchar_t pat[MAX_PATH]; swprintf_s(pat, L"%s\\*.*", p);
+                WIN32_FIND_DATA fd; HANDLE hf = FindFirstFile(pat, &fd);
+                if (hf != INVALID_HANDLE_VALUE) {
+                    do {
+                        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                            wchar_t full[MAX_PATH]; swprintf_s(full, L"%s\\%s", p, fd.cFileName);
+                            if (IsAudio(full)) {
+                                bool dup = false;
+                                for (auto& ci : g_convItems) if (_wcsicmp(ci.path, full) == 0) { dup = true; break; }
+                                if (!dup) {
+                                    ConvItem ci; wcsncpy_s(ci.path, full, _TRUNCATE);
+                                    wcsncpy_s(ci.display, Filename(full), _TRUNCATE);
+                                    g_convItems.push_back(ci);
+                                    SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)ci.display);
+                                    added++;
+                                }
+                            }
+                        }
+                    } while (FindNextFile(hf, &fd));
+                    FindClose(hf);
+                }
+            } else if (IsAudio(p)) {
+                bool dup = false;
+                for (auto& ci : g_convItems) if (_wcsicmp(ci.path, p) == 0) { dup = true; break; }
+                if (!dup) {
+                    ConvItem ci; wcsncpy_s(ci.path, p, _TRUNCATE);
+                    wcsncpy_s(ci.display, Filename(p), _TRUNCATE);
+                    g_convItems.push_back(ci);
+                    SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)ci.display);
+                    added++;
+                }
+            }
+        }
+        DragFinish(hd);
+        wchar_t sb2[128]; swprintf_s(sb2, L"Added %d file(s) via drag & drop. Total: %d.", added, (int)g_convItems.size());
+        SetDlgItemText(hwnd, ID_CONV_STATUS, sb2);
         break;
     }
     case WM_COMMAND:
+        if (LOWORD(wParam) == ID_CONV_FORMAT && HIWORD(wParam) == CBN_SELCHANGE) {
+            int fmt = (int)SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0);
+            if (fmt < 0) fmt = 0;
+            UpdateConvQuality(hwnd, fmt);
+            break;
+        }
         switch (LOWORD(wParam)) {
         case ID_CONV_ADDPLAYLIST: {
             HWND hList = GetDlgItem(hwnd, ID_CONV_LIST); int added = 0;
@@ -2094,43 +3233,1084 @@ static LRESULT CALLBACK ConvertWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             break;
         }
         case ID_CONV_START: {
+            if (g_convRunning) { MessageBox(hwnd, L"Conversion already in progress.", L"Convert", MB_ICONWARNING); break; }
             if (g_convItems.empty()) { MessageBox(hwnd, L"No files to convert.", L"Convert", MB_ICONWARNING); break; }
             if (!g_convOutDir[0]) { MessageBox(hwnd, L"Please select an output folder.", L"Convert", MB_ICONWARNING); break; }
-            int fmt = (int)SendMessage(GetDlgItem(hwnd, ID_CONV_FORMAT), CB_GETCURSEL, 0, 0);
+
+            int fmt  = (int)SendMessage(GetDlgItem(hwnd, ID_CONV_FORMAT),  CB_GETCURSEL, 0, 0);
             int qual = (int)SendMessage(GetDlgItem(hwnd, ID_CONV_QUALITY), CB_GETCURSEL, 0, 0);
-            const wchar_t* fmtNames[] = { L"mp3",L"wav",L"flac",L"ogg",L"m4a" };
-            const int kbps[] = { 320,256,192,128,96 };
-            int bitrate = (qual >= 0 && qual < 5) ? kbps[qual] : 192;
-            const wchar_t* ext = (fmt >= 0 && fmt < 5) ? fmtNames[fmt] : L"mp3";
+            if (fmt  < 0 || fmt  >= 5) fmt  = 0;
+            if (qual < 0) qual = 0;
             bool normalize = (SendMessage(GetDlgItem(hwnd, ID_CONV_NORMALIZE), BM_GETCHECK, 0, 0) == BST_CHECKED);
-            bool copyMeta = (SendMessage(GetDlgItem(hwnd, ID_CONV_METADATA), BM_GETCHECK, 0, 0) == BST_CHECKED);
-            wchar_t info[512];
-            swprintf_s(info,
-                L"Conversion plan:\n  Files:    %d\n  Format:   %s @ %d kbps\n"
-                L"  Output:   %s\n  Normalize: %s   Metadata: %s\n\n"
-                L"Integrate BASS_Encode or call FFmpeg to perform actual encode:\n"
-                L"  ffmpeg -i input -b:a %dk output.%s\n\n"
-                L"(Progress bar and status are wired in - add the encode loop to complete.)",
-                (int)g_convItems.size(), ext, bitrate, g_convOutDir,
-                normalize ? L"Yes" : L"No", copyMeta ? L"Yes" : L"No", bitrate, ext);
-            MessageBox(hwnd, info, L"Start Conversion", MB_ICONINFORMATION);
-            HWND hProg = GetDlgItem(hwnd, ID_CONV_PROGRESS);
-            for (int i = 0; i <= 100; i += 5) {
-                SendMessage(hProg, PBM_SETPOS, i, 0);
-                wchar_t sb[64]; swprintf_s(sb, L"Processing... %d%%", i);
-                SetDlgItemText(hwnd, ID_CONV_STATUS, sb); Sleep(20);
+            bool copyMeta  = (SendMessage(GetDlgItem(hwnd, ID_CONV_METADATA),  BM_GETCHECK, 0, 0) == BST_CHECKED);
+
+            // Warn if a compressed format was chosen but ffmpeg is not available
+            if (fmt != 1) {
+                wchar_t ffPath[MAX_PATH];
+                if (!ConvFindFfmpeg(ffPath, MAX_PATH)) {
+                    const wchar_t* fmtLabels[] = { L"MP3", L"WAV", L"FLAC", L"OGG", L"AAC/M4A" };
+                    wchar_t msg[512];
+                    swprintf_s(msg, ARRAYSIZE(msg),
+                        L"FFmpeg was not found on this system.\n\n"
+                        L"%s encoding requires FFmpeg (ffmpeg.exe).\n\n"
+                        L"Files will be converted to WAV (lossless PCM) instead.\n\n"
+                        L"To enable %s output, place ffmpeg.exe in the same folder as BillyPro.exe "
+                        L"or add it to your system PATH.\n\nContinue with WAV output?",
+                        fmtLabels[fmt], fmtLabels[fmt]);
+                    if (MessageBox(hwnd, msg, L"FFmpeg Not Found", MB_YESNO | MB_ICONWARNING) != IDYES)
+                        break;
+                }
             }
-            SetDlgItemText(hwnd, ID_CONV_STATUS, L"Done. Integrate encoder library for actual audio conversion.");
-            SendMessage(hProg, PBM_SETPOS, 0, 0); break;
+
+            // Package data for the worker thread (owns a copy of the item list)
+            ConvThreadData* d = new ConvThreadData();
+            d->hwnd        = hwnd;
+            d->items       = g_convItems;
+            wcsncpy_s(d->outDir, g_convOutDir, _TRUNCATE);
+            d->fmt         = fmt;
+            d->normalize   = normalize;
+            d->copyMeta    = copyMeta;
+            d->wavBitDepth = 16;
+            d->qualArgs[0] = L'\0';
+            switch (fmt) {
+            case 0: { // MP3
+                const wchar_t* a[] = { L"-b:a 320k", L"-b:a 256k", L"-b:a 192k", L"-b:a 128k", L"-b:a 96k" };
+                int q = min(qual, 4); wcsncpy_s(d->qualArgs, a[q], _TRUNCATE); break;
+            }
+            case 1: { // WAV
+                const int bits[] = { 16, 24, 32 };
+                int q = min(qual, 2); d->wavBitDepth = bits[q]; break;
+            }
+            case 2: { // FLAC
+                const wchar_t* a[] = { L"-compression_level 8", L"-compression_level 5", L"-compression_level 0" };
+                int q = min(qual, 2); wcsncpy_s(d->qualArgs, a[q], _TRUNCATE); break;
+            }
+            case 3: { // OGG Vorbis
+                const wchar_t* a[] = { L"-q:a 10", L"-q:a 8", L"-q:a 6", L"-q:a 4", L"-q:a 2" };
+                int q = min(qual, 4); wcsncpy_s(d->qualArgs, a[q], _TRUNCATE); break;
+            }
+            case 4: { // AAC/M4A
+                const wchar_t* a[] = { L"-b:a 320k", L"-b:a 256k", L"-b:a 192k", L"-b:a 128k", L"-b:a 96k" };
+                int q = min(qual, 4); wcsncpy_s(d->qualArgs, a[q], _TRUNCATE); break;
+            }
+            }
+
+            g_convAbort      = false;
+            g_convRunning    = true;
+            g_convStartTick  = GetTickCount();
+            EnableWindow(GetDlgItem(hwnd, ID_CONV_START), FALSE);
+            EnableWindow(GetDlgItem(hwnd, ID_CONV_CLOSE), FALSE);
+            SendMessage(GetDlgItem(hwnd, ID_CONV_PROGRESS), PBM_SETPOS, 0, 0);
+            SetDlgItemText(hwnd, ID_CONV_STATUS, L"Starting conversion...");
+
+            if (g_convThread) { CloseHandle(g_convThread); g_convThread = NULL; }
+            g_convThread = CreateThread(NULL, 0, ConvThreadProc, d, 0, NULL);
+            if (!g_convThread) {
+                g_convRunning = false;
+                EnableWindow(GetDlgItem(hwnd, ID_CONV_START), TRUE);
+                EnableWindow(GetDlgItem(hwnd, ID_CONV_CLOSE), TRUE);
+                delete d;
+                MessageBox(hwnd, L"Failed to start conversion thread.", L"Error", MB_ICONERROR);
+            }
+            break;
         }
-        case ID_CONV_CLOSE: DestroyWindow(hwnd); break;
+        case ID_CONV_CLOSE:
+            if (g_convRunning) {
+                if (MessageBox(hwnd, L"A conversion is in progress. Abort and close?",
+                               L"Convert", MB_YESNO | MB_ICONWARNING) != IDYES) break;
+                g_convAbort = true;
+            }
+            DestroyWindow(hwnd);
+            break;
         }
         break;
-    case WM_KEYDOWN: if (wParam == VK_ESCAPE) DestroyWindow(hwnd); break;
-    case WM_DESTROY: g_hwndConvert = NULL; break;
+
+    case WM_CONV_PROGRESS: {
+        int pct       = (int)wParam;
+        int fileIdx   = (int)LOWORD(lParam);
+        int fileTotal = (int)HIWORD(lParam);
+        SendMessage(GetDlgItem(hwnd, ID_CONV_PROGRESS), PBM_SETPOS, pct, 0);
+        DWORD elapsed = (GetTickCount() - g_convStartTick) / 1000;
+        int eMin = (int)(elapsed / 60), eSec = (int)(elapsed % 60);
+        const wchar_t* fn = (fileIdx >= 1 && fileIdx <= (int)g_convItems.size())
+            ? Filename(g_convItems[fileIdx - 1].path) : L"";
+        wchar_t sb[320];
+        if (eMin > 0)
+            swprintf_s(sb, ARRAYSIZE(sb), L"[%d:%02d] (%d/%d, %d%%) %s",
+                       eMin, eSec, fileIdx, fileTotal, pct, fn);
+        else
+            swprintf_s(sb, ARRAYSIZE(sb), L"[%ds] (%d/%d, %d%%) %s",
+                       eSec, fileIdx, fileTotal, pct, fn);
+        SetDlgItemText(hwnd, ID_CONV_STATUS, sb);
+        return 0;
+    }
+    case WM_CONV_DONE: {
+        int ok    = (int)wParam;
+        int total = (int)lParam;
+        SendMessage(GetDlgItem(hwnd, ID_CONV_PROGRESS), PBM_SETPOS, 100, 0);
+        wchar_t sb[128];
+        if (g_convAbort)
+            swprintf_s(sb, ARRAYSIZE(sb), L"Conversion cancelled. %d of %d file(s) completed.", ok, total);
+        else
+            swprintf_s(sb, ARRAYSIZE(sb), L"Done. %d of %d file(s) converted successfully.", ok, total);
+        SetDlgItemText(hwnd, ID_CONV_STATUS, sb);
+        EnableWindow(GetDlgItem(hwnd, ID_CONV_START), TRUE);
+        EnableWindow(GetDlgItem(hwnd, ID_CONV_CLOSE), TRUE);
+        if (g_convThread) { CloseHandle(g_convThread); g_convThread = NULL; }
+        g_convRunning = false;
+        return 0;
+    }
+    case WM_ERASEBKGND: {
+        HDC dc = (HDC)wParam; RECT rc; GetClientRect(hwnd, &rc);
+        FillRect(dc, &rc, g_brBg); return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wParam;
+        SetTextColor(dc, g_theme.text);
+        SetBkColor(dc, g_theme.bg);
+        return (LRESULT)g_brBg;
+    }
+    case WM_CTLCOLORLISTBOX: {
+        HDC dc = (HDC)wParam;
+        SetTextColor(dc, g_theme.text);
+        SetBkColor(dc, g_theme.bgList);
+        return (LRESULT)g_brList;
+    }
+    case WM_KEYDOWN: if (wParam == VK_ESCAPE && !g_convRunning) DestroyWindow(hwnd); break;
+    case WM_DESTROY:
+        g_convAbort = true;
+        if (g_convThread) {
+            WaitForSingleObject(g_convThread, 8000);
+            CloseHandle(g_convThread);
+            g_convThread = NULL;
+        }
+        g_convRunning = false;
+        g_hwndConvert = NULL;
+        break;
+    case WM_CLOSE:
+        if (g_convRunning) {
+            if (MessageBox(hwnd, L"A conversion is in progress. Abort and close?",
+                           L"Convert", MB_YESNO | MB_ICONWARNING) != IDYES) return 0;
+            g_convAbort = true;
+        }
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+// ============================================================
+//  File Associations dialog
+// ============================================================
+static const wchar_t* s_audioExts[] = {
+    L".mp3", L".wav", L".flac", L".ogg", L".m4a",
+    L".aac", L".wma", L".opus", L".ape", L".aiff", nullptr
+};
+
+static void RegisterFileAssoc(const wchar_t* ext)
+{
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+
+    // ProgID: BillyPro.audio
+    // HKCU\Software\Classes\BillyPro.audio\shell\open\command = "exePath" "%1"
+    wchar_t cmd[MAX_PATH + 8];
+    swprintf_s(cmd, L"\"%s\" \"%%1\"", exePath);
+    HKEY hk;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Classes\\BillyPro.audio\\shell\\open\\command",
+            0, NULL, 0, KEY_SET_VALUE, NULL, &hk, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(hk, NULL, 0, REG_SZ, (BYTE*)cmd, (DWORD)((wcslen(cmd)+1)*sizeof(wchar_t)));
+        RegCloseKey(hk);
+    }
+    // Friendly name
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Classes\\BillyPro.audio",
+            0, NULL, 0, KEY_SET_VALUE, NULL, &hk, NULL) == ERROR_SUCCESS) {
+        const wchar_t* desc = L"Billy Pro Audio File";
+        RegSetValueExW(hk, NULL, 0, REG_SZ, (BYTE*)desc, (DWORD)((wcslen(desc)+1)*sizeof(wchar_t)));
+        RegCloseKey(hk);
+    }
+    // Map extension: HKCU\Software\Classes\.ext = BillyPro.audio
+    wchar_t keyPath[64]; swprintf_s(keyPath, L"Software\\Classes\\%s", ext);
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, keyPath,
+            0, NULL, 0, KEY_SET_VALUE, NULL, &hk, NULL) == ERROR_SUCCESS) {
+        const wchar_t* prog = L"BillyPro.audio";
+        RegSetValueExW(hk, NULL, 0, REG_SZ, (BYTE*)prog, (DWORD)((wcslen(prog)+1)*sizeof(wchar_t)));
+        RegCloseKey(hk);
+    }
+}
+
+static void UnregisterFileAssoc(const wchar_t* ext)
+{
+    wchar_t keyPath[64]; swprintf_s(keyPath, L"Software\\Classes\\%s", ext);
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, keyPath, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, &hk) == ERROR_SUCCESS) {
+        wchar_t cur[64] = L""; DWORD sz = sizeof(cur);
+        RegQueryValueExW(hk, NULL, NULL, NULL, (BYTE*)cur, &sz);
+        if (_wcsicmp(cur, L"BillyPro.audio") == 0)
+            RegDeleteValueW(hk, NULL);
+        RegCloseKey(hk);
+    }
+}
+
+static bool IsExtAssociated(const wchar_t* ext)
+{
+    wchar_t keyPath[64]; swprintf_s(keyPath, L"Software\\Classes\\%s", ext);
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, keyPath, 0, KEY_QUERY_VALUE, &hk) != ERROR_SUCCESS)
+        return false;
+    wchar_t cur[64] = L""; DWORD sz = sizeof(cur);
+    RegQueryValueExW(hk, NULL, NULL, NULL, (BYTE*)cur, &sz);
+    RegCloseKey(hk);
+    return (_wcsicmp(cur, L"BillyPro.audio") == 0);
+}
+
+static LRESULT CALLBACK AssocDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_CREATE: {
+        HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
+        RECT rc; GetClientRect(hwnd, &rc);
+        int cw = rc.right;
+
+        HWND hLbl = CreateWindow(L"STATIC",
+            L"Select file types to always open with Billy Pro:",
+            WS_CHILD | WS_VISIBLE, 8, 8, cw - 16, 18, hwnd, (HMENU)IDC_STATIC, hInst, NULL);
+        SendMessage(hLbl, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+
+        HWND hList = CreateWindowEx(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_HASSTRINGS |
+            LBS_NOINTEGRALHEIGHT | LBS_NOTIFY,
+            8, 30, cw - 16, 220, hwnd, (HMENU)ID_ASSOC_LIST, hInst, NULL);
+        SendMessage(hList, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+
+        for (int i = 0; s_audioExts[i]; i++) {
+            int idx = (int)SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)s_audioExts[i]);
+            SendMessage(hList, LB_SETITEMDATA, idx, (LPARAM)i);
+            // Use LB_SETSEL to mark checked state — we store checked as ItemData bit
+            // We'll use WM_DRAWITEM, but LBS_CHECKBOX is not a real Windows style.
+            // Instead use simple LBS_MULTIPLESEL:
+        }
+        // Re-create as a checklist using owner-draw or just show checkmarks as text
+        // Simplest: just rebuild with check status in the string
+        SendMessage(hList, LB_RESETCONTENT, 0, 0);
+        for (int i = 0; s_audioExts[i]; i++) {
+            bool on = IsExtAssociated(s_audioExts[i]);
+            wchar_t item[32]; swprintf_s(item, L"[%c]  %s", on ? L'X' : L' ', s_audioExts[i]);
+            SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)item);
+        }
+
+        int bx = 8, by = 258, bh = 26;
+        HWND hAll  = CreateWindow(L"BUTTON", L"Select All",   WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, bx, by, 90, bh, hwnd, (HMENU)ID_ASSOC_SELALL, hInst, NULL);
+        HWND hNone = CreateWindow(L"BUTTON", L"Select None",  WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, bx+94, by, 90, bh, hwnd, (HMENU)ID_ASSOC_NONE, hInst, NULL);
+        HWND hApp  = CreateWindow(L"BUTTON", L"Apply",        WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, cw-196, by, 88, bh, hwnd, (HMENU)ID_ASSOC_APPLY, hInst, NULL);
+        HWND hClo  = CreateWindow(L"BUTTON", L"Close",        WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, cw-104, by, 88, bh, hwnd, (HMENU)ID_ASSOC_CLOSE, hInst, NULL);
+        SendMessage(hAll,  WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        SendMessage(hNone, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        SendMessage(hApp,  WM_SETFONT, (WPARAM)g_fontBold, TRUE);
+        SendMessage(hClo,  WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        break;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case ID_ASSOC_LIST:
+            if (HIWORD(wParam) == LBN_SELCHANGE) {
+                // Toggle the clicked item's [X][ ] marker
+                HWND hList = GetDlgItem(hwnd, ID_ASSOC_LIST);
+                int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
+                if (sel == LB_ERR) break;
+                wchar_t buf[64]; SendMessage(hList, LB_GETTEXT, sel, (LPARAM)buf);
+                bool wasOn = (buf[1] == L'X');
+                buf[1] = wasOn ? L' ' : L'X';
+                // Replace item in-place
+                SendMessage(hList, LB_DELETESTRING, sel, 0);
+                SendMessage(hList, LB_INSERTSTRING, sel, (LPARAM)buf);
+                SendMessage(hList, LB_SETCURSEL, sel, 0);
+            }
+            break;
+        case ID_ASSOC_SELALL: {
+            HWND hList = GetDlgItem(hwnd, ID_ASSOC_LIST);
+            int cnt = (int)SendMessage(hList, LB_GETCOUNT, 0, 0);
+            for (int i = 0; i < cnt; i++) {
+                wchar_t buf[64]; SendMessage(hList, LB_GETTEXT, i, (LPARAM)buf);
+                buf[1] = L'X';
+                SendMessage(hList, LB_DELETESTRING, i, 0);
+                SendMessage(hList, LB_INSERTSTRING, i, (LPARAM)buf);
+            }
+            break;
+        }
+        case ID_ASSOC_NONE: {
+            HWND hList = GetDlgItem(hwnd, ID_ASSOC_LIST);
+            int cnt = (int)SendMessage(hList, LB_GETCOUNT, 0, 0);
+            for (int i = 0; i < cnt; i++) {
+                wchar_t buf[64]; SendMessage(hList, LB_GETTEXT, i, (LPARAM)buf);
+                buf[1] = L' ';
+                SendMessage(hList, LB_DELETESTRING, i, 0);
+                SendMessage(hList, LB_INSERTSTRING, i, (LPARAM)buf);
+            }
+            break;
+        }
+        case ID_ASSOC_APPLY: {
+            HWND hList = GetDlgItem(hwnd, ID_ASSOC_LIST);
+            int cnt = (int)SendMessage(hList, LB_GETCOUNT, 0, 0);
+            for (int i = 0; i < cnt && s_audioExts[i]; i++) {
+                wchar_t buf[64]; SendMessage(hList, LB_GETTEXT, i, (LPARAM)buf);
+                if (buf[1] == L'X') RegisterFileAssoc(s_audioExts[i]);
+                else                UnregisterFileAssoc(s_audioExts[i]);
+            }
+            // Notify Explorer
+            SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
+            MessageBox(hwnd, L"File associations updated.\n\nAudio files will now open with Billy Pro when double-clicked.",
+                L"File Associations", MB_ICONINFORMATION);
+            break;
+        }
+        case ID_ASSOC_CLOSE: DestroyWindow(hwnd); break;
+        }
+        break;
+    case WM_DESTROY: g_hwndAssoc = NULL; break;
     case WM_CLOSE:   DestroyWindow(hwnd); return 0;
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+void OpenFileAssocDialog()
+{
+    if (g_hwndAssoc && IsWindow(g_hwndAssoc)) { SetForegroundWindow(g_hwndAssoc); return; }
+    HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(g_hwnd, GWLP_HINSTANCE);
+    static const wchar_t ASSOC_CLASS[] = L"BillyAssocWnd";
+    static bool assocReg = false;
+    if (!assocReg) {
+        WNDCLASS wc = {}; wc.lpfnWndProc = AssocDlgProc; wc.hInstance = hInst;
+        wc.lpszClassName = ASSOC_CLASS; wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1); RegisterClass(&wc); assocReg = true;
+    }
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE;
+    RECT cr = { 0, 0, 340, 294 }; AdjustWindowRect(&cr, style, FALSE);
+    int dw = cr.right - cr.left, dh = cr.bottom - cr.top;
+    g_hwndAssoc = CreateWindowEx(WS_EX_APPWINDOW, ASSOC_CLASS,
+        L"Billy Pro \u2014 File Associations", style, 0, 0, dw, dh, NULL, NULL, hInst, NULL);
+    RECT pr; GetWindowRect(g_hwnd, &pr);
+    SetWindowPos(g_hwndAssoc, NULL,
+        pr.left + (pr.right - pr.left - dw) / 2,
+        pr.top  + (pr.bottom - pr.top  - dh) / 2,
+        dw, dh, SWP_NOZORDER);
+}
+
+// ============================================================
+//  Taskbar thumbnail toolbar (prev / play-pause / next)
+// ============================================================
+static HICON CreateThumbIcon(const wchar_t* symbol)
+{
+    // Draw a simple 20x20 icon with a Unicode symbol using GDI
+    int sz = 20;
+    HDC hdcScreen = GetDC(NULL);
+    HDC hdc = CreateCompatibleDC(hdcScreen);
+    ReleaseDC(NULL, hdcScreen);
+
+    BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = sz; bi.bmiHeader.biHeight = -sz;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = NULL;
+    HBITMAP hbm = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    HBITMAP hOld = (HBITMAP)SelectObject(hdc, hbm);
+
+    // Fill transparent (alpha=0, black)
+    memset(bits, 0, sz * sz * 4);
+
+    // Draw symbol in white
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(255, 255, 255));
+    HFONT hf = CreateFont(-14, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI Symbol");
+    HFONT hOldF = (HFONT)SelectObject(hdc, hf);
+    RECT rc = { 0, 0, sz, sz };
+    DrawText(hdc, symbol, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(hdc, hOldF); DeleteObject(hf);
+
+    // Create mask (all-black = fully use color bitmap)
+    HBITMAP hMask = CreateBitmap(sz, sz, 1, 1, NULL);
+    ICONINFO ii = {}; ii.fIcon = TRUE; ii.hbmColor = hbm; ii.hbmMask = hMask;
+    HICON hico = CreateIconIndirect(&ii);
+
+    SelectObject(hdc, hOld);
+    DeleteObject(hbm); DeleteObject(hMask); DeleteDC(hdc);
+    return hico;
+}
+
+void UpdateThumbButtons()
+{
+    if (!g_pTaskbar || !g_hwnd) return;
+    bool playing = (currentStream && BASS_ChannelIsActive(currentStream) == BASS_ACTIVE_PLAYING);
+
+    THUMBBUTTON tb[3] = {};
+    // Prev
+    tb[0].dwMask  = THB_ICON | THB_TOOLTIP | THB_FLAGS;
+    tb[0].iId     = THUMB_BTN_PREV;
+    tb[0].hIcon   = g_thumbIcons[0];
+    wcscpy_s(tb[0].szTip, L"Previous");
+    tb[0].dwFlags = THBF_ENABLED;
+    // Play/Pause — icon switches based on current play state
+    tb[1].dwMask  = THB_ICON | THB_TOOLTIP | THB_FLAGS;
+    tb[1].iId     = THUMB_BTN_PLAY;
+    tb[1].hIcon   = playing ? g_thumbIcons[2] : g_thumbIcons[1]; // ⏸ if playing, ▶ if paused/stopped
+    wcscpy_s(tb[1].szTip, playing ? L"Pause" : L"Play");
+    tb[1].dwFlags = THBF_ENABLED;
+    // Next
+    tb[2].dwMask  = THB_ICON | THB_TOOLTIP | THB_FLAGS;
+    tb[2].iId     = THUMB_BTN_NEXT;
+    tb[2].hIcon   = g_thumbIcons[3];
+    wcscpy_s(tb[2].szTip, L"Next");
+    tb[2].dwFlags = THBF_ENABLED;
+
+    g_pTaskbar->ThumbBarUpdateButtons(g_hwnd, 3, tb);
+}
+
+// ============================================================
+//  Options dialog  (replaces the old ugly DLGTEMPLATE version)
+//  Contains: Bass Boost settings, Multi-instance, Drop mode,
+//  File Associations button, Dark Mode toggle
+// ============================================================
+// ─────────────────────────────────────────────────────────────────────────────
+//  Options dialog — Billy-style sidebar layout
+// ─────────────────────────────────────────────────────────────────────────────
+#define ID_OPT_NAVLIST      612
+#define ID_OPT_BB_ENABLE    601
+#define ID_OPT_BB_LOW       602
+#define ID_OPT_BB_HIGH      603
+#define ID_OPT_BB_GAIN      604
+#define ID_OPT_MULTIINST    605
+#define ID_OPT_DROP_APPEND  606
+#define ID_OPT_DROP_REPLACE 607
+#define ID_OPT_FILEASSOC    608
+#define ID_OPT_DARKMODE     609
+#define ID_OPT_SAVE         610
+#define ID_OPT_CANCEL       611
+#define ID_OPT_FT_WAV       620
+#define ID_OPT_FT_MP3       621
+#define ID_OPT_FT_OGG       622
+#define ID_OPT_FT_FLAC      623
+#define ID_OPT_FT_M3U       624
+#define ID_OPT_DEVICE_COMBO  626
+#define ID_OPT_DEVICE_RESET  627
+#define ID_OPT_MEDIA_PATH    628
+#define ID_OPT_MEDIA_BROWSE  629
+#define ID_OPT_MEDIA_LIST    633
+#define ID_OPT_MEDIA_ADD     634
+#define ID_OPT_MEDIA_REMOVE  635
+#define ID_OPT_PITCH_ENABLE  630
+#define ID_OPT_PITCH_VALUE   631
+#define ID_OPT_RESET         632
+#define ID_OPT_PITCH_SLIDER  636
+#define ID_OPT_SEEK_STEP     637
+#define ID_OPT_REVERB        640
+#define ID_OPT_SATURATE      641
+#define ID_OPT_VINYL         642
+#define ID_OPT_HIFI          643
+#define ID_OPT_REV_MIX       644
+#define ID_OPT_REV_ROOM      645
+#define ID_OPT_REV_WIDTH     652
+#define ID_OPT_SAT_DRIVE     646
+#define ID_OPT_SAT_LEVEL     647
+#define ID_OPT_VIN_FREQ      648
+#define ID_OPT_VIN_CRACK     649
+#define ID_OPT_HFI_BASS      650
+#define ID_OPT_HFI_WARM      651
+
+static HWND s_optPanels[6] = {};
+static int  s_optPage = 0;
+
+static LRESULT CALLBACK OptPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_ERASEBKGND: {
+        HDC dc = (HDC)wp; RECT rc; GetClientRect(hwnd, &rc);
+        FillRect(dc, &rc, g_brBg); return 1;
+    }
+    case WM_HSCROLL:
+    case WM_COMMAND:
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORBTN:
+    case WM_CTLCOLORLISTBOX:
+        return SendMessage(GetParent(hwnd), msg, wp, lp);
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+static void OptSwitchPage(int page)
+{
+    for (int i = 0; i < 6; i++)
+        if (s_optPanels[i]) ShowWindow(s_optPanels[i], i == page ? SW_SHOW : SW_HIDE);
+    s_optPage = page;
+}
+
+static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    // Layout constants (client area 490 x 380)
+    static const int CL_W  = 490;
+    static const int CL_H  = 548;
+    static const int SB_W  = 130;   // sidebar width
+    static const int GAP   = 8;
+    static const int BTN_H = 28;
+    static const int PNL_X = SB_W + GAP * 2;
+    static const int PNL_Y = GAP;
+    static const int PNL_W = CL_W - PNL_X - GAP;
+    static const int PNL_H = CL_H - GAP * 2 - BTN_H - GAP;
+
+    switch (msg) {
+    case WM_CREATE: {
+        if (g_darkMode) { BOOL dk = TRUE; DwmSetWindowAttribute(hwnd, 20, &dk, sizeof(dk)); DwmSetWindowAttribute(hwnd, 19, &dk, sizeof(dk)); }
+        HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
+        s_optPage = 0;
+        for (auto& p : s_optPanels) p = NULL;
+
+        // Register panel class once
+        static bool panelReg = false;
+        if (!panelReg) {
+            WNDCLASS wcp = {};
+            wcp.lpfnWndProc   = OptPanelProc;
+            wcp.hInstance     = hInst;
+            wcp.hCursor       = LoadCursor(NULL, IDC_ARROW);
+            wcp.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+            wcp.lpszClassName = L"BillyOptPanel";
+            RegisterClass(&wcp);
+            panelReg = true;
+        }
+
+        // ── Control creation helpers ─────────────────────────────────────
+        auto lbl = [&](HWND par, int x, int y, int w, int h, const wchar_t* t) -> HWND {
+            HWND hL = CreateWindow(L"STATIC", t, WS_CHILD|WS_VISIBLE|SS_LEFT,
+                x, y, w, h, par, (HMENU)IDC_STATIC, hInst, NULL);
+            SendMessage(hL, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+            return hL;
+        };
+        auto chk = [&](HWND par, int x, int y, int w, int h, WORD id, const wchar_t* t, bool v) -> HWND {
+            HWND hC = CreateWindow(L"BUTTON", t,
+                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,
+                x, y, w, h, par, (HMENU)(UINT_PTR)id, hInst, NULL);
+            SendMessage(hC, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+            SendMessage(hC, BM_SETCHECK, v ? BST_CHECKED : BST_UNCHECKED, 0);
+            return hC;
+        };
+        auto rad = [&](HWND par, int x, int y, int w, int h, WORD id, const wchar_t* t, bool v) -> HWND {
+            HWND hR = CreateWindow(L"BUTTON", t,
+                WS_CHILD|WS_VISIBLE|BS_AUTORADIOBUTTON|WS_TABSTOP,
+                x, y, w, h, par, (HMENU)(UINT_PTR)id, hInst, NULL);
+            SendMessage(hR, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+            SendMessage(hR, BM_SETCHECK, v ? BST_CHECKED : BST_UNCHECKED, 0);
+            return hR;
+        };
+        auto edt = [&](HWND par, int x, int y, int w, int h, WORD id, const wchar_t* val) -> HWND {
+            HWND hE = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", val,
+                WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL|WS_TABSTOP,
+                x, y, w, h, par, (HMENU)(UINT_PTR)id, hInst, NULL);
+            SendMessage(hE, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+            return hE;
+        };
+        auto grp = [&](HWND par, int x, int y, int w, int h, const wchar_t* t) -> HWND {
+            HWND hG = CreateWindow(L"BUTTON", t, WS_CHILD|WS_VISIBLE|BS_GROUPBOX,
+                x, y, w, h, par, (HMENU)IDC_STATIC, hInst, NULL);
+            SendMessage(hG, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+            return hG;
+        };
+        auto btn = [&](HWND par, int x, int y, int w, int h, WORD id, const wchar_t* t, bool def=false) -> HWND {
+            HWND hB = CreateWindow(L"BUTTON", t,
+                WS_CHILD|WS_VISIBLE|WS_TABSTOP|(def?BS_DEFPUSHBUTTON:BS_PUSHBUTTON),
+                x, y, w, h, par, (HMENU)(UINT_PTR)id, hInst, NULL);
+            SendMessage(hB, WM_SETFONT, (WPARAM)(def?g_fontBold:g_fontUI), TRUE);
+            return hB;
+        };
+        auto mkPanel = [&](bool visible) -> HWND {
+            return CreateWindow(L"BillyOptPanel", L"",
+                WS_CHILD | (visible ? WS_VISIBLE : 0),
+                PNL_X, PNL_Y, PNL_W, PNL_H, hwnd, NULL, hInst, NULL);
+        };
+
+        // ── Sidebar navigation listbox ───────────────────────────────────
+        HWND hNav = CreateWindow(L"LISTBOX", NULL,
+            WS_CHILD|WS_VISIBLE|WS_BORDER|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT|WS_TABSTOP,
+            GAP, GAP, SB_W, PNL_H, hwnd, (HMENU)ID_OPT_NAVLIST, hInst, NULL);
+        SendMessage(hNav, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        SendMessage(hNav, LB_ADDSTRING, 0, (LPARAM)L"Setup");
+        SendMessage(hNav, LB_ADDSTRING, 0, (LPARAM)L"Display");
+        SendMessage(hNav, LB_ADDSTRING, 0, (LPARAM)L"Audio");
+        SendMessage(hNav, LB_ADDSTRING, 0, (LPARAM)L"Device");
+        SendMessage(hNav, LB_ADDSTRING, 0, (LPARAM)L"Media");
+        SendMessage(hNav, LB_ADDSTRING, 0, (LPARAM)L"Timestretch");
+        SendMessage(hNav, LB_SETCURSEL, 0, 0);
+
+        // ── Bottom: Save / Cancel / Reset (always visible in main window) ─
+        int btnY = CL_H - GAP - BTN_H;
+        btn(hwnd, CL_W - GAP - 90 - GAP - 90,             btnY, 90, BTN_H, ID_OPT_SAVE,   L"Save",   true);
+        btn(hwnd, CL_W - GAP - 90,                        btnY, 90, BTN_H, ID_OPT_CANCEL, L"Cancel", false);
+        btn(hwnd, GAP,                                     btnY, 120, BTN_H, ID_OPT_RESET, L"Reset to Defaults", false);
+
+        // ── Page 0: Setup ─────────────────────────────────────────────────
+        {
+            HWND p = mkPanel(true);
+            s_optPanels[0] = p;
+            int w = PNL_W - 4;
+
+            grp(p, 0, 0, w, 108, L"Open Billy Pro with these file types");
+            chk(p, 10, 20, 80, 20, ID_OPT_FT_WAV,  L"WAV",  false);
+            chk(p, 95, 20, 80, 20, ID_OPT_FT_MP3,  L"MP3",  false);
+            chk(p, 180, 20, 80, 20, ID_OPT_FT_OGG,  L"OGG",  false);
+            chk(p, 10, 42, 80, 20, ID_OPT_FT_FLAC, L"FLAC", false);
+            chk(p, 95, 42, 80, 20, ID_OPT_FT_M3U,  L"M3U",  false);
+            btn(p, 10, 68, w - 20, 26, ID_OPT_FILEASSOC, L"Associate selected types with Billy Pro");
+
+            grp(p, 0, 118, w, 82, L"General");
+            chk(p, 10, 136, w - 20, 20, ID_OPT_MULTIINST,
+                L"Allow multiple instances of Billy Pro", g_multiInst);
+            lbl(p, 10, 162, 160, 16, L"Arrow key seek (seconds):");
+            {
+                wchar_t sbuf[16]; swprintf_s(sbuf, L"%.0f", g_seekStep);
+                edt(p, 174, 160, 50, 20, ID_OPT_SEEK_STEP, sbuf);
+            }
+
+            grp(p, 0, 190, w, 68, L"Drag && Drop");
+            rad(p, 10, 208, w - 20, 20, ID_OPT_DROP_APPEND,
+                L"Add dropped files to current playlist", g_dropAppend);
+            rad(p, 10, 228, w - 20, 20, ID_OPT_DROP_REPLACE,
+                L"Replace playlist with dropped files", !g_dropAppend);
+        }
+
+        // ── Page 1: Display ───────────────────────────────────────────────
+        {
+            HWND p = mkPanel(false);
+            s_optPanels[1] = p;
+            int w = PNL_W - 4;
+            grp(p, 0, 0, w, 52, L"Theme");
+            chk(p, 10, 18, w - 20, 24, ID_OPT_DARKMODE, L"Dark Mode", g_darkMode);
+        }
+
+        // ── Page 2: Audio ─────────────────────────────────────────────────
+        {
+            HWND p = mkPanel(false);
+            s_optPanels[2] = p;
+            int w = PNL_W - 4;
+            wchar_t buf[32];
+            grp(p, 0, 0, w, 130, L"Bass Boost");
+            chk(p, 10, 18, w - 20, 22, ID_OPT_BB_ENABLE, L"Enable Bass Boost", g_bassBoost);
+            lbl(p, 20, 46, 120, 16, L"Low Freq (Hz):");
+            swprintf_s(buf, L"%.1f", g_bbFreqLow);
+            edt(p, 155, 44, 90, 20, ID_OPT_BB_LOW, buf);
+            lbl(p, 20, 70, 120, 16, L"High Freq (Hz):");
+            swprintf_s(buf, L"%.1f", g_bbFreqHigh);
+            edt(p, 155, 68, 90, 20, ID_OPT_BB_HIGH, buf);
+            lbl(p, 20, 94, 120, 16, L"Gain (dB):");
+            swprintf_s(buf, L"%.1f", g_bbGainDB);
+            edt(p, 155, 92, 90, 20, ID_OPT_BB_GAIN, buf);
+
+            // Reverb
+            grp(p, 0, 138, w, 96, L"Reverb");
+            chk(p, 10, 154, w - 20, 20, ID_OPT_REVERB, L"Enable Reverb (Room Ambience)", g_dspReverb);
+            lbl(p, 10, 180, 44, 16, L"Mix %:");
+            swprintf_s(buf, L"%.0f", g_revMix);   edt(p, 56,  178, 46, 20, ID_OPT_REV_MIX,   buf);
+            lbl(p, 108, 180, 52, 16, L"Room %:");
+            swprintf_s(buf, L"%.0f", g_revRoom);  edt(p, 162, 178, 46, 20, ID_OPT_REV_ROOM,  buf);
+            lbl(p, 214, 180, 54, 16, L"Width %:");
+            swprintf_s(buf, L"%.0f", g_revWidth); edt(p, 270, 178, 50, 20, ID_OPT_REV_WIDTH, buf);
+            lbl(p, 20, 202, w - 30, 14, L"Width 0 = mono reverb, 100 = full stereo.");
+
+            // Saturation
+            grp(p, 0, 242, w, 70, L"Saturation");
+            chk(p, 10, 258, w - 20, 20, ID_OPT_SATURATE, L"Enable Saturation (Tube Warmth)", g_dspSaturate);
+            lbl(p, 20, 284, 44, 16, L"Drive:");
+            swprintf_s(buf, L"%.1f", g_satDrive);  edt(p, 66, 282, 52, 20, ID_OPT_SAT_DRIVE, buf);
+            lbl(p, 130, 284, 54, 16, L"Level %:");
+            swprintf_s(buf, L"%.0f", g_satLevel);  edt(p, 186, 282, 52, 20, ID_OPT_SAT_LEVEL, buf);
+
+            // Vinyl
+            grp(p, 0, 320, w, 70, L"Vinyl Emulation");
+            chk(p, 10, 336, w - 20, 20, ID_OPT_VINYL, L"Enable Vinyl (HF Roll-off + Crackles)", g_dspVinyl);
+            lbl(p, 20, 362, 44, 16, L"LP Hz:");
+            swprintf_s(buf, L"%.0f", g_vinLpFreq);  edt(p, 66, 360, 60, 20, ID_OPT_VIN_FREQ,  buf);
+            lbl(p, 138, 362, 58, 16, L"Crackle %:");
+            swprintf_s(buf, L"%.0f", g_vinCrackle); edt(p, 198, 360, 52, 20, ID_OPT_VIN_CRACK, buf);
+
+            // HiFi Amplifier
+            grp(p, 0, 398, w, 70, L"HiFi Amplifier");
+            chk(p, 10, 414, w - 20, 20, ID_OPT_HIFI, L"Enable HiFi Amplifier (Bass Shelf + Warmth)", g_dspHifi);
+            lbl(p, 20, 440, 52, 16, L"Bass dB:");
+            swprintf_s(buf, L"%.1f", g_hfiBassDb); edt(p, 74, 438, 52, 20, ID_OPT_HFI_BASS, buf);
+            lbl(p, 138, 440, 60, 16, L"Warmth %:");
+            swprintf_s(buf, L"%.0f", g_hfiWarmth); edt(p, 200, 438, 52, 20, ID_OPT_HFI_WARM, buf);
+
+        }
+
+        // ── Page 3: Device ────────────────────────────────────────────────
+        {
+            HWND p = mkPanel(false);
+            s_optPanels[3] = p;
+            int w = PNL_W - 4;
+            grp(p, 0, 0, w, 130, L"Audio Output");
+            lbl(p, 10, 20, w - 20, 16, L"Billy output:");
+            HWND hCombo = CreateWindow(L"COMBOBOX", L"",
+                WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST|CBS_HASSTRINGS,
+                10, 38, w - 20, 200, p, (HMENU)ID_OPT_DEVICE_COMBO, hInst, NULL);
+            SendMessage(hCombo, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+            // Enumerate BASS devices
+            BASS_DEVICEINFO di;
+            int selIdx = 0, devCount = 0;
+            DWORD curDev = BASS_GetDevice();
+            for (int d = 1; BASS_GetDeviceInfo(d, &di); d++) {
+                if (di.flags & BASS_DEVICE_ENABLED) {
+                    wchar_t wname[256];
+                    MultiByteToWideChar(CP_ACP, 0, di.name, -1, wname, 256);
+                    int idx = (int)SendMessage(hCombo, CB_ADDSTRING, 0, (LPARAM)wname);
+                    SendMessage(hCombo, CB_SETITEMDATA, idx, (LPARAM)d);
+                    if ((DWORD)d == curDev) selIdx = devCount;
+                    devCount++;
+                }
+            }
+            if (devCount > 0) SendMessage(hCombo, CB_SETCURSEL, selIdx, 0);
+            btn(p, 10, 68, w - 20, 26, ID_OPT_DEVICE_RESET, L"Reset sound driver mixer");
+            // Sound info
+            lbl(p, 10, 104, w - 20, 16, L"Sound details:");
+            wchar_t detail[128];
+            DWORD bassVer = BASS_GetVersion();
+            swprintf_s(detail, L"BASS v%d.%d.%d  |  Buffer: 3000 ms",
+                HIBYTE(HIWORD(bassVer)), LOBYTE(HIWORD(bassVer)), HIBYTE(LOWORD(bassVer)));
+            lbl(p, 10, 120, w - 20, 16, detail);
+        }
+
+        // ── Page 4: Media ─────────────────────────────────────────────────
+        {
+            HWND p = mkPanel(false);
+            s_optPanels[4] = p;
+            int w = PNL_W - 4;
+            grp(p, 0, 0, w, 180, L"Media Folders");
+            lbl(p, 10, 20, w - 20, 16, L"Folders shown in the \u2605 browser (add one or more):");
+            // Listbox of configured folders
+            HWND hList = CreateWindowEx(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
+                WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP,
+                10, 38, w - 20, 100, p, (HMENU)ID_OPT_MEDIA_LIST, hInst, NULL);
+            SendMessage(hList, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+            for (auto& f : g_mediaFolders)
+                SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)f.c_str());
+            btn(p, 10,        144, 90, 24, ID_OPT_MEDIA_ADD,    L"Add Folder...");
+            btn(p, 106,       144, 90, 24, ID_OPT_MEDIA_REMOVE, L"Remove");
+            lbl(p, 10, 168, w - 20, 14, L"Press the \u2605 button on the main toolbar to browse.");
+        }
+
+        // ── Page 5: Timestretch ───────────────────────────────────────────
+        {
+            HWND p = mkPanel(false);
+            s_optPanels[5] = p;
+            int w = PNL_W - 4;
+            grp(p, 0, 0, w, 150, L"Pitch / Speed (CDJ-style)");
+            chk(p, 10, 20, w - 20, 20, ID_OPT_PITCH_ENABLE, L"Enable pitch shift (changes pitch + tempo)", g_pitchEnabled);
+
+            // Slider: -120 to +120 in units of 0.1 semitone
+            int sliderVal = (int)roundf(g_pitchSemitones * 10.0f);
+            HWND hSlider = CreateWindow(TRACKBAR_CLASS, NULL,
+                WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP,
+                10, 46, w - 80, 28, p, (HMENU)ID_OPT_PITCH_SLIDER, hInst, NULL);
+            SendMessage(hSlider, TBM_SETRANGE, TRUE, MAKELONG(-120, 120));
+            SendMessage(hSlider, TBM_SETTICFREQ, 10, 0);  // tick every 1 semitone
+            SendMessage(hSlider, TBM_SETPAGESIZE, 0, 10); // PgUp/Dn = 1 semitone
+            SendMessage(hSlider, TBM_SETPOS, TRUE, sliderVal);
+
+            // Value edit: shows semitones with 1 decimal place
+            wchar_t pbuf[16]; swprintf_s(pbuf, L"%.1f", g_pitchSemitones);
+            edt(p, w - 66, 48, 60, 22, ID_OPT_PITCH_VALUE, pbuf);
+
+            lbl(p, 10, 80, 40, 14, L"-12");
+            lbl(p, w/2 - 4, 80, 20, 14, L"0");
+            lbl(p, w - 72, 80, 24, 14, L"+12");
+            lbl(p, 10, 100, w - 20, 32,
+                L"Negative = lower pitch/slower.  Positive = higher pitch/faster.\n"
+                L"Move slider or type a value (e.g. -8.4).");
+            lbl(p, 10, 132, w - 20, 14, L"Time display updates to reflect changed duration.");
+        }
+
+        break;
+    }
+
+    case WM_COMMAND:
+        // EN_CHANGE on pitch value edit — sync slider position
+        if (LOWORD(wParam) == ID_OPT_PITCH_VALUE && HIWORD(wParam) == EN_CHANGE && s_optPanels[5]) {
+            HWND hEdit   = GetDlgItem(s_optPanels[5], ID_OPT_PITCH_VALUE);
+            HWND hSlider = GetDlgItem(s_optPanels[5], ID_OPT_PITCH_SLIDER);
+            if (hEdit && hSlider) {
+                wchar_t buf[16] = {}; GetWindowText(hEdit, buf, 16);
+                float v = max(-12.0f, min(12.0f, (float)_wtof(buf)));
+                int newPos = (int)roundf(v * 10.0f);
+                if ((int)SendMessage(hSlider, TBM_GETPOS, 0, 0) != newPos)
+                    SendMessage(hSlider, TBM_SETPOS, TRUE, newPos);
+            }
+        }
+        switch (LOWORD(wParam)) {
+        case ID_OPT_NAVLIST:
+            if (HIWORD(wParam) == LBN_SELCHANGE) {
+                int sel = (int)SendMessage(GetDlgItem(hwnd, ID_OPT_NAVLIST), LB_GETCURSEL, 0, 0);
+                if (sel >= 0 && sel < 6) OptSwitchPage(sel);
+            }
+            break;
+
+        case ID_OPT_MEDIA_ADD: {
+            BROWSEINFO bi = {}; bi.hwndOwner = hwnd; bi.lpszTitle = L"Select Media Folder";
+            bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
+            LPITEMIDLIST pidl = SHBrowseForFolder(&bi);
+            if (pidl) {
+                wchar_t folder[MAX_PATH] = {};
+                if (SHGetPathFromIDList(pidl, folder) && folder[0]) {
+                    // Avoid duplicates
+                    bool dup = false;
+                    for (auto& f : g_mediaFolders) if (_wcsicmp(f.c_str(), folder) == 0) { dup = true; break; }
+                    if (!dup) {
+                        g_mediaFolders.push_back(folder);
+                        // Keep g_mediaFolder = first entry
+                        wcsncpy_s(g_mediaFolder, g_mediaFolders[0].c_str(), _TRUNCATE);
+                        if (s_optPanels[4]) {
+                            HWND hList = GetDlgItem(s_optPanels[4], ID_OPT_MEDIA_LIST);
+                            SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)folder);
+                        }
+                        LayoutControls(g_hwnd);
+                    }
+                }
+                CoTaskMemFree(pidl);
+            }
+            break;
+        }
+        case ID_OPT_MEDIA_REMOVE: {
+            if (!s_optPanels[4]) break;
+            HWND hList = GetDlgItem(s_optPanels[4], ID_OPT_MEDIA_LIST);
+            int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
+            if (sel == LB_ERR) break;
+            if (sel >= 0 && sel < (int)g_mediaFolders.size()) {
+                g_mediaFolders.erase(g_mediaFolders.begin() + sel);
+                SendMessage(hList, LB_DELETESTRING, sel, 0);
+                // Sync g_mediaFolder
+                if (!g_mediaFolders.empty())
+                    wcsncpy_s(g_mediaFolder, g_mediaFolders[0].c_str(), _TRUNCATE);
+                else
+                    g_mediaFolder[0] = L'\0';
+                // If browser was active and now no folders, deactivate it
+                if (g_mediaFolders.empty() && g_mediaActive) {
+                    g_mediaActive = false;
+                    g_browserActive = false;
+                    g_browserItems.clear();
+                }
+                LayoutControls(g_hwnd);
+            }
+            break;
+        }
+
+        case ID_OPT_FILEASSOC: {
+            // Register checked file types directly
+            wchar_t exe[MAX_PATH];
+            GetModuleFileName(NULL, exe, MAX_PATH);
+            wchar_t cmd[MAX_PATH + 12];
+            swprintf_s(cmd, L"\"%s\" \"%%1\"", exe);
+            struct { WORD id; const wchar_t* ext; } types[] = {
+                {ID_OPT_FT_WAV, L".wav"}, {ID_OPT_FT_MP3, L".mp3"},
+                {ID_OPT_FT_OGG, L".ogg"}, {ID_OPT_FT_FLAC, L".flac"},
+                {ID_OPT_FT_M3U, L".m3u"},
+            };
+            int count = 0;
+            for (auto& t : types) {
+                HWND hC = GetDlgItem(s_optPanels[0], t.id);
+                if (!hC || SendMessage(hC, BM_GETCHECK, 0, 0) != BST_CHECKED) continue;
+                wchar_t key[MAX_PATH];
+                HKEY hk;
+                swprintf_s(key, L"Software\\Classes\\%s", t.ext);
+                if (RegCreateKeyEx(HKEY_CURRENT_USER, key, 0, NULL, 0, KEY_WRITE, NULL, &hk, NULL) == ERROR_SUCCESS) {
+                    RegSetValueEx(hk, NULL, 0, REG_SZ, (const BYTE*)L"BillyProFile",
+                        (DWORD)sizeof(L"BillyProFile")); RegCloseKey(hk);
+                }
+                swprintf_s(key, L"Software\\Classes\\BillyProFile\\shell\\open\\command");
+                if (RegCreateKeyEx(HKEY_CURRENT_USER, key, 0, NULL, 0, KEY_WRITE, NULL, &hk, NULL) == ERROR_SUCCESS) {
+                    RegSetValueEx(hk, NULL, 0, REG_SZ, (const BYTE*)cmd,
+                        (DWORD)((wcslen(cmd)+1)*sizeof(wchar_t))); RegCloseKey(hk);
+                }
+                count++;
+            }
+            SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
+            if (count > 0) MessageBox(hwnd, L"File associations updated.", L"Billy Pro", MB_OK|MB_ICONINFORMATION);
+            else MessageBox(hwnd, L"Select at least one file type first.", L"Billy Pro", MB_OK|MB_ICONWARNING);
+            break;
+        }
+
+        case ID_OPT_DEVICE_RESET: {
+            if (!s_optPanels[3]) break;
+            HWND hCombo = GetDlgItem(s_optPanels[3], ID_OPT_DEVICE_COMBO);
+            int sel = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
+            if (sel == CB_ERR) break;
+            int devIdx = (int)SendMessage(hCombo, CB_GETITEMDATA, sel, 0);
+            if ((DWORD)devIdx == BASS_GetDevice()) break;
+            if (currentStream) {
+                BASS_ChannelStop(currentStream);
+                BASS_StreamFree(currentStream);
+                currentStream = 0;
+            }
+            BASS_Free();
+            BASS_Init(devIdx, 44100, 0, g_hwnd, NULL);
+            ApplyDSP();
+            UpdateStatusBar();
+            break;
+        }
+
+        case ID_OPT_SAVE: {
+            wchar_t buf[32];
+            // Audio page
+            GetWindowText(GetDlgItem(s_optPanels[2], ID_OPT_BB_LOW),  buf, 32); float lo = (float)_wtof(buf);
+            GetWindowText(GetDlgItem(s_optPanels[2], ID_OPT_BB_HIGH), buf, 32); float hi = (float)_wtof(buf);
+            GetWindowText(GetDlgItem(s_optPanels[2], ID_OPT_BB_GAIN), buf, 32); float gn = (float)_wtof(buf);
+            g_bbFreqLow  = max(20.0f,  min(500.0f,  lo));
+            g_bbFreqHigh = max(50.0f,  min(2000.0f, hi));
+            g_bbGainDB   = max(0.0f,   min(24.0f,   gn));
+            g_bassBoost   = (SendMessage(GetDlgItem(s_optPanels[2], ID_OPT_BB_ENABLE), BM_GETCHECK,0,0)==BST_CHECKED);
+            g_dspReverb   = (SendMessage(GetDlgItem(s_optPanels[2], ID_OPT_REVERB),   BM_GETCHECK,0,0)==BST_CHECKED);
+            g_dspSaturate = (SendMessage(GetDlgItem(s_optPanels[2], ID_OPT_SATURATE), BM_GETCHECK,0,0)==BST_CHECKED);
+            g_dspVinyl    = (SendMessage(GetDlgItem(s_optPanels[2], ID_OPT_VINYL),    BM_GETCHECK,0,0)==BST_CHECKED);
+            g_dspHifi     = (SendMessage(GetDlgItem(s_optPanels[2], ID_OPT_HIFI),     BM_GETCHECK,0,0)==BST_CHECKED);
+            {
+                wchar_t tb[16];
+                GetDlgItemText(s_optPanels[2], ID_OPT_REV_MIX,   tb,16); g_revMix    = max(0.0f,  min(100.0f,  (float)_wtof(tb)));
+                GetDlgItemText(s_optPanels[2], ID_OPT_REV_ROOM,  tb,16); g_revRoom   = max(0.0f,  min(100.0f,  (float)_wtof(tb)));
+                GetDlgItemText(s_optPanels[2], ID_OPT_REV_WIDTH, tb,16); g_revWidth  = max(0.0f,  min(100.0f,  (float)_wtof(tb)));
+                GetDlgItemText(s_optPanels[2], ID_OPT_SAT_DRIVE, tb,16); g_satDrive  = max(1.0f,  min(10.0f,   (float)_wtof(tb)));
+                GetDlgItemText(s_optPanels[2], ID_OPT_SAT_LEVEL, tb,16); g_satLevel  = max(0.0f,  min(100.0f,  (float)_wtof(tb)));
+                GetDlgItemText(s_optPanels[2], ID_OPT_VIN_FREQ,  tb,16); g_vinLpFreq = max(500.0f,min(20000.0f,(float)_wtof(tb)));
+                GetDlgItemText(s_optPanels[2], ID_OPT_VIN_CRACK, tb,16); g_vinCrackle= max(0.0f,  min(100.0f,  (float)_wtof(tb)));
+                GetDlgItemText(s_optPanels[2], ID_OPT_HFI_BASS,  tb,16); g_hfiBassDb = max(0.0f,  min(24.0f,   (float)_wtof(tb)));
+                GetDlgItemText(s_optPanels[2], ID_OPT_HFI_WARM,  tb,16); g_hfiWarmth = max(0.0f,  min(100.0f,  (float)_wtof(tb)));
+            }
+            // Display page
+            bool wasDark = g_darkMode;
+            g_darkMode   = (SendMessage(GetDlgItem(s_optPanels[1], ID_OPT_DARKMODE),  BM_GETCHECK,0,0)==BST_CHECKED);
+            // Setup page
+            g_multiInst  = (SendMessage(GetDlgItem(s_optPanels[0], ID_OPT_MULTIINST),    BM_GETCHECK,0,0)==BST_CHECKED);
+            g_dropAppend = (SendMessage(GetDlgItem(s_optPanels[0], ID_OPT_DROP_APPEND),  BM_GETCHECK,0,0)==BST_CHECKED);
+            { wchar_t sb[16]; GetDlgItemText(s_optPanels[0], ID_OPT_SEEK_STEP, sb, 16);
+              float sv = (float)_wtof(sb); if (sv >= 1.0f) g_seekStep = sv; }
+            ApplyDSP();
+            if (g_hwnd) LayoutControls(g_hwnd);
+            // Timestretch page
+            if (s_optPanels[5]) {
+                bool wasPitch = g_pitchEnabled;
+                float wasAmt  = g_pitchSemitones;
+                g_pitchEnabled = (SendMessage(GetDlgItem(s_optPanels[5], ID_OPT_PITCH_ENABLE), BM_GETCHECK,0,0)==BST_CHECKED);
+                wchar_t pbuf[16]; GetWindowText(GetDlgItem(s_optPanels[5], ID_OPT_PITCH_VALUE), pbuf, 16);
+                g_pitchSemitones = max(-12.0f, min(12.0f, (float)_wtof(pbuf)));
+                if (wasPitch != g_pitchEnabled || wasAmt != g_pitchSemitones) ApplyPitch();
+            }
+            if (g_darkMode != wasDark) ApplyTheme();
+            SaveSettings();
+            DestroyWindow(hwnd);
+            break;
+        }
+        case ID_OPT_CANCEL:
+            DestroyWindow(hwnd);
+            break;
+        case ID_OPT_RESET:
+            if (MessageBox(hwnd,
+                    L"Reset all settings to defaults? This will take effect immediately.",
+                    L"Reset to Defaults", MB_YESNO | MB_ICONWARNING) == IDYES) {
+                // Delete INI so LoadSettings reads all defaults
+                GetIniPath();
+                DeleteFile(g_iniPath);
+                g_iniPath[0] = L'\0';
+                LoadSettings();
+                // Apply all effects
+                ApplyDSP();
+                ApplyPitch();
+                ApplyTheme();
+                // Repaint toggle buttons on main window
+                if (hShuffleBtn)    InvalidateRect(hShuffleBtn,    NULL, TRUE);
+                if (hRepeatBtn)     InvalidateRect(hRepeatBtn,     NULL, TRUE);
+                if (hMonoBtn)       InvalidateRect(hMonoBtn,       NULL, TRUE);
+                if (hNormalizeBtn)  InvalidateRect(hNormalizeBtn,  NULL, TRUE);
+                if (hBassBoostBtn)  InvalidateRect(hBassBoostBtn,  NULL, TRUE);
+                if (hDspBtn)        InvalidateRect(hDspBtn,        NULL, TRUE);
+                LayoutControls(g_hwnd); // update star + FX button visibility
+                // Save defaults so exit doesn't overwrite with stale values
+                SaveSettings();
+                DestroyWindow(hwnd);
+            }
+            break;
+        }
+        break;
+
+    case WM_ERASEBKGND: {
+        HDC dc = (HDC)wParam; RECT rc; GetClientRect(hwnd, &rc);
+        FillRect(dc, &rc, g_brBg); return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wParam;
+        SetTextColor(dc, g_theme.text);
+        SetBkColor(dc, g_theme.bg);
+        return (LRESULT)g_brBg;
+    }
+    case WM_CTLCOLORLISTBOX: {
+        HDC dc = (HDC)wParam;
+        SetTextColor(dc, g_theme.text);
+        SetBkColor(dc, g_theme.bgList);
+        return (LRESULT)g_brList;
+    }
+    case WM_CTLCOLORBTN: {
+        HDC dc = (HDC)wParam;
+        SetTextColor(dc, g_theme.text);
+        SetBkColor(dc, g_theme.bg);
+        return (LRESULT)g_brBg;
+    }
+    case WM_HSCROLL: {
+        // Pitch slider moved — update the value edit field
+        if (!s_optPanels[5]) break;
+        HWND hSlider = GetDlgItem(s_optPanels[5], ID_OPT_PITCH_SLIDER);
+        if ((HWND)lParam != hSlider) break;
+        int pos = (int)SendMessage(hSlider, TBM_GETPOS, 0, 0);
+        float semitones = pos / 10.0f;
+        wchar_t buf[16]; swprintf_s(buf, L"%.1f", semitones);
+        // Update edit without triggering EN_CHANGE feedback loop
+        HWND hEdit = GetDlgItem(s_optPanels[5], ID_OPT_PITCH_VALUE);
+        SetWindowText(hEdit, buf);
+        break;
+    }
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) DestroyWindow(hwnd);
+        break;
+    case WM_DESTROY:
+        g_hwndOptions = NULL;
+        for (auto& p : s_optPanels) p = NULL;
+        break;
+    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+void OpenOptionsDialog()
+{
+    if (g_hwndOptions && IsWindow(g_hwndOptions)) { SetForegroundWindow(g_hwndOptions); return; }
+    HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(g_hwnd, GWLP_HINSTANCE);
+    static const wchar_t OPT_CLASS[] = L"BillyOptionsDlg";
+    static bool optReg = false;
+    if (!optReg) {
+        WNDCLASS wc = {};
+        wc.lpfnWndProc   = OptionsDlgProc;
+        wc.hInstance     = hInst;
+        wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hIcon         = LoadIcon(hInst, MAKEINTRESOURCE(IDI_BILLYPRO));
+        wc.lpszClassName = OPT_CLASS;
+        RegisterClass(&wc);
+        optReg = true;
+    }
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE;
+    RECT cr = { 0, 0, 490, 548 }; AdjustWindowRect(&cr, style, FALSE);
+    int dw = cr.right - cr.left, dh = cr.bottom - cr.top;
+    g_hwndOptions = CreateWindowEx(WS_EX_APPWINDOW, OPT_CLASS,
+        L"Settings", style, 0, 0, dw, dh, NULL, NULL, hInst, NULL);
+    RECT pr; GetWindowRect(g_hwnd, &pr);
+    SetWindowPos(g_hwndOptions, NULL,
+        pr.left + (pr.right - pr.left - dw) / 2,
+        pr.top  + (pr.bottom - pr.top  - dh) / 2,
+        dw, dh, SWP_NOZORDER);
 }
 
 void OpenConvertDialog()
@@ -2142,18 +4322,26 @@ void OpenConvertDialog()
     if (!convReg) {
         WNDCLASS wc = {}; wc.lpfnWndProc = ConvertWndProc; wc.hInstance = hInst;
         wc.lpszClassName = CONV_CLASS; wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_BILLYPRO));
         wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1); RegisterClass(&wc); convReg = true;
     }
-    int dw = 660, dh = 480;
+    // Compute window size so the client area exactly fits the layout (client = 716 x 470)
+    // Controls: cw=700 wide, bottom of buttons at y=452, +18px bottom padding = 470 client height
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_THICKFRAME;
+    RECT cr = { 0, 0, 716, 470 };
+    AdjustWindowRect(&cr, style, FALSE);
+    int dw = cr.right  - cr.left;
+    int dh = cr.bottom - cr.top;
+
     g_hwndConvert = CreateWindowEx(WS_EX_APPWINDOW, CONV_CLASS,
-        L"Billy Pro \u2014 Convert Audio",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_THICKFRAME,
-        0, 0, dw, dh, NULL, NULL, hInst, NULL);
+        L"Convert",
+        style, 0, 0, dw, dh, NULL, NULL, hInst, NULL);
+
+    // Centre over the main window
     RECT pr; GetWindowRect(g_hwnd, &pr);
-    SetWindowPos(g_hwndConvert, NULL,
-        pr.left + (pr.right - pr.left - dw) / 2,
-        pr.top + (pr.bottom - pr.top - dh) / 2,
-        dw, dh, SWP_NOZORDER);
+    int cx = pr.left + (pr.right  - pr.left - dw) / 2;
+    int cy = pr.top  + (pr.bottom - pr.top  - dh) / 2;
+    SetWindowPos(g_hwndConvert, NULL, cx, cy, dw, dh, SWP_NOZORDER);
 }
 
 // ============================================================
@@ -2191,6 +4379,48 @@ static void SearchPlaySelected()
     PlayIndex(idx);
 }
 
+// Subclass proc for the search edit box — routes Enter/Delete to the parent
+static WNDPROC g_OldSearchEditProc = NULL;
+static LRESULT CALLBACK SearchEditSubProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (msg == WM_KEYDOWN) {
+        if (wParam == VK_RETURN) {
+            SearchPlaySelected();
+            return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+            if (g_hwndSearch && IsWindow(g_hwndSearch)) DestroyWindow(g_hwndSearch);
+            return 0;
+        }
+    }
+    return CallWindowProc(g_OldSearchEditProc, hwnd, msg, wParam, lParam);
+}
+
+// Delete selected item(s) from search results and from the real playlist
+static void SearchDeleteSelected()
+{
+    if (!hSearchList) return;
+    int sel = (int)SendMessage(hSearchList, LB_GETCURSEL, 0, 0);
+    if (sel == LB_ERR || sel >= (int)g_searchResults.size()) return;
+    int playlistIdx = g_searchResults[sel];
+    if (playlistIdx < 0 || playlistIdx >= (int)g_playlist.size()) return;
+
+    bool wasPlaying = (playlistIdx == g_currentIndex);
+    g_playlist.erase(g_playlist.begin() + playlistIdx);
+    SendMessage(hListBox, LB_DELETESTRING, playlistIdx, 0);
+    if (wasPlaying) StopAudio();
+    RebuildShuffleOrder();
+    g_currentIndex = min(g_currentIndex, (int)g_playlist.size() - 1);
+    if (!g_playlist.empty())
+        SendMessage(hListBox, LB_SETCURSEL, max(0, g_currentIndex), 0);
+    UpdateStatusBar();
+
+    // Refresh search results
+    SearchFilter();
+    int newSel = min(sel, (int)SendMessage(hSearchList, LB_GETCOUNT, 0, 0) - 1);
+    if (newSel >= 0) SendMessage(hSearchList, LB_SETCURSEL, newSel, 0);
+}
+
 LRESULT CALLBACK SearchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
@@ -2207,25 +4437,39 @@ LRESULT CALLBACK SearchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         }
         break;
     case WM_SIZE: {
-        // Re-layout controls when resized
         RECT rc; GetClientRect(hwnd, &rc);
-        int dw = rc.right, dh = rc.bottom;
-        if (hSearchEdit)
-            MoveWindow(hSearchEdit, 8, 8, dw - 18, 24, TRUE);
-        if (hSearchList)
-            MoveWindow(hSearchList, 8, 40, dw - 18, dh - 40 - 46, TRUE);
-        // Reposition buttons
-        HWND hOK = GetDlgItem(hwnd, ID_SEARCH_OK);
+        int cw = rc.right, ch = rc.bottom;
+        if (hSearchEdit) MoveWindow(hSearchEdit, 8, 8, cw - 16, 26, TRUE);
+        if (hSearchList) MoveWindow(hSearchList, 8, 42, cw - 16, ch - 42 - 46, TRUE);
+        HWND hOK  = GetDlgItem(hwnd, ID_SEARCH_OK);
         HWND hCan = GetDlgItem(hwnd, ID_SEARCH_CANCEL);
-        int bw2 = 80, bh2 = 26, by = dh - 40;
-        if (hOK)  MoveWindow(hOK, dw / 2 - bw2 - 4, by, bw2, bh2, TRUE);
-        if (hCan) MoveWindow(hCan, dw / 2 + 4, by, bw2, bh2, TRUE);
+        int bw = 88, bh = 28, by = ch - 38;
+        if (hOK)  MoveWindow(hOK,  cw / 2 - bw - 4, by, bw, bh, TRUE);
+        if (hCan) MoveWindow(hCan, cw / 2 + 4,       by, bw, bh, TRUE);
         break;
     }
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) { DestroyWindow(hwnd); return 0; }
         if (wParam == VK_RETURN) { SearchPlaySelected(); return 0; }
+        if (wParam == VK_DELETE) { SearchDeleteSelected(); return 0; }
         break;
+    case WM_ERASEBKGND: {
+        HDC dc = (HDC)wParam; RECT rc; GetClientRect(hwnd, &rc);
+        FillRect(dc, &rc, g_brBg); return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wParam;
+        SetTextColor(dc, g_theme.text);
+        SetBkColor(dc, g_theme.bg);
+        return (LRESULT)g_brBg;
+    }
+    case WM_CTLCOLORLISTBOX: {
+        HDC dc = (HDC)wParam;
+        SetTextColor(dc, g_theme.text);
+        SetBkColor(dc, g_theme.bgList);
+        return (LRESULT)g_brList;
+    }
     case WM_DESTROY:
         g_hwndSearch = NULL; hSearchEdit = NULL; hSearchList = NULL;
         break;
@@ -2246,60 +4490,71 @@ void OpenSearchDialog()
     }
 
     HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(g_hwnd, GWLP_HINSTANCE);
-    int dw = 360, dh = 420;
 
-    // Register a proper window class for the search dialog so it's movable and closeable
     static const wchar_t SEARCH_CLASS[] = L"BillySearchWnd";
     static bool searchRegistered = false;
     if (!searchRegistered) {
         WNDCLASS wc = {};
-        wc.lpfnWndProc = SearchWndProc;
-        wc.hInstance = hInst;
+        wc.lpfnWndProc   = SearchWndProc;
+        wc.hInstance     = hInst;
         wc.lpszClassName = SEARCH_CLASS;
-        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+        wc.hIcon         = LoadIcon(hInst, MAKEINTRESOURCE(IDI_BILLYPRO));
         wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
         RegisterClass(&wc);
         searchRegistered = true;
     }
 
-    HWND hDlg = CreateWindowEx(
-        WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW,
-        SEARCH_CLASS,
-        L"Find in Playlist",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_THICKFRAME,
-        0, 0, dw, dh, NULL, NULL, hInst, NULL);
+    // Desired client area: 360 x 420
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_THICKFRAME;
+    RECT cr = { 0, 0, 360, 420 };
+    AdjustWindowRect(&cr, style, FALSE);
+    int dw = cr.right - cr.left;
+    int dh = cr.bottom - cr.top;
+
+    HWND hDlg = CreateWindowEx(WS_EX_APPWINDOW, SEARCH_CLASS,
+        L"Find in Playlist", style, 0, 0, dw, dh, NULL, NULL, hInst, NULL);
+    if (g_darkMode) { BOOL dk = TRUE; DwmSetWindowAttribute(hDlg, 20, &dk, sizeof(dk)); DwmSetWindowAttribute(hDlg, 19, &dk, sizeof(dk)); }
 
     RECT pr; GetWindowRect(g_hwnd, &pr);
     SetWindowPos(hDlg, NULL,
         pr.left + (pr.right - pr.left - dw) / 2,
-        pr.top + (pr.bottom - pr.top - dh) / 2,
+        pr.top  + (pr.bottom - pr.top  - dh) / 2,
         dw, dh, SWP_NOZORDER);
 
     g_hwndSearch = hDlg;
     g_searchResults.clear();
 
+    // Create controls — WM_SIZE will position them correctly on first paint
     hSearchEdit = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-        8, 8, dw - 18, 24, hDlg, (HMENU)ID_SEARCH_EDIT, hInst, NULL);
+        8, 8, 344, 26, hDlg, (HMENU)ID_SEARCH_EDIT, hInst, NULL);
     SendMessage(hSearchEdit, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+
+    // Subclass edit to catch Enter / Escape
+    g_OldSearchEditProc = (WNDPROC)SetWindowLongPtr(hSearchEdit, GWLP_WNDPROC,
+        (LONG_PTR)SearchEditSubProc);
 
     hSearchList = CreateWindowEx(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
-        8, 40, dw - 18, dh - 40 - 46, hDlg, (HMENU)ID_SEARCH_LIST, hInst, NULL);
+        8, 42, 344, 330, hDlg, (HMENU)ID_SEARCH_LIST, hInst, NULL);
     SendMessage(hSearchList, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
     SendMessage(hSearchList, LB_SETITEMHEIGHT, 0, 20);
 
-    int bw2 = 80, bh2 = 26, by = dh - 40;
     HWND hOK = CreateWindow(L"BUTTON", L"Play",
         WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-        dw / 2 - bw2 - 4, by, bw2, bh2, hDlg, (HMENU)ID_SEARCH_OK, hInst, NULL);
+        84, 380, 88, 28, hDlg, (HMENU)ID_SEARCH_OK, hInst, NULL);
     HWND hCan = CreateWindow(L"BUTTON", L"Close",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        dw / 2 + 4, by, bw2, bh2, hDlg, (HMENU)ID_SEARCH_CANCEL, hInst, NULL);
-    SendMessage(hOK, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        188, 380, 88, 28, hDlg, (HMENU)ID_SEARCH_CANCEL, hInst, NULL);
+    SendMessage(hOK,  WM_SETFONT, (WPARAM)g_fontUI, TRUE);
     SendMessage(hCan, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
 
-    // No subclass needed - SearchWndProc is the window proc directly
+    // Trigger layout via WM_SIZE
+    RECT rcClient; GetClientRect(hDlg, &rcClient);
+    SendMessage(hDlg, WM_SIZE, SIZE_RESTORED,
+        MAKELPARAM(rcClient.right, rcClient.bottom));
+
     SearchFilter();
     SetFocus(hSearchEdit);
 }
@@ -2309,12 +4564,51 @@ void OpenSearchDialog()
 // ============================================================
 void ApplyTheme()
 {
-    g_theme = LIGHT;
-    if (g_brBg) { DeleteObject(g_brBg);  g_brBg = NULL; }
+    g_theme = g_darkMode ? DARK : LIGHT;
+    if (g_brBg)   { DeleteObject(g_brBg);   g_brBg   = NULL; }
     if (g_brList) { DeleteObject(g_brList); g_brList = NULL; }
-    g_brBg = CreateSolidBrush(g_theme.bg);
+    if (g_brMenu) { DeleteObject(g_brMenu); g_brMenu = NULL; }
+    g_brBg   = CreateSolidBrush(g_theme.bg);
     g_brList = CreateSolidBrush(g_theme.bgList);
-    if (g_hwnd) InvalidateRect(g_hwnd, NULL, TRUE);
+    g_brMenu = CreateSolidBrush(g_darkMode ? (COLORREF)0x2A2A2A : GetSysColor(COLOR_MENU));
+
+    if (g_hwnd) {
+        // Dark title bar — attribute 20 (Win10 1903+/Win11), 19 (Win10 1809)
+        BOOL dark = g_darkMode ? TRUE : FALSE;
+        DwmSetWindowAttribute(g_hwnd, 20, &dark, sizeof(dark));
+        DwmSetWindowAttribute(g_hwnd, 19, &dark, sizeof(dark));
+
+        // Listbox scrollbar style
+        if (hListBox)
+            SetWindowTheme(hListBox, g_darkMode ? L"DarkMode_Explorer" : L"Explorer", NULL);
+
+        // Status bar: strip visual style so background + custom painting work
+        if (hStatus) {
+            SetWindowTheme(hStatus, g_darkMode ? L"" : NULL, g_darkMode ? L"" : NULL);
+            SendMessage(hStatus, SB_SETBKCOLOR, 0,
+                (LPARAM)(g_darkMode ? (COLORREF)g_theme.bg : CLR_DEFAULT));
+            InvalidateRect(hStatus, NULL, TRUE);
+        }
+
+        // Menus — owner-draw applied once (idempotent); colors adapt via g_darkMode in WM_DRAWITEM
+        HMENU hm = GetMenu(g_hwnd);
+        if (hm) {
+            MenuInitOwnerDraw(hm);  // safe to call every time — skips already-converted items
+            // Set popup background so system border/gaps match dark background
+            MENUINFO mi = {}; mi.cbSize = sizeof(mi);
+            mi.fMask    = MIM_BACKGROUND | MIM_APPLYTOSUBMENUS;
+            mi.hbrBack  = g_brMenu;  // NULL restores default in light mode
+            SetMenuInfo(hm, &mi);
+            CheckMenuItem(hm, IDM_VIEW_DARKMODE,
+                g_darkMode ? MF_BYCOMMAND | MF_CHECKED : MF_BYCOMMAND | MF_UNCHECKED);
+            DrawMenuBar(g_hwnd);
+        }
+
+        // Repaint everything cleanly
+        SetClassLongPtr(g_hwnd, GCLP_HBRBACKGROUND, (LONG_PTR)g_brBg);
+        RedrawWindow(g_hwnd, NULL, NULL,
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME);
+    }
 }
 
 void CreateFonts()
@@ -2360,22 +4654,54 @@ void LayoutControls(HWND hwnd)
     MoveWindow(hMonoBtn, sbx + 94, y, 36, bh, TRUE);
     MoveWindow(hNormalizeBtn, sbx + 134, y, 36, bh, TRUE);
     MoveWindow(hBassBoostBtn, sbx + 174, y, 58, bh, TRUE);
-
+    // FX (DSP) button: right of BassBoost, visible only when any extra effect is enabled
+    if (hDspBtn) {
+        bool showDsp = g_dspReverb || g_dspSaturate || g_dspVinyl || g_dspHifi;
+        MoveWindow(hDspBtn, sbx + 236, y, 30, bh, TRUE);
+        ShowWindow(hDspBtn, showDsp ? SW_SHOW : SW_HIDE);
+    }
     // Row 2: seek bar
-    int vw = 12;  // vol bar width (needed here for seek bar calculation)
+    int vw = 12;  // vol bar width
+
+    // Star (media) button: far right, next to vol bar — only visible when media folders are set
+    if (hMediaBtn) {
+        if (!g_mediaFolders.empty()) {
+            MoveWindow(hMediaBtn, rc.right - vw - 4 - 22, y, 22, bh, TRUE);
+            ShowWindow(hMediaBtn, SW_SHOW);
+        } else {
+            ShowWindow(hMediaBtn, SW_HIDE);
+        }
+    }
     int sh = 14;
     int sy = y + bh + 3;
     MoveWindow(hSeekCanvas, m, sy, rc.right - 2 * m - vw - 2, sh, TRUE);
 
-    // Row 3: time labels + pct label
+    // Row 3: time labels + pct label — sizes computed from actual font/track length
     int ty = sy + sh + 3;
     int th = 16;
     int pctW = 36;
     int vx = rc.right - vw;
     int pctX = vx - 2 - pctW;
-    MoveWindow(hTimeCur, m, ty, 48, th, TRUE);
-    MoveWindow(hTimeTot, m + 50, ty, 64, th, TRUE);
-    MoveWindow(hTimeRemain, m + 102, ty, 64, th, TRUE);
+    {
+        // Measure how wide the time strings will be with the monospace font
+        double tlen = GetTrackLength();
+        wchar_t tstr[32];
+        FormatTime(tlen, tstr, _countof(tstr));
+        HDC hdc = GetDC(hTimeCur ? hTimeCur : hwnd);
+        HFONT oldF = (HFONT)SelectObject(hdc, g_fontMono);
+        SIZE sz = {};
+        GetTextExtentPoint32(hdc, tstr, (int)wcslen(tstr), &sz);
+        int baseW = sz.cx + 8;
+        SelectObject(hdc, oldF);
+        ReleaseDC(hTimeCur ? hTimeCur : hwnd, hdc);
+
+        int curW = max(baseW, 44);
+        int totW = max(baseW + 18, 58);  // "/ " prefix
+        int remW = max(baseW + 10, 58);  // "-"  prefix
+        MoveWindow(hTimeCur,    m,                          ty, curW, th, TRUE);
+        MoveWindow(hTimeTot,    m + curW + 2,               ty, totW, th, TRUE);
+        MoveWindow(hTimeRemain, m + curW + 2 + totW + 2,   ty, remW, th, TRUE);
+    }
     if (hVolPct) MoveWindow(hVolPct, pctX, ty, pctW, th, TRUE);
 
     // Vol bar: spans all 3 rows tall, flush right
@@ -2396,23 +4722,18 @@ void LayoutControls(HWND hwnd)
 void HandleDrop(HDROP hd)
 {
     UINT n = DragQueryFile(hd, 0xFFFFFFFF, NULL, 0);
-    // First pass: check if any folders are dropped
-    bool hasFolder = false;
+
+    // If replace mode, clear before adding anything
+    if (!g_dropAppend) ClearPlaylist();
+
     for (UINT i = 0; i < n; i++) {
         wchar_t p[MAX_PATH]; DragQueryFile(hd, i, p, MAX_PATH);
         DWORD a = GetFileAttributes(p);
-        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY))
-        {
-            hasFolder = true; break;
-        }
-    }
-    // If folders dropped, clear playlist first then add all folders+files
-    if (hasFolder) ClearPlaylist();
-    for (UINT i = 0; i < n; i++) {
-        wchar_t p[MAX_PATH]; DragQueryFile(hd, i, p, MAX_PATH);
-        DWORD a = GetFileAttributes(p);
-        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY))
-            AddFolder(p);  // add without clearing
+        if (a == INVALID_FILE_ATTRIBUTES) continue;
+        if (a & FILE_ATTRIBUTE_DIRECTORY)
+            AddFolder(p);
+        else if (IsM3U(p))
+            LoadM3UFromPath(p, true);  // always append M3U contents on drop
         else if (IsAudio(p))
             AddTrack(p);
     }
@@ -2420,7 +4741,6 @@ void HandleDrop(HDROP hd)
     if (!g_playlist.empty() && g_currentIndex < 0) {
         g_currentIndex = 0;
         SendMessage(hListBox, LB_SETSEL, FALSE, (LPARAM)-1);
-        SendMessage(hListBox, LB_SETSEL, TRUE, 0);
         SendMessage(hListBox, LB_SETCURSEL, 0, 0);
     }
     DragFinish(hd);
@@ -2461,18 +4781,90 @@ bool HandleGlobalKey(WPARAM vk)
     case 'F':       OpenSearchDialog();     return true;
     case 'N':       PlayNext();             return true;
     case 'P':       PlayPrev();             return true;
-    case 'S':       g_shuffle = !g_shuffle;
+    case 'S':
+        g_shuffle = !g_shuffle;
+        CheckMenuItem(GetMenu(g_hwnd), IDM_PLAY_SHUFFLE,
+            MF_BYCOMMAND | (g_shuffle ? MF_CHECKED : MF_UNCHECKED));
         InvalidateRect(hShuffleBtn, NULL, TRUE); return true;
-    case 'R':       g_repeat = !g_repeat;
+    case 'R':
+        g_repeat = !g_repeat;
+        CheckMenuItem(GetMenu(g_hwnd), IDM_PLAY_REPEAT,
+            MF_BYCOMMAND | (g_repeat ? MF_CHECKED : MF_UNCHECKED));
         InvalidateRect(hRepeatBtn, NULL, TRUE);  return true;
     case VK_UP:
+        if (GetFocus() == hListBox) return false; // let listbox navigate
         currentVolume = min(1.0f, currentVolume + 0.05f);
         UpdateVolume(); return true;
     case VK_DOWN:
+        if (GetFocus() == hListBox) return false; // let listbox navigate
         currentVolume = max(0.0f, currentVolume - 0.05f);
         UpdateVolume(); return true;
     }
     return false;
+}
+
+// ============================================================
+//  Status bar subclass — paints text in theme color for dark mode
+// ============================================================
+static LRESULT CALLBACK StatusBarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_PAINT && g_darkMode) {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_brBg);
+        HFONT oldFont = (HFONT)SelectObject(hdc, g_fontUI);
+        SetTextColor(hdc, g_theme.text);
+        SetBkMode(hdc, TRANSPARENT);
+        int n = (int)SendMessage(hwnd, SB_GETPARTS, 0, 0);
+        for (int i = 0; i < n; i++) {
+            RECT prc = {};
+            SendMessage(hwnd, SB_GETRECT, i, (LPARAM)&prc);
+            wchar_t text[512] = {};
+            LRESULT lr = SendMessage(hwnd, SB_GETTEXT, i, (LPARAM)text);
+            if (HIWORD(lr) & SBT_OWNERDRAW) continue;  // skip owner-draw parts
+            prc.left += 4;
+            DrawText(hdc, text, -1, &prc,
+                DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
+            // Divider between parts
+            if (i < n - 1) {
+                HPEN pen = CreatePen(PS_SOLID, 1, g_theme.btnBorder);
+                HPEN op = (HPEN)SelectObject(hdc, pen);
+                MoveToEx(hdc, prc.right - 4, prc.top + 2, NULL);
+                LineTo(hdc, prc.right - 4, prc.bottom - 2);
+                SelectObject(hdc, op); DeleteObject(pen);
+            }
+        }
+        SelectObject(hdc, oldFont);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    return CallWindowProc(g_OldStatusProc, hwnd, msg, wp, lp);
+}
+
+// ============================================================
+//  Owner-draw menus — set up ONCE, never removed.
+//  Colors adapt to g_darkMode in WM_DRAWITEM; no toggle = no glitch.
+// ============================================================
+static void MenuInitOwnerDraw(HMENU hm)
+{
+    int n = GetMenuItemCount(hm);
+    for (int i = 0; i < n; i++) {
+        MENUITEMINFO mii = { sizeof(mii),
+            MIIM_FTYPE | MIIM_STRING | MIIM_SUBMENU | MIIM_DATA };
+        wchar_t buf[256] = {};
+        mii.dwTypeData = buf; mii.cch = 255;
+        if (!GetMenuItemInfo(hm, i, TRUE, &mii)) continue;
+        if (mii.hSubMenu) MenuInitOwnerDraw(mii.hSubMenu); // recurse first
+        if (mii.fType & MFT_SEPARATOR) continue;
+        if (mii.fType & MFT_OWNERDRAW) continue;  // already done
+        auto* str = new wchar_t[256];
+        wcscpy_s(str, 256, buf);
+        mii.fMask      = MIIM_FTYPE | MIIM_DATA;
+        mii.fType     |= MFT_OWNERDRAW;
+        mii.dwItemData = (ULONG_PTR)str;
+        SetMenuItemInfo(hm, i, TRUE, &mii);
+    }
 }
 
 // ============================================================
@@ -2506,6 +4898,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         hMonoBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_MONO, hInst, NULL);
         hNormalizeBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_NORMALIZE, hInst, NULL);
         hBassBoostBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_BASSBOOST, hInst, NULL);
+        hDspBtn       = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_DSP,       hInst, NULL);
+        hMediaBtn     = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_MEDIA,     hInst, NULL);
 
         // Volume custom bar
         hVolumeCanvas = CreateWindow(VOL_CLASS, NULL,
@@ -2551,6 +4945,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         SetWindowLongPtr(hMonoBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
         SetWindowLongPtr(hNormalizeBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
         SetWindowLongPtr(hBassBoostBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
+        SetWindowLongPtr(hDspBtn,       GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
 
         hStatus = CreateWindowEx(0, STATUSCLASSNAME, NULL,
             WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
@@ -2558,12 +4953,31 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         SendMessage(hStatus, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
         int parts[2] = { 420,-1 };
         SendMessage(hStatus, SB_SETPARTS, 2, (LPARAM)parts);
+        // Subclass for dark mode text color
+        g_OldStatusProc = (WNDPROC)SetWindowLongPtr(hStatus, GWLP_WNDPROC, (LONG_PTR)StatusBarProc);
 
         LoadSettings();
+        ApplyTheme();  // re-apply after LoadSettings so dark mode is applied on startup
         DragAcceptFiles(hwnd, TRUE);
         LayoutControls(hwnd);
         UpdateVolume();
         UpdateStatusBar();
+
+        // Register global media key hotkeys
+        RegisterHotKey(hwnd, ID_HOTKEY_PLAYPAUSE, 0, VK_MEDIA_PLAY_PAUSE);
+        RegisterHotKey(hwnd, ID_HOTKEY_NEXT,      0, VK_MEDIA_NEXT_TRACK);
+        RegisterHotKey(hwnd, ID_HOTKEY_PREV,      0, VK_MEDIA_PREV_TRACK);
+        RegisterHotKey(hwnd, ID_HOTKEY_STOP,      0, VK_MEDIA_STOP);
+
+        // Taskbar thumbnail toolbar (Win7+)
+        g_WM_TASKBARBUTTONCREATED = RegisterWindowMessage(L"TaskbarButtonCreated");
+        g_thumbIcons[0] = CreateThumbIcon(L"\u23EE");  // ⏮ previous
+        g_thumbIcons[1] = CreateThumbIcon(L"\u25B6");  // ▶ play
+        g_thumbIcons[2] = CreateThumbIcon(L"\u23F8");  // ⏸ pause
+        g_thumbIcons[3] = CreateThumbIcon(L"\u23ED");  // ⏭ next
+        CoCreateInstance(CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER,
+            IID_ITaskbarList3, (void**)&g_pTaskbar);
+        if (g_pTaskbar) g_pTaskbar->HrInit();
         break;
     }
 
@@ -2604,13 +5018,94 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)wParam;
-        SetTextColor(dc, 0x000000);
+        SetTextColor(dc, g_theme.text);
         SetBkMode(dc, TRANSPARENT);
         return (LRESULT)g_brBg;
     }
 
+    case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT* ms = (MEASUREITEMSTRUCT*)lParam;
+        if (ms->CtlType == ODT_MENU) {
+            const wchar_t* text = (const wchar_t*)ms->itemData;
+            if (!text || !*text) { ms->itemHeight = 5; ms->itemWidth = 40; return TRUE; } // separator
+            HDC dc = GetDC(hwnd);
+            HFONT old = (HFONT)SelectObject(dc, g_fontUI ? g_fontUI : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+            SIZE sz = {};
+            GetTextExtentPoint32(dc, text, (int)wcslen(text), &sz);
+            SelectObject(dc, old); ReleaseDC(hwnd, dc);
+            // Match system default menu bar item sizing
+            ms->itemWidth  = (UINT)(sz.cx + 10);
+            ms->itemHeight = (UINT)max(sz.cy + 4, GetSystemMetrics(SM_CYMENUSIZE));
+            return TRUE;
+        }
+        break;
+    }
+
     case WM_DRAWITEM: {
         DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lParam;
+        // Owner-draw menu items — handles both dark and light (safe fallback)
+        if (dis->CtlType == ODT_MENU) {
+            const wchar_t* text = (const wchar_t*)dis->itemData;
+            bool sep    = (!text || !*text);
+            bool sel    = (dis->itemState & ODS_SELECTED) != 0;
+            bool grayed = (dis->itemState & ODS_GRAYED)   != 0;
+            bool chk    = (dis->itemState & ODS_CHECKED)  != 0;
+
+            COLORREF bgCol, fgCol;
+            if (g_darkMode) {
+                bgCol = sel ? 0x505858 : 0x2A2A2A;
+                fgCol = grayed ? 0x666666 : 0xE8E8E8;
+            } else {
+                // Light mode fallback (should rarely fire — system normally draws these)
+                bgCol = sel ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_MENU);
+                fgCol = grayed ? GetSysColor(COLOR_GRAYTEXT)
+                               : (sel ? GetSysColor(COLOR_HIGHLIGHTTEXT)
+                                      : GetSysColor(COLOR_MENUTEXT));
+            }
+
+            HBRUSH br = CreateSolidBrush(bgCol);
+            FillRect(dis->hDC, &dis->rcItem, br); DeleteObject(br);
+
+            if (sep) {
+                int mid = (dis->rcItem.top + dis->rcItem.bottom) / 2;
+                COLORREF ln = g_darkMode ? 0x585858 : GetSysColor(COLOR_GRAYTEXT);
+                HPEN pen = CreatePen(PS_SOLID, 1, ln);
+                HPEN op = (HPEN)SelectObject(dis->hDC, pen);
+                MoveToEx(dis->hDC, dis->rcItem.left  + 4, mid, NULL);
+                LineTo  (dis->hDC, dis->rcItem.right - 4, mid);
+                SelectObject(dis->hDC, op); DeleteObject(pen);
+                return TRUE;
+            }
+
+            SetTextColor(dis->hDC, fgCol);
+            SetBkMode(dis->hDC, TRANSPARENT);
+            HFONT fntOld = (HFONT)SelectObject(dis->hDC,
+                g_fontUI ? g_fontUI : (HFONT)GetStockObject(DEFAULT_GUI_FONT));
+            RECT rc = dis->rcItem;
+            if (chk) {
+                RECT cr = rc; cr.right = cr.left + 18;
+                DrawText(dis->hDC, L"\u2713", 1, &cr, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+                rc.left += 18;
+            } else {
+                rc.left += 8;
+            }
+            if (text) {
+                const wchar_t* tab = wcschr(text, L'\t');
+                if (tab) {
+                    // Left part: item name
+                    DrawText(dis->hDC, text, (int)(tab - text), &rc,
+                        DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOCLIP);
+                    // Right part: shortcut — right-aligned with padding
+                    RECT rr = dis->rcItem; rr.right -= 8;
+                    DrawText(dis->hDC, tab + 1, -1, &rr,
+                        DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
+                } else {
+                    DrawText(dis->hDC, text, -1, &rc, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+                }
+            }
+            SelectObject(dis->hDC, fntOld);
+            return TRUE;
+        }
         switch (dis->CtlID) {
         case ID_BTN_PREV:      DrawBtn(dis, BTN_PREV);    return TRUE;
         case ID_BTN_PLAYPAUSE: DrawBtn(dis, BTN_PLAY);    return TRUE;
@@ -2621,7 +5116,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case ID_BTN_MONO:       DrawBtn(dis, BTN_MONO);       return TRUE;
         case ID_BTN_NORMALIZE: DrawBtn(dis, BTN_NORMALIZE); return TRUE;
         case ID_BTN_BASSBOOST:  DrawBtn(dis, BTN_BASSBOOST);  return TRUE;
-        case ID_BTN_REPEAT:    DrawBtn(dis, BTN_REPEAT);  return TRUE;
+        case ID_BTN_REPEAT:     DrawBtn(dis, BTN_REPEAT);     return TRUE;
+        case ID_BTN_MEDIA:      DrawBtn(dis, BTN_MEDIA);      return TRUE;
+        case ID_BTN_DSP:        DrawBtn(dis, BTN_DSP);        return TRUE;
         }
         break;
     }
@@ -2630,11 +5127,49 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         HandleDrop((HDROP)wParam);
         break;
 
+    case WM_HOTKEY:
+        switch ((int)wParam) {
+        case ID_HOTKEY_PLAYPAUSE: TogglePlayPause(); break;
+        case ID_HOTKEY_NEXT:      PlayNext();        break;
+        case ID_HOTKEY_PREV:      PlayPrev();        break;
+        case ID_HOTKEY_STOP:      StopAudio();       break;
+        }
+        UpdateThumbButtons();
+        break;
+
+    case WM_COPYDATA: {
+        // Another instance sent us a file path to open
+        COPYDATASTRUCT* cds = (COPYDATASTRUCT*)lParam;
+        if (cds && cds->dwData == COPYDATAID_OPENFILE && cds->lpData) {
+            wchar_t* path = (wchar_t*)cds->lpData;
+            DWORD a = GetFileAttributes(path);
+            if (a != INVALID_FILE_ATTRIBUTES) {
+                if (a & FILE_ATTRIBUTE_DIRECTORY) {
+                    LoadFolder(path);
+                } else if (IsM3U(path)) {
+                    LoadM3UFromPath(path);
+                    if (!g_playlist.empty()) PlayIndex(0);
+                } else if (IsAudio(path)) {
+                    wchar_t folder[MAX_PATH]; wcsncpy_s(folder, path, _TRUNCATE);
+                    wchar_t* sep = wcsrchr(folder, L'\\');
+                    if (sep) *sep = 0;
+                    LoadFolder(folder);
+                    for (int i = 0; i < (int)g_playlist.size(); i++)
+                        if (_wcsicmp(g_playlist[i].path, path) == 0) { PlayIndex(i); break; }
+                }
+            }
+            SetForegroundWindow(hwnd);
+            if (IsIconic(hwnd)) { ShowWindow(hwnd, SW_RESTORE); RemoveTrayIcon(); }
+        }
+        return TRUE;
+    }
+
     case WM_TIMER:
         if (wParam == IDT_PLAYBACK && currentStream && !g_seekDragging) {
-            UpdateTimeDisplays();
+            static DWORD s_lastTimeTick = 0;
+            DWORD now = GetTickCount();
+            if (now - s_lastTimeTick >= 200) { s_lastTimeTick = now; UpdateTimeDisplays(); }
             InvalidateRect(hSeekCanvas, NULL, FALSE);
-
         }
         if (wParam == IDT_PEAK_METER) {
             if (currentStream && BASS_ChannelIsActive(currentStream) == BASS_ACTIVE_PLAYING) {
@@ -2684,7 +5219,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             InvalidateRect(hVolumeCanvas, NULL, FALSE);
         }
         if (wParam == IDT_SEEK_REPEAT && g_seekKeyHeld) {
-            SeekToSeconds(GetPlayPos() + g_seekKeyDir * 3.0);
+            g_seekRepeatCount++;
+            if (g_seekRepeatCount == 3) {
+                // Held for ~1 second: switch to fast-skip (80 ms, 4x step)
+                KillTimer(hwnd, IDT_SEEK_REPEAT);
+                SetTimer(hwnd, IDT_SEEK_REPEAT, 80, NULL);
+            }
+            float step = (g_seekRepeatCount >= 3) ? g_seekStep * 4.0f : g_seekStep;
+            SeekToSeconds(GetPlayPos() + g_seekKeyDir * step);
         }
         break;
 
@@ -2694,15 +5236,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         switch (wParam) {
         case VK_RIGHT:
             if (currentStream && !g_seekKeyHeld) {
-                SeekToSeconds(GetPlayPos() + 3.0);
-                g_seekKeyHeld = true; g_seekKeyDir = +1;
+                SeekToSeconds(GetPlayPos() + g_seekStep);
+                g_seekKeyHeld = true; g_seekKeyDir = +1; g_seekRepeatCount = 0;
                 SetTimer(hwnd, IDT_SEEK_REPEAT, 350, NULL);
             }
             break;
         case VK_LEFT:
             if (currentStream && !g_seekKeyHeld) {
-                SeekToSeconds(GetPlayPos() - 3.0);
-                g_seekKeyHeld = true; g_seekKeyDir = -1;
+                SeekToSeconds(GetPlayPos() - g_seekStep);
+                g_seekKeyHeld = true; g_seekKeyDir = -1; g_seekRepeatCount = 0;
                 SetTimer(hwnd, IDT_SEEK_REPEAT, 350, NULL);
             }
             break;
@@ -2732,25 +5274,73 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case ID_BTN_NEXT:         PlayNext();        break;
         case ID_BTN_PREV:         PlayPrev();        break;
         case ID_BTN_SHUFFLE:
-            g_shuffle = !g_shuffle; InvalidateRect(hShuffleBtn, NULL, TRUE); break;
+            g_shuffle = !g_shuffle;
+            CheckMenuItem(GetMenu(g_hwnd), IDM_PLAY_SHUFFLE,
+                MF_BYCOMMAND | (g_shuffle ? MF_CHECKED : MF_UNCHECKED));
+            InvalidateRect(hShuffleBtn, NULL, TRUE); break;
         case ID_BTN_REPEAT:
-            g_repeat = !g_repeat;  InvalidateRect(hRepeatBtn, NULL, TRUE); break;
+            g_repeat = !g_repeat;
+            CheckMenuItem(GetMenu(g_hwnd), IDM_PLAY_REPEAT,
+                MF_BYCOMMAND | (g_repeat ? MF_CHECKED : MF_UNCHECKED));
+            InvalidateRect(hRepeatBtn, NULL, TRUE); break;
         case ID_BTN_MONO:
             g_mono = !g_mono; ApplyDSP(); InvalidateRect(hMonoBtn, NULL, TRUE); break;
         case ID_BTN_NORMALIZE:
             g_normalize = !g_normalize; ApplyDSP(); InvalidateRect(hNormalizeBtn, NULL, TRUE); break;
         case ID_BTN_BASSBOOST:
             g_bassBoost = !g_bassBoost; ApplyDSP(); InvalidateRect(hBassBoostBtn, NULL, TRUE); break;
+        case ID_BTN_DSP:
+            g_dspBypass = !g_dspBypass;
+            ApplyDSP();
+            if (hDspBtn) InvalidateRect(hDspBtn, NULL, TRUE);
+            break;
+        case ID_BTN_MEDIA: {
+            if (g_mediaFolders.empty()) break;
+            if (!g_mediaActive) {
+                // Activate: save current playlist, show folder browser — keep audio playing
+                g_savedPlaylist = g_playlist;
+                g_mediaActive = true;
+                g_browserActive = true;
+                // Multiple roots: show virtual root; single root: go directly into it
+                if (g_mediaFolders.size() > 1)
+                    FillBrowser(L"");
+                else
+                    FillBrowser(g_mediaFolders[0].c_str());
+            } else {
+                // Deactivate: restore old playlist view — keep audio playing
+                g_mediaActive = false;
+                g_browserActive = false;
+                g_browserItems.clear();
+                // Restore saved playlist to listbox without stopping playback
+                g_playlist = g_savedPlaylist;
+                g_savedPlaylist.clear();
+                g_currentIndex = -1;  // position in restored playlist is unknown
+                SendMessage(hListBox, LB_RESETCONTENT, 0, 0);
+                for (auto& t : g_playlist)
+                    SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)t.display);
+                RebuildShuffleOrder();
+            }
+            InvalidateRect(hMediaBtn, NULL, TRUE);
+            UpdateStatusBar();
+            break;
+        }
         case ID_LISTBOX:
             if (HIWORD(wParam) == LBN_DBLCLK) {
                 int s = (int)SendMessage(hListBox, LB_GETCURSEL, 0, 0);
-                if (s != LB_ERR) PlayIndex(s);
+                if (s != LB_ERR) {
+                    if (g_browserActive) BrowserNavigate(s);
+                    else PlayIndex(s);
+                }
             }
             if (HIWORD(wParam) == LBN_SELCHANGE) UpdateStatusBar();
             break;
             // Context menu
         case IDC_CTX_PLAY:
-            if (g_ctxTrackIndex >= 0) PlayIndex(g_ctxTrackIndex);
+            if (g_ctxIsBrowser) {
+                if (g_ctxTrackIndex >= 0) BrowserNavigate(g_ctxTrackIndex);
+            } else {
+                if (g_ctxTrackIndex >= 0) PlayIndex(g_ctxTrackIndex);
+            }
             break;
         case IDC_CTX_REMOVE: {
             // Collect all selected items
@@ -2763,6 +5353,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             // If none selected or only right-clicked item, use ctx index
             if (toDelete.empty() && g_ctxTrackIndex >= 0)
                 toDelete.push_back(g_ctxTrackIndex);
+            // Save undo state (forward order)
+            g_undoRemove.clear();
+            std::sort(toDelete.begin(), toDelete.end());
+            for (int idx : toDelete)
+                if (idx >= 0 && idx < (int)g_playlist.size())
+                    g_undoRemove.push_back({g_playlist[idx], idx});
             // Delete in reverse
             std::sort(toDelete.begin(), toDelete.end(), std::greater<int>());
             bool stopNeeded = false;
@@ -2782,17 +5378,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             break;
         }
         case IDC_CTX_PROPERTIES:
-            if (g_ctxTrackIndex >= 0 && g_ctxTrackIndex < (int)g_playlist.size()) {
+            if (g_ctxFilePath[0]) {
                 SHELLEXECUTEINFO sei = { sizeof(sei) };
                 sei.lpVerb = L"properties";
-                sei.lpFile = g_playlist[g_ctxTrackIndex].path;
+                sei.lpFile = g_ctxFilePath;
                 sei.fMask = SEE_MASK_INVOKEIDLIST;
                 sei.hwnd = hwnd;
                 ShellExecuteEx(&sei);
             }
             break;
         case IDC_CTX_AUDIOINFO:
-            OpenAudioInfoDialog(g_ctxTrackIndex);
+            if (g_ctxIsBrowser)
+                OpenAudioInfoForPath(g_ctxFilePath);
+            else
+                OpenAudioInfoDialog(g_ctxTrackIndex);
+            break;
+        case IDC_CTX_OPENLOCATION:
+            if (g_ctxFilePath[0]) {
+                wchar_t args[MAX_PATH + 16];
+                _snwprintf_s(args, _countof(args), _TRUNCATE, L"/select,\"%s\"", g_ctxFilePath);
+                ShellExecute(hwnd, L"open", L"explorer.exe", args, NULL, SW_SHOW);
+            }
             break;
             // Menu
         case IDM_FILE_OPENFOLDER: {
@@ -2818,6 +5424,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             break;
         case IDM_FILE_EXIT:      RemoveTrayIcon(); DestroyWindow(hwnd); break;
         case IDM_FILE_CONVERT:   OpenConvertDialog(); break;
+        case IDM_FILE_OPENM3U:   LoadPlaylistM3U(hwnd); break;
+        case IDM_FILE_SAVEM3U:   SavePlaylistM3U(hwnd); break;
+
+        case IDM_VIEW_DARKMODE:
+            g_darkMode = !g_darkMode;
+            ApplyTheme();
+            SaveSettings();
+            break;
+
+        case IDM_OPTIONS_FILEASSOC: OpenFileAssocDialog(); break;
+
         case IDM_PLAY_PLAYPAUSE: TogglePlayPause();   break;
         case IDM_PLAY_STOP:      StopAudio();         break;
         case IDM_PLAY_NEXT:      PlayNext();          break;
@@ -2833,7 +5450,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         case IDM_HELP_ABOUT:
             MessageBox(hwnd,
-                L"Billy Pro V0.3\n\n"
+                L"Billy Pro V0.4\n\n"
                 L"Lightweight music player inspired by BillyMp3 (SheepFriends)\n\n"
                 L"Created by MRJN/CLD.",
                 L"About Billy Pro", MB_ICONINFORMATION);
@@ -2860,128 +5477,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             break;
         case IDM_OPTIONS:
         {
-            // ---- static data shared between host and dialog proc ----
-            static struct {
-                float bbLow, bbHigh, bbGain;
-                HWND  hDlg;
-                bool  done;
-                bool  save;
-            } od;
-            od.bbLow = g_bbFreqLow;  od.bbHigh = g_bbFreqHigh; od.bbGain = g_bbGainDB;
-            od.done = false;        od.save = false;
-
-            HINSTANCE hInst2 = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
-
-            // Build in-memory DLGTEMPLATE and use DialogBoxIndirectParam
-            // which correctly passes lParam into WM_INITDIALOG
-            DWORD tmplSize = 8192;
-            HGLOBAL hG = GlobalAlloc(GHND, tmplSize);
-            WORD* p = (WORD*)GlobalLock(hG);
-
-            // Helper: align pointer to DWORD
-            auto al = [](WORD*& pp) { while ((ULONG_PTR)pp & 3) { *pp = 0; pp++; } };
-
-            // Write DLGTEMPLATE header
-            DLGTEMPLATE* dt = (DLGTEMPLATE*)p;
-            dt->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_SETFONT | DS_MODALFRAME | DS_CENTER;
-            dt->dwExtendedStyle = 0;
-            dt->cdit = 10;
-            dt->x = 0; dt->y = 0; dt->cx = 230; dt->cy = 120;
-            p = (WORD*)(dt + 1);
-            *p++ = 0; *p++ = 0;                         // no menu, default class
-            const wchar_t* wt = L"Options"; while (*wt) *p++ = *wt++; *p++ = 0;
-            *p++ = 9;                                  // font size
-            const wchar_t* wf = L"Segoe UI"; while (*wf) *p++ = *wf++; *p++ = 0;
-
-            // Helpers to emit controls
-            auto lbl = [&](short x, short y, short cx, short cy, const wchar_t* t) {
-                al(p);
-                DLGITEMTEMPLATE* it = (DLGITEMTEMPLATE*)p;
-                it->style = WS_CHILD | WS_VISIBLE | SS_LEFT;
-                it->dwExtendedStyle = 0; it->x = x; it->y = y; it->cx = cx; it->cy = cy; it->id = 0;
-                p = (WORD*)(it + 1); *p++ = 0xFFFF; *p++ = 0x0082;
-                while (*t)*p++ = *t++; *p++ = 0; *p++ = 0;
-                };
-            auto edt = [&](short x, short y, short cx, short cy, WORD id) {
-                al(p);
-                DLGITEMTEMPLATE* it = (DLGITEMTEMPLATE*)p;
-                it->style = WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL;
-                it->dwExtendedStyle = 0; it->x = x; it->y = y; it->cx = cx; it->cy = cy; it->id = id;
-                p = (WORD*)(it + 1); *p++ = 0xFFFF; *p++ = 0x0081;
-                *p++ = 0; *p++ = 0;
-                };
-            auto btn = [&](short x, short y, short cx, short cy, WORD id, const wchar_t* t, DWORD st) {
-                al(p);
-                DLGITEMTEMPLATE* it = (DLGITEMTEMPLATE*)p;
-                it->style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | st;
-                it->dwExtendedStyle = 0; it->x = x; it->y = y; it->cx = cx; it->cy = cy; it->id = id;
-                p = (WORD*)(it + 1); *p++ = 0xFFFF; *p++ = 0x0080;
-                while (*t)*p++ = *t++; *p++ = 0; *p++ = 0;
-                };
-
-            // Layout: Bass Boost
-            lbl(8, 8, 210, 10, L"Bass Boost");
-            lbl(12, 23, 96, 10, L"Low Freq (Hz):");   edt(114, 21, 60, 12, 201);
-            lbl(12, 38, 96, 10, L"High Freq (Hz):");  edt(114, 36, 60, 12, 202);
-            lbl(12, 53, 96, 10, L"Gain (dB):");       edt(114, 51, 60, 12, 203);
-            // Buttons
-            btn(8, 98, 60, 14, IDOK, L"OK", BS_DEFPUSHBUTTON);
-            btn(80, 98, 60, 14, IDCANCEL, L"Cancel", BS_PUSHBUTTON);
-            btn(152, 98, 60, 14, 206, L"Save", BS_PUSHBUTTON);
-
-            GlobalUnlock(hG);
-
-            // Dialog proc — lParam is passed correctly via DialogBoxIndirectParam
-            struct DP {
-                static INT_PTR CALLBACK Proc(HWND hd, UINT m, WPARAM wp, LPARAM lp) {
-                    // s_v: pointer to od.bbLow etc stored in DWLP_USER
-                    if (m == WM_INITDIALOG) {
-                        // lp IS the lParam passed to DialogBoxIndirectParam
-                        SetWindowLongPtr(hd, DWLP_USER, lp);
-                        float* v = (float*)lp;
-                        wchar_t t[32];
-                        swprintf_s(t, L"%.1f", v[0]); SetDlgItemText(hd, 201, t);
-                        swprintf_s(t, L"%.1f", v[1]); SetDlgItemText(hd, 202, t);
-                        swprintf_s(t, L"%.1f", v[2]); SetDlgItemText(hd, 203, t);
-                        return TRUE;
-                    }
-                    if (m == WM_COMMAND) {
-                        WORD id = LOWORD(wp);
-                        if (id == IDCANCEL) { EndDialog(hd, IDCANCEL); return TRUE; }
-                        if (id == IDOK || id == 206) {
-                            float* v = (float*)GetWindowLongPtr(hd, DWLP_USER);
-                            if (!v) { EndDialog(hd, IDCANCEL); return TRUE; }
-                            wchar_t t[32];
-                            GetDlgItemText(hd, 201, t, 32); v[0] = (float)_wtof(t);
-                            GetDlgItemText(hd, 202, t, 32); v[1] = (float)_wtof(t);
-                            GetDlgItemText(hd, 203, t, 32); v[2] = (float)_wtof(t);
-                            EndDialog(hd, id);
-                            return TRUE;
-                        }
-                    }
-                    if (m == WM_CLOSE) { EndDialog(hd, IDCANCEL); return TRUE; }
-                    return FALSE;
-                }
-            };
-
-            // Pass pointer to vals array as lParam — arrives safely in WM_INITDIALOG
-            float vals[3] = { g_bbFreqLow, g_bbFreqHigh, g_bbGainDB };
-            INT_PTR res = DialogBoxIndirectParam(
-                hInst2,
-                (DLGTEMPLATE*)GlobalLock(hG),
-                hwnd,
-                DP::Proc,
-                (LPARAM)vals);
-            GlobalUnlock(hG);
-            GlobalFree(hG);
-
-            if (res == IDOK || res == 206) {
-                g_bbFreqLow = max(20.0f, min(500.0f, vals[0]));
-                g_bbFreqHigh = max(50.0f, min(2000.0f, vals[1]));
-                g_bbGainDB = max(0.0f, min(24.0f, vals[2]));
-                ApplyDSP();
-                if (res == 206) SaveSettings();
-            }
+            OpenOptionsDialog();
             break;
         }
         }
@@ -2994,6 +5490,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         InvalidateRect(hSeekCanvas, NULL, FALSE);
         if (g_repeat && g_currentIndex >= 0) PlayIndex(g_currentIndex);
         else PlayNext();
+        UpdateThumbButtons();
         break;
 
     case WM_DESTROY:
@@ -3001,21 +5498,59 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         RemoveTrayIcon();
         KillTimer(g_hwnd, IDT_PLAYBACK);
         KillTimer(g_hwnd, IDT_SEEK_REPEAT);
-        if (g_hwndSearch && IsWindow(g_hwndSearch))  DestroyWindow(g_hwndSearch);
-        if (g_hwndInfo && IsWindow(g_hwndInfo))       DestroyWindow(g_hwndInfo);
-        if (g_hwndConvert && IsWindow(g_hwndConvert)) DestroyWindow(g_hwndConvert);
+        if (g_hwndSearch && IsWindow(g_hwndSearch))   DestroyWindow(g_hwndSearch);
+        if (g_hwndInfo && IsWindow(g_hwndInfo))        DestroyWindow(g_hwndInfo);
+        if (g_hwndConvert && IsWindow(g_hwndConvert))  DestroyWindow(g_hwndConvert);
+        if (g_hwndAssoc && IsWindow(g_hwndAssoc))      DestroyWindow(g_hwndAssoc);
         FreeArtBytes();
         DragAcceptFiles(hwnd, FALSE);
         if (currentStream) { BASS_ChannelStop(currentStream); BASS_StreamFree(currentStream); }
         BASS_Free();
+        // Unregister media key hotkeys
+        UnregisterHotKey(hwnd, ID_HOTKEY_PLAYPAUSE);
+        UnregisterHotKey(hwnd, ID_HOTKEY_NEXT);
+        UnregisterHotKey(hwnd, ID_HOTKEY_PREV);
+        UnregisterHotKey(hwnd, ID_HOTKEY_STOP);
+        // Release taskbar thumbnail
+        if (g_pTaskbar) { g_pTaskbar->Release(); g_pTaskbar = NULL; }
+        for (int i = 0; i < 4; i++) if (g_thumbIcons[i]) { DestroyIcon(g_thumbIcons[i]); g_thumbIcons[i] = NULL; }
         if (g_fontUI)   DeleteObject(g_fontUI);
         if (g_fontMono) DeleteObject(g_fontMono);
         if (g_fontBold) DeleteObject(g_fontBold);
         if (g_brBg)     DeleteObject(g_brBg);
         if (g_brList)   DeleteObject(g_brList);
+        if (g_brMenu)   DeleteObject(g_brMenu);
         PostQuitMessage(0);
         return 0;
     }
+
+    // Taskbar button created — add thumbnail toolbar buttons
+    if (g_WM_TASKBARBUTTONCREATED && msg == g_WM_TASKBARBUTTONCREATED) {
+        if (g_pTaskbar) {
+            THUMBBUTTON tb[3] = {};
+            tb[0].dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS; tb[0].iId = THUMB_BTN_PREV;
+            tb[0].hIcon = g_thumbIcons[0]; wcscpy_s(tb[0].szTip, L"Previous"); tb[0].dwFlags = THBF_ENABLED;
+            tb[1].dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS; tb[1].iId = THUMB_BTN_PLAY;
+            tb[1].hIcon = g_thumbIcons[1]; wcscpy_s(tb[1].szTip, L"Play"); tb[1].dwFlags = THBF_ENABLED;
+            tb[2].dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS; tb[2].iId = THUMB_BTN_NEXT;
+            tb[2].hIcon = g_thumbIcons[3]; wcscpy_s(tb[2].szTip, L"Next"); tb[2].dwFlags = THBF_ENABLED;
+            g_pTaskbar->ThumbBarAddButtons(hwnd, 3, tb);
+            UpdateThumbButtons(); // set correct play/pause icon from the start
+        }
+        return 0;
+    }
+
+    // Thumbnail toolbar button clicks (WM_COMMAND from taskbar)
+    if (msg == WM_COMMAND && HIWORD(wParam) == THBN_CLICKED) {
+        switch (LOWORD(wParam)) {
+        case THUMB_BTN_PREV: PlayPrev();        break;
+        case THUMB_BTN_PLAY: TogglePlayPause(); break;
+        case THUMB_BTN_NEXT: PlayNext();        break;
+        }
+        UpdateThumbButtons();
+        return 0;
+    }
+
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
@@ -3024,11 +5559,45 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 // ============================================================
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
 {
+    // Load multi-instance preference from INI before the mutex check
+    // Must use the same path as GetIniPath() — %APPDATA%\BillyPro\BillyPro.ini
+    bool multiInstPref = false;
+    {
+        wchar_t iniPath[MAX_PATH] = L"";
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, iniPath))) {
+            wcscat_s(iniPath, L"\\BillyPro\\BillyPro.ini");
+        } else {
+            // Fallback: exe directory
+            GetModuleFileName(hInst, iniPath, MAX_PATH);
+            wchar_t* sl = wcsrchr(iniPath, L'\\'); if (sl) sl[1] = 0;
+            wcscat_s(iniPath, L"BillyPro.ini");
+        }
+        multiInstPref = (GetPrivateProfileInt(L"UI", L"MultiInstance", 0, iniPath) != 0);
+    }
+
     HANDLE hMutex = CreateMutex(NULL, TRUE, L"BillyProV4Mutex");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    bool alreadyRunning = (GetLastError() == ERROR_ALREADY_EXISTS);
+    if (alreadyRunning) {
         HWND ex = FindWindow(CLASS_NAME, NULL);
-        if (ex) SetForegroundWindow(ex);
-        return 0;
+        if (!ex) { CloseHandle(hMutex); return 0; }
+
+        if (!multiInstPref && cmdLine && *cmdLine) {
+            // Replace mode: send the file path to the existing instance via WM_COPYDATA
+            wchar_t filePath[MAX_PATH] = {};
+            wchar_t* p = cmdLine;
+            if (*p == L'"') { p++; wchar_t* e = wcschr(p, L'"'); if (e) { wcsncpy_s(filePath, p, e-p); } else wcsncpy_s(filePath, p, _TRUNCATE); }
+            else wcsncpy_s(filePath, p, _TRUNCATE);
+            COPYDATASTRUCT cds = {};
+            cds.dwData = COPYDATAID_OPENFILE;
+            cds.cbData = (DWORD)((wcslen(filePath) + 1) * sizeof(wchar_t));
+            cds.lpData = filePath;
+            SendMessage(ex, WM_COPYDATA, 0, (LPARAM)&cds);
+        } else if (!multiInstPref) {
+            SetForegroundWindow(ex);
+            if (IsIconic(ex)) ShowWindow(ex, SW_RESTORE);
+        }
+        // In multi-instance mode, fall through and launch a new instance
+        if (!multiInstPref) { CloseHandle(hMutex); return 0; }
     }
 
     INITCOMMONCONTROLSEX icex = { sizeof(icex),ICC_BAR_CLASSES | ICC_WIN95_CLASSES };
@@ -3062,28 +5631,45 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
     HMENU hMenu = CreateMenu();
     HMENU hFile = CreatePopupMenu(), hPlay = CreatePopupMenu();
     HMENU hHelp = CreatePopupMenu(), hOpts = CreatePopupMenu();
+    HMENU hView = CreatePopupMenu();
 
     AppendMenu(hFile, MF_STRING, IDM_FILE_OPENFOLDER, L"Open Folder...\tCtrl+O");
     AppendMenu(hFile, MF_SEPARATOR, 0, NULL);
-    AppendMenu(hFile, MF_STRING, IDM_FILE_CONVERT, L"Convert...");
+    AppendMenu(hFile, MF_STRING, IDM_FILE_OPENM3U,   L"Load Playlist (M3U)...");
+    AppendMenu(hFile, MF_STRING, IDM_FILE_SAVEM3U,   L"Save Playlist (M3U)...");
     AppendMenu(hFile, MF_SEPARATOR, 0, NULL);
-    AppendMenu(hFile, MF_STRING, IDM_FILE_EXIT, L"Exit");
+    AppendMenu(hFile, MF_STRING, IDM_FILE_CONVERT,   L"Convert...");
+    AppendMenu(hFile, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hFile, MF_STRING, IDM_FILE_EXIT,      L"Exit");
+
     AppendMenu(hPlay, MF_STRING, IDM_PLAY_PLAYPAUSE, L"Play / Pause\tSpace");
-    AppendMenu(hPlay, MF_STRING, IDM_PLAY_STOP, L"Stop");
+    AppendMenu(hPlay, MF_STRING, IDM_PLAY_STOP,      L"Stop");
     AppendMenu(hPlay, MF_SEPARATOR, 0, NULL);
-    AppendMenu(hPlay, MF_STRING, IDM_PLAY_PREV, L"Previous\tP");
-    AppendMenu(hPlay, MF_STRING, IDM_PLAY_NEXT, L"Next\tN");
+    AppendMenu(hPlay, MF_STRING, IDM_PLAY_PREV,      L"Previous\tP");
+    AppendMenu(hPlay, MF_STRING, IDM_PLAY_NEXT,      L"Next\tN");
     AppendMenu(hPlay, MF_SEPARATOR, 0, NULL);
-    AppendMenu(hPlay, MF_STRING, IDM_PLAY_SHUFFLE, L"Shuffle\tS");
-    AppendMenu(hPlay, MF_STRING, IDM_PLAY_REPEAT, L"Repeat\tR");
-    AppendMenu(hHelp, MF_STRING, IDM_HELP_ABOUT, L"About...");
-    AppendMenu(hHelp, MF_STRING, IDM_HELP_CONTROLS, L"Controls...");
+    AppendMenu(hPlay, MF_STRING, IDM_PLAY_SHUFFLE,   L"Shuffle\tS");
+    AppendMenu(hPlay, MF_STRING, IDM_PLAY_REPEAT,    L"Repeat\tR");
+
+    AppendMenu(hView, MF_STRING, IDM_VIEW_DARKMODE,  L"Dark Mode");
+
     AppendMenu(hOpts, MF_STRING, IDM_OPTIONS, L"Options...");
+
+    AppendMenu(hHelp, MF_STRING, IDM_HELP_ABOUT,    L"About...");
+    AppendMenu(hHelp, MF_STRING, IDM_HELP_CONTROLS, L"Controls...");
+
     AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hFile, L"&File");
     AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hPlay, L"&Play");
+    AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hView, L"&View");
     AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hOpts, L"&Options");
     AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hHelp, L"&Help");
     SetMenu(hwnd, hMenu);
+
+    // Now that the menu exists, apply persisted checkmarks
+    if (g_darkMode)  CheckMenuItem(hMenu, IDM_VIEW_DARKMODE,  MF_BYCOMMAND | MF_CHECKED);
+    if (g_shuffle)   CheckMenuItem(hMenu, IDM_PLAY_SHUFFLE,   MF_BYCOMMAND | MF_CHECKED);
+    if (g_repeat)    CheckMenuItem(hMenu, IDM_PLAY_REPEAT,    MF_BYCOMMAND | MF_CHECKED);
+    ApplyTheme();  // re-run so dark mode title bar / controls are applied with menu present
 
     if (cmdLine && *cmdLine) {
         // Strip optional surrounding quotes
@@ -3104,6 +5690,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
             if (a & FILE_ATTRIBUTE_DIRECTORY) {
                 // Opened with a folder argument
                 LoadFolder(filePath);
+            }
+            else if (IsM3U(filePath)) {
+                LoadM3UFromPath(filePath);
+                if (!g_playlist.empty()) PlayIndex(0);
             }
             else if (IsAudio(filePath)) {
                 // Billy style: load entire parent folder, start on the clicked file
@@ -3128,12 +5718,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
         }
     }
     else {
-        // No arguments: auto-load all audio files from the EXE's own folder (Billy style)
-        wchar_t exePath[MAX_PATH] = {};
-        GetModuleFileName(hInst, exePath, MAX_PATH);
-        wchar_t* lastSep = wcsrchr(exePath, L'\\');
-        if (lastSep) *lastSep = L'\0';
-        if (exePath[0]) LoadFolder(exePath);
+        // No arguments: if media folder is configured, auto-load it; otherwise load from exe folder
+        if (!g_mediaFolders.empty() && GetFileAttributes(g_mediaFolders[0].c_str()) != INVALID_FILE_ATTRIBUTES) {
+            LoadFolder(g_mediaFolders[0].c_str());
+        } else {
+            wchar_t exePath[MAX_PATH] = {};
+            GetModuleFileName(hInst, exePath, MAX_PATH);
+            wchar_t* lastSep = wcsrchr(exePath, L'\\');
+            if (lastSep) *lastSep = L'\0';
+            if (exePath[0]) LoadFolder(exePath);
+        }
     }
 
     ShowWindow(hwnd, nCmdShow);
@@ -3148,10 +5742,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
         //  Left/Right are forwarded to main WndProc for seek.
         // ────────────────────────────────────────────────────
         if (msg.message == WM_KEYDOWN) {
-            // Don't steal keys when search edit has focus
+            HWND focusWnd = GetFocus();
+            // Don't steal keys when any dialog (info, options, convert) or search has focus
             bool searchFocused = (g_hwndSearch && IsWindow(g_hwndSearch) &&
-                GetFocus() == hSearchEdit);
-            if (!searchFocused) {
+                focusWnd == hSearchEdit);
+            bool dialogFocused =
+                (g_hwndInfo    && IsWindow(g_hwndInfo)    && (focusWnd == g_hwndInfo    || IsChild(g_hwndInfo,    focusWnd))) ||
+                (g_hwndOptions && IsWindow(g_hwndOptions) && (focusWnd == g_hwndOptions || IsChild(g_hwndOptions, focusWnd))) ||
+                (g_hwndConvert && IsWindow(g_hwndConvert) && (focusWnd == g_hwndConvert || IsChild(g_hwndConvert, focusWnd)));
+            if (!searchFocused && !dialogFocused) {
                 WPARAM vk = msg.wParam;
                 // Ctrl+F opens search
                 if (vk == 'F' && (GetKeyState(VK_CONTROL) & 0x8000)) {
@@ -3172,9 +5771,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
                 continue;
             }
         }
-        // Let search window handle its own dialog messages
-        if (g_hwndSearch && IsWindow(g_hwndSearch) &&
-            IsDialogMessage(g_hwndSearch, &msg)) continue;
+        // Let each secondary window handle its own dialog messages (Tab, Enter, etc.)
+        if (g_hwndSearch  && IsWindow(g_hwndSearch)  && IsDialogMessage(g_hwndSearch,  &msg)) continue;
+        if (g_hwndInfo    && IsWindow(g_hwndInfo)    && IsDialogMessage(g_hwndInfo,    &msg)) continue;
+        if (g_hwndOptions && IsWindow(g_hwndOptions) && IsDialogMessage(g_hwndOptions, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
