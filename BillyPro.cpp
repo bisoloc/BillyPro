@@ -27,6 +27,12 @@
 #include "bass.h"
 #include "Resource.h"
 
+// DTS decoding via dcadec
+extern "C" {
+#include "dca_context.h"
+#include "dca_frame.h"
+}
+
 
 #pragma comment(lib, "Comctl32.lib")
 #pragma comment(lib, "Shell32.lib")
@@ -260,6 +266,21 @@ HDSP    g_dspSatHdl = 0;
 HDSP    g_dspVinHdl = 0;
 HDSP    g_dspHfiHdl = 0;
 
+// Gapless playback: decode streams fed into a master output via STREAMPROC
+static HSTREAM g_decStream  = 0;     // current decode stream (BASS_STREAM_DECODE)
+static HSTREAM g_decNext    = 0;     // pre-loaded next decode stream
+static int     g_decNextIdx = -1;    // playlist index of next decode stream
+
+// DTS decode state (forward-declared, defined in DTS section below)
+struct DcaDecoder;
+static DcaDecoder* g_dcaDec = nullptr;     // non-null when playing DTS stream
+static double g_dcaDuration = 0;
+static int    g_dcaSampleRate = 0;
+static int    g_dcaChannels = 0;
+static volatile int64_t g_dcaFramesOut = 0; // PCM frames decoded (for position)
+static DcaDecoder* g_lastDcaDec = nullptr;  // set by CreateDtsStream, consumed by caller
+static DcaDecoder* g_dcaDecNext = nullptr;  // preloaded next DTS decoder
+
 bool    g_seekDragging = false;
 double  g_seekDragPos = 0.0;
 
@@ -360,6 +381,7 @@ void PlayPrev();
 void SeekToSeconds(double sec);
 void UpdateVolume();
 void LayoutControls(HWND hwnd);
+void PreloadNext();
 
 void ApplyTheme();
 static void MenuInitOwnerDraw(HMENU hm);
@@ -1073,6 +1095,28 @@ static void LoadPlaylistM3U(HWND hwndParent)
     LoadM3UFromPath(path, false);
 }
 
+// Scan peak for normalization on any file path (returns peak level)
+static float ScanPeak(const wchar_t* path)
+{
+    float peak = 0.001f;
+    HSTREAM scan = BASS_StreamCreateFile(FALSE, path, 0, 0,
+        BASS_UNICODE | BASS_STREAM_DECODE | BASS_SAMPLE_FLOAT);
+    if (scan) {
+        float fbuf[4096]; DWORD got; int chunks = 0;
+        while (chunks < 200 &&
+            (got = BASS_ChannelGetData(scan, fbuf, sizeof(fbuf))) != (DWORD)-1 && got > 0) {
+            DWORD n = got / sizeof(float);
+            for (DWORD j = 0; j < n; j++) {
+                float a = fabsf(fbuf[j]);
+                if (a > peak) peak = a;
+            }
+            chunks++;
+        }
+        BASS_StreamFree(scan);
+    }
+    return peak;
+}
+
 void ApplyDSP()
 {
     if (!currentStream) return;
@@ -1094,34 +1138,14 @@ void ApplyDSP()
     }
     // Update DSP button visibility
     if (g_hwnd) LayoutControls(g_hwnd);
-    // Normalization: quick-scan peak and adjust volume
-    if (g_normalize) {
-        HSTREAM scan = BASS_StreamCreateFile(FALSE,
-            g_playlist[g_currentIndex].path, 0, 0,
-            BASS_UNICODE | BASS_STREAM_DECODE | BASS_SAMPLE_FLOAT);
-        if (scan) {
-            float peak = 0.001f;
-            float fbuf[4096];
-            DWORD got;
-            int chunks = 0;
-            while (chunks < 200 &&
-                (got = BASS_ChannelGetData(scan, fbuf, sizeof(fbuf))) != (DWORD)-1 && got > 0) {
-                DWORD n = got / sizeof(float);
-                for (DWORD j = 0; j < n; j++) {
-                    float a = fabsf(fbuf[j]);
-                    if (a > peak) peak = a;
-                }
-                chunks++;
-            }
-            BASS_StreamFree(scan);
-            float normVol = currentVolume / peak;
-            if (normVol > 4.0f) normVol = 4.0f;
-            BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_VOL, normVol);
-        }
+    // Normalization on decode stream, user volume on master output
+    if (g_decStream && g_normalize && g_currentIndex >= 0 && g_currentIndex < (int)g_playlist.size()) {
+        float peak = ScanPeak(g_playlist[g_currentIndex].path);
+        float normScale = 1.0f / peak;
+        if (normScale > 4.0f) normScale = 4.0f;
+        BASS_ChannelSetAttribute(g_decStream, BASS_ATTRIB_VOL, normScale);
     }
-    else {
-        BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_VOL, currentVolume);
-    }
+    BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_VOL, currentVolume);
 }
 
 // ============================================================
@@ -1171,6 +1195,17 @@ void StopAudio()
     KillTimer(g_hwnd, IDT_SEEK_REPEAT);
     KillTimer(g_hwnd, IDT_PEAK_METER);
     g_seekKeyHeld = false;
+    // Free decode streams first (before master, since GaplessProc reads them)
+    g_dcaDec = nullptr;
+    g_dcaDecNext = nullptr;
+    g_lastDcaDec = nullptr;
+    g_dcaDuration = 0;
+    g_dcaSampleRate = 0;
+    g_dcaChannels = 0;
+    g_dcaFramesOut = 0;
+    if (g_decNext) { BASS_StreamFree(g_decNext); g_decNext = 0; }
+    g_decNextIdx = -1;
+    if (g_decStream) { BASS_StreamFree(g_decStream); g_decStream = 0; }
     if (currentStream) {
         BASS_ChannelStop(currentStream);
         BASS_StreamFree(currentStream);
@@ -1188,6 +1223,42 @@ void StopAudio()
     SetWindowText(g_hwnd, APP_TITLE);
 }
 
+// Master output STREAMPROC: reads from decode streams, seamless switch on track end
+static DWORD CALLBACK GaplessProc(HSTREAM handle, void* buffer, DWORD length, void* user)
+{
+    BYTE* buf = (BYTE*)buffer;
+    DWORD total = 0;
+
+    while (total < length) {
+        if (!g_decStream) break;
+
+        DWORD got = BASS_ChannelGetData(g_decStream, buf + total, length - total);
+        if (got == (DWORD)-1) got = 0; // end of stream or error
+
+        total += got;
+
+        if (total < length) {
+            // Current decode stream exhausted — switch to next atomically
+            BASS_StreamFree(g_decStream);
+            if (g_decNext) {
+                g_decStream = g_decNext;
+                g_decNext = 0;
+                // Tell UI thread to update title/time/listbox and preload next
+                PostMessage((HWND)user, WM_PLAYNEXT, 1, 0);
+            } else {
+                g_decStream = 0;
+                // End of playlist
+                PostMessage((HWND)user, WM_PLAYNEXT, 0, 0);
+                break;
+            }
+        }
+    }
+
+    if (total == 0) return BASS_STREAMPROC_END;
+    return total;
+}
+
+// Fired when the master output finishes (end of playlist, no more data)
 void CALLBACK EndSyncProc(HSYNC, DWORD, DWORD, void* user)
 {
     PostMessage((HWND)user, WM_PLAYNEXT, 0, 0);
@@ -1216,32 +1287,57 @@ void SeekToSeconds(double sec)
 {
     if (!currentStream) return;
     if (sec < 0) sec = 0;
-    // sec is display-time (pitch-adjusted); convert back to raw sample-time for BASS
     double rawSec = sec * GetPitchSpeedRatio();
-    double rawLen = BASS_ChannelBytes2Seconds(currentStream,
-        BASS_ChannelGetLength(currentStream, BASS_POS_BYTE));
+
+    // DTS seek via dcadec direct file I/O
+    if (g_dcaDec) {
+        extern void DcaSeek(double sec);
+        DcaSeek(rawSec);
+        if (currentStream) BASS_ChannelPlay(currentStream, TRUE);
+        UpdateTimeDisplays();
+        if (hSeekCanvas) InvalidateRect(hSeekCanvas, NULL, FALSE);
+        return;
+    }
+
+    // Normal: seek on decode stream
+    HSTREAM seekTarget = g_decStream ? g_decStream : currentStream;
+    double rawLen = BASS_ChannelBytes2Seconds(seekTarget,
+        BASS_ChannelGetLength(seekTarget, BASS_POS_BYTE));
     if (rawSec > rawLen) rawSec = rawLen;
-    BASS_ChannelSetPosition(currentStream,
-        BASS_ChannelSeconds2Bytes(currentStream, rawSec), BASS_POS_BYTE);
+    BASS_ChannelSetPosition(seekTarget,
+        BASS_ChannelSeconds2Bytes(seekTarget, rawSec), BASS_POS_BYTE);
+    if (g_decStream && currentStream)
+        BASS_ChannelPlay(currentStream, TRUE);
     UpdateTimeDisplays();
     if (hSeekCanvas) InvalidateRect(hSeekCanvas, NULL, FALSE);
 }
 
+static double DcaGetPosition()
+{
+    if (!g_dcaDec || g_dcaSampleRate <= 0) return 0;
+    return (double)g_dcaFramesOut / g_dcaSampleRate;
+}
+
 static double GetTrackLength()
 {
-    if (!currentStream) return 1.0;
-    double s = BASS_ChannelBytes2Seconds(currentStream,
-        BASS_ChannelGetLength(currentStream, BASS_POS_BYTE));
-    s /= GetPitchSpeedRatio();   // actual playback duration after speed change
-    return (s > 0) ? s : 1.0;
+    if (g_dcaDec && g_dcaDuration > 0)
+        return g_dcaDuration / GetPitchSpeedRatio();
+    HSTREAM s = g_decStream ? g_decStream : currentStream;
+    if (!s) return 1.0;
+    double len = BASS_ChannelBytes2Seconds(s,
+        BASS_ChannelGetLength(s, BASS_POS_BYTE));
+    len /= GetPitchSpeedRatio();
+    return (len > 0) ? len : 1.0;
 }
 
 static double GetPlayPos()
 {
-    if (!currentStream) return 0.0;
-    return BASS_ChannelBytes2Seconds(currentStream,
-        BASS_ChannelGetPosition(currentStream, BASS_POS_BYTE))
-        / GetPitchSpeedRatio();  // actual elapsed time
+    if (g_dcaDec) return DcaGetPosition() / GetPitchSpeedRatio();
+    HSTREAM s = g_decStream ? g_decStream : currentStream;
+    if (!s) return 0.0;
+    return BASS_ChannelBytes2Seconds(s,
+        BASS_ChannelGetPosition(s, BASS_POS_BYTE))
+        / GetPitchSpeedRatio();
 }
 
 void UpdateTimeDisplays()
@@ -1275,34 +1371,373 @@ void UpdateWindowTitle()
     else SetWindowText(g_hwnd, APP_TITLE);
 }
 
+// ============================================================
+//  DTS-WAV decoding via dcadec with direct FILE* I/O (seekable)
+// ============================================================
+
+// DTS sync words
+#define DTS_SYNC_CORE_BE   0x7FFE8001u
+#define DTS_SYNC_CORE_LE   0xFE7F0180u
+#define DTS_SYNC_CORE_BE14 0x1FFFE800u
+#define DTS_SYNC_CORE_LE14 0xFF1F00E8u
+
+struct DcaDecoder {
+    FILE*            fp;
+    dcadec_context*  ctx;
+    int64_t          dataOffset;     // WAV 'data' chunk file offset
+    int64_t          dataSize;       // WAV 'data' chunk size
+    int              sampleRate;
+    int              nChannels;      // output channels (2)
+    int              bitsPerSample;
+    int              samplesPerFrame;
+    int              avgFrameBytes;  // average DTS frame size in bytes
+    double           totalDuration;
+    // PCM output buffer
+    float*           pcmBuf;
+    int              pcmLen;
+    int              pcmPos;
+    // Frame buffer
+    uint8_t*         frameBuf;
+    size_t           frameBufCap;
+    bool             eof;
+    int64_t          seekTarget;     // seek target in PCM frames (-1 = none)
+    int64_t          pcmFramesOut;   // total PCM frames output
+};
+
+static bool IsDtsWav(const wchar_t* path)
+{
+    FILE* f = nullptr;
+    _wfopen_s(&f, path, L"rb");
+    if (!f) return false;
+    uint8_t hdr[12];
+    if (fread(hdr, 1, 12, f) != 12) { fclose(f); return false; }
+    if (memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) { fclose(f); return false; }
+    while (true) {
+        uint8_t ch[8];
+        if (fread(ch, 1, 8, f) != 8) { fclose(f); return false; }
+        uint32_t sz = ch[4] | (ch[5] << 8) | (ch[6] << 16) | (ch[7] << 24);
+        if (memcmp(ch, "data", 4) == 0) break;
+        fseek(f, sz, SEEK_CUR);
+    }
+    uint8_t sync[4];
+    if (fread(sync, 1, 4, f) != 4) { fclose(f); return false; }
+    fclose(f);
+    uint32_t s = ((uint32_t)sync[0] << 24) | ((uint32_t)sync[1] << 16) | ((uint32_t)sync[2] << 8) | sync[3];
+    return (s == DTS_SYNC_CORE_BE || s == DTS_SYNC_CORE_LE || s == DTS_SYNC_CORE_BE14 || s == DTS_SYNC_CORE_LE14);
+}
+
+// Scan forward from current file position to find next DTS sync word.
+// Returns true if found, file positioned at start of sync word.
+static bool DcaScanSync(FILE* fp, int64_t maxBytes)
+{
+    uint32_t sync = 0;
+    for (int64_t i = 0; i < maxBytes; i++) {
+        int c = fgetc(fp);
+        if (c == EOF) return false;
+        sync = (sync << 8) | (uint8_t)c;
+        if (sync == DTS_SYNC_CORE_BE || sync == DTS_SYNC_CORE_LE ||
+            sync == DTS_SYNC_CORE_BE14 || sync == DTS_SYNC_CORE_LE14) {
+            _fseeki64(fp, -4, SEEK_CUR); // back up to start of sync
+            return true;
+        }
+    }
+    return false;
+}
+
+// Read one DTS frame from file, convert bitstream, return size (0 = EOF/error)
+static size_t DcaReadFrame(DcaDecoder* d)
+{
+    if (!DcaScanSync(d->fp, 65536)) return 0;
+
+    uint8_t header[DCADEC_FRAME_HEADER_SIZE];
+    if (fread(header, 1, DCADEC_FRAME_HEADER_SIZE, d->fp) != DCADEC_FRAME_HEADER_SIZE)
+        return 0;
+
+    size_t frameSize = 0;
+    if (dcadec_frame_parse_header(header, &frameSize) < 0) return 0;
+
+    size_t bufSize = dcadec_frame_buffer_size(frameSize);
+    if (bufSize > d->frameBufCap) {
+        free(d->frameBuf);
+        d->frameBuf = (uint8_t*)malloc(bufSize);
+        d->frameBufCap = bufSize;
+    }
+    memset(d->frameBuf, 0, bufSize);
+    memcpy(d->frameBuf, header, DCADEC_FRAME_HEADER_SIZE);
+    size_t rest = frameSize - DCADEC_FRAME_HEADER_SIZE;
+    if (fread(d->frameBuf + DCADEC_FRAME_HEADER_SIZE, 1, rest, d->fp) != rest)
+        return 0;
+
+    size_t convSize = 0;
+    if (dcadec_frame_convert_bitstream(d->frameBuf, &convSize, d->frameBuf, frameSize) < 0)
+        return 0;
+
+    return convSize;
+}
+
+// Decode one frame and fill pcmBuf. Returns true if got samples.
+static bool DcaDecodeFrame(DcaDecoder* d)
+{
+    size_t frameSize = DcaReadFrame(d);
+    if (frameSize == 0) { d->eof = true; return false; }
+
+    if (dcadec_context_parse(d->ctx, d->frameBuf, frameSize) < 0)
+        return false; // skip bad frame, caller retries
+
+    int** samples = nullptr;
+    int ns = 0, cm = 0, sr = 0, bps = 0, prof = 0;
+    if (dcadec_context_filter(d->ctx, &samples, &ns, &cm, &sr, &bps, &prof) < 0)
+        return false;
+    if (ns <= 0 || !samples) return false;
+
+    d->sampleRate = sr;
+    d->bitsPerSample = bps;
+    if (d->samplesPerFrame == 0) d->samplesPerFrame = ns;
+
+    int nch = 0;
+    for (int b = 0; b < 32; b++) if (cm & (1 << b)) nch++;
+    if (nch < 1) return false;
+    int outCh = min(nch, 2);
+    d->nChannels = outCh;
+
+    int needed = ns * outCh;
+    if (d->pcmLen < needed) {
+        delete[] d->pcmBuf;
+        d->pcmBuf = new float[needed];
+    }
+    d->pcmLen = needed;
+    d->pcmPos = 0;
+    d->pcmFramesOut += ns;
+    g_dcaFramesOut = d->pcmFramesOut;
+
+    float scale = 1.0f / (float)(1 << (bps - 1));
+    for (int i = 0; i < ns; i++) {
+        d->pcmBuf[i * outCh] = samples[0][i] * scale;
+        if (outCh >= 2)
+            d->pcmBuf[i * outCh + 1] = (nch >= 2) ? samples[1][i] * scale : samples[0][i] * scale;
+    }
+    return true;
+}
+
+void DcaSeek(double sec)
+{
+    DcaDecoder* d = g_dcaDec;
+    if (!d || d->dataSize <= 0 || d->totalDuration <= 0) return;
+
+    // Calculate byte offset in WAV data chunk
+    double frac = sec / d->totalDuration;
+    if (frac < 0) frac = 0; if (frac > 1) frac = 1;
+    int64_t byteOff = (int64_t)(frac * d->dataSize);
+
+    // Seek to that position and scan for next sync word
+    _fseeki64(d->fp, d->dataOffset + byteOff, SEEK_SET);
+
+    // Reset decoder state
+    dcadec_context_clear(d->ctx);
+    d->pcmPos = d->pcmLen = 0;
+    d->eof = false;
+    d->pcmFramesOut = (int64_t)(sec * d->sampleRate);
+    g_dcaFramesOut = d->pcmFramesOut;
+}
+
+static void DcaFreeData(DcaDecoder* d)
+{
+    if (!d) return;
+    if (d == g_dcaDec) {
+        g_dcaDec = nullptr;
+        g_dcaDuration = 0;
+        g_dcaSampleRate = 0;
+        g_dcaChannels = 0;
+    }
+    if (d->ctx) dcadec_context_destroy(d->ctx);
+    if (d->fp)  fclose(d->fp);
+    free(d->frameBuf);
+    delete[] d->pcmBuf;
+    delete d;
+}
+
+// BASS STREAMPROC: on-the-fly DTS decode
+static DWORD CALLBACK DcaStreamProc(HSTREAM handle, void* buffer, DWORD length, void* user)
+{
+    DcaDecoder* d = (DcaDecoder*)user;
+    float* out = (float*)buffer;
+    DWORD wanted = length / sizeof(float);
+    DWORD written = 0;
+
+    // Handle pending seek
+    if (d->seekTarget >= 0) {
+        DcaSeek((double)d->seekTarget / d->sampleRate);
+        d->seekTarget = -1;
+    }
+
+    while (written < wanted && !d->eof) {
+        if (d->pcmPos < d->pcmLen) {
+            DWORD avail = (DWORD)(d->pcmLen - d->pcmPos);
+            DWORD copy = min(avail, wanted - written);
+            memcpy(out + written, d->pcmBuf + d->pcmPos, copy * sizeof(float));
+            d->pcmPos += copy;
+            written += copy;
+        } else {
+            if (!DcaDecodeFrame(d)) {
+                if (!d->eof) continue; // skip bad frame
+                break;
+            }
+        }
+    }
+
+    if (written == 0) return BASS_STREAMPROC_END;
+    return written * sizeof(float);
+}
+
+// Open WAV file, find data chunk, estimate duration, create BASS decode stream
+static HSTREAM CreateDtsStream(const wchar_t* path)
+{
+    FILE* fp = nullptr;
+    _wfopen_s(&fp, path, L"rb");
+    if (!fp) return 0;
+
+    // Parse WAV header to find 'data' chunk
+    uint8_t hdr[12];
+    if (fread(hdr, 1, 12, fp) != 12) { fclose(fp); return 0; }
+    if (memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) { fclose(fp); return 0; }
+
+    int64_t dataOffset = 0, dataSize = 0;
+    while (true) {
+        uint8_t ch[8];
+        if (fread(ch, 1, 8, fp) != 8) { fclose(fp); return 0; }
+        uint32_t sz = ch[4] | (ch[5] << 8) | (ch[6] << 16) | (ch[7] << 24);
+        if (memcmp(ch, "data", 4) == 0) {
+            dataOffset = _ftelli64(fp);
+            dataSize = sz;
+            break;
+        }
+        _fseeki64(fp, sz, SEEK_CUR);
+    }
+
+    // Create decoder context
+    dcadec_context* ctx = dcadec_context_create(DCADEC_FLAG_KEEP_DMIX_2CH);
+    if (!ctx) { fclose(fp); return 0; }
+
+    DcaDecoder* d = new DcaDecoder{};
+    d->fp = fp;
+    d->ctx = ctx;
+    d->dataOffset = dataOffset;
+    d->dataSize = dataSize;
+    d->frameBuf = nullptr;
+    d->frameBufCap = 0;
+    d->pcmBuf = nullptr;
+    d->pcmLen = 0;
+    d->pcmPos = 0;
+    d->eof = false;
+    d->seekTarget = -1;
+    d->pcmFramesOut = 0;
+    d->samplesPerFrame = 0;
+    d->avgFrameBytes = 0;
+
+    // Decode first frame to get format info
+    if (!DcaDecodeFrame(d)) {
+        DcaFreeData(d); return 0;
+    }
+
+    // Estimate duration from file size
+    int64_t firstFrameFilePos = _ftelli64(fp);
+    int64_t firstFrameBytes = firstFrameFilePos - dataOffset;
+    d->avgFrameBytes = (int)firstFrameBytes;
+    if (d->avgFrameBytes > 0 && d->samplesPerFrame > 0 && d->sampleRate > 0) {
+        int64_t totalFrames = dataSize / d->avgFrameBytes;
+        d->totalDuration = (double)(totalFrames * d->samplesPerFrame) / d->sampleRate;
+    }
+
+    HSTREAM h = BASS_StreamCreate(d->sampleRate, d->nChannels,
+        BASS_SAMPLE_FLOAT | BASS_STREAM_DECODE, DcaStreamProc, d);
+    if (!h) { DcaFreeData(d); return 0; }
+
+    BASS_ChannelSetSync(h, BASS_SYNC_FREE, 0,
+        [](HSYNC, DWORD, DWORD, void* user) {
+            DcaFreeData((DcaDecoder*)user);
+        }, d);
+
+    // Don't set g_dcaDec here — caller decides when this becomes the active stream
+    // Store info for caller to pick up
+    g_lastDcaDec = d;
+    return h;
+}
+
+// Activate DTS decoder as the current playing stream
+static void DcaActivate()
+{
+    g_dcaDec = g_lastDcaDec;
+    if (g_dcaDec) {
+        g_dcaDuration = g_dcaDec->totalDuration;
+        g_dcaSampleRate = g_dcaDec->sampleRate;
+        g_dcaChannels = g_dcaDec->nChannels;
+        g_dcaFramesOut = g_dcaDec->pcmFramesOut;
+    }
+    g_lastDcaDec = nullptr;
+}
+
 void PlayIndex(int idx)
 {
     if (idx < 0 || idx >= (int)g_playlist.size()) return;
     StopAudio();
     g_currentIndex = idx;
     if (!g_browserActive) {
-        // Normal mode: highlight and scroll the playlist listbox
         SendMessage(hListBox, LB_SETSEL, FALSE, (LPARAM)-1);
         SendMessage(hListBox, LB_SETSEL, TRUE, (LPARAM)idx);
         SendMessage(hListBox, LB_SETCURSEL, idx, 0);
         SendMessage(hListBox, LB_SETTOPINDEX, max(0, idx - 3), 0);
     }
 
-    currentStream = BASS_StreamCreateFile(FALSE, g_playlist[idx].path, 0, 0, BASS_UNICODE | BASS_SAMPLE_FLOAT);
-    if (!currentStream) {
+    // Create decode stream (DTS-WAV or normal)
+    HSTREAM dec = 0;
+    g_lastDcaDec = nullptr;
+    if (IsDtsWav(g_playlist[idx].path))
+        dec = CreateDtsStream(g_playlist[idx].path);
+    if (dec && g_lastDcaDec) {
+        DcaActivate(); // set g_dcaDec for current track
+    } else {
+        g_lastDcaDec = nullptr;
+    }
+    if (!dec)
+        dec = BASS_StreamCreateFile(FALSE, g_playlist[idx].path, 0, 0,
+            BASS_UNICODE | BASS_SAMPLE_FLOAT | BASS_STREAM_DECODE);
+    if (!dec) {
         wchar_t msg[MAX_PATH + 80];
         swprintf_s(msg, L"Cannot open:\n%s\n\nBASS error: %d",
             g_playlist[idx].path, BASS_ErrorGetCode());
         MessageBox(g_hwnd, msg, L"Playback Error", MB_ICONERROR);
         return;
     }
+
+    // Get format from decode stream to create matching master output
+    BASS_CHANNELINFO ci = {};
+    BASS_ChannelGetInfo(dec, &ci);
+
+    g_decStream = dec;
+
+    // Create master output stream with GaplessProc
+    currentStream = BASS_StreamCreate(ci.freq, ci.chans, BASS_SAMPLE_FLOAT,
+        GaplessProc, g_hwnd);
+    if (!currentStream) {
+        BASS_StreamFree(dec);
+        g_decStream = 0;
+        return;
+    }
+
+    // Apply normalization to decode stream
+    if (g_normalize && g_currentIndex >= 0 && g_currentIndex < (int)g_playlist.size()) {
+        float peak = ScanPeak(g_playlist[g_currentIndex].path);
+        float normScale = 1.0f / peak;
+        if (normScale > 4.0f) normScale = 4.0f;
+        BASS_ChannelSetAttribute(g_decStream, BASS_ATTRIB_VOL, normScale);
+    }
+
+    // User volume on master output
     BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_VOL, currentVolume);
     BASS_ChannelSetSync(currentStream, BASS_SYNC_END, 0, EndSyncProc, g_hwnd);
     ApplyDSP();
     ApplyPitch();
-    // Resize time labels to fit the track's duration (handles hours-long files)
     if (g_hwnd) LayoutControls(g_hwnd);
-    // Update total time display AFTER ApplyPitch so it reflects the pitch-adjusted duration
     if (hTimeTot) {
         wchar_t buf[32], tot[40];
         FormatTime(GetTrackLength(), buf, _countof(buf));
@@ -1320,6 +1755,9 @@ void PlayIndex(int idx)
     UpdateTimeDisplays();
     if (hSeekCanvas)   InvalidateRect(hSeekCanvas, NULL, FALSE);
     if (hVolumeCanvas) InvalidateRect(hVolumeCanvas, NULL, FALSE);
+
+    // Pre-load next track as decode stream
+    PreloadNext();
 }
 
 void TogglePlayPause()
@@ -1377,6 +1815,60 @@ void PlayPrev()
         if (prev < 0) prev = g_repeat ? (int)g_playlist.size() - 1 : 0;
     }
     PlayIndex(prev);
+}
+
+// Compute the next track index (-1 if none)
+static int ComputeNextIndex()
+{
+    if (g_playlist.empty() || g_currentIndex < 0) return -1;
+    if (g_repeat) return g_currentIndex;
+    if (g_shuffle) {
+        int p = 0;
+        for (int i = 0; i < (int)g_shuffleOrder.size(); ++i)
+            if (g_shuffleOrder[i] == g_currentIndex) { p = i; break; }
+        return g_shuffleOrder[(p + 1) % g_shuffleOrder.size()];
+    }
+    int next = g_currentIndex + 1;
+    if (next >= (int)g_playlist.size()) {
+        if (g_repeat) return 0;
+        return -1; // end of playlist, no repeat
+    }
+    return next;
+}
+
+void PreloadNext()
+{
+    // Free any previously pre-loaded decode stream
+    if (g_decNext) { BASS_StreamFree(g_decNext); g_decNext = 0; }
+    g_decNextIdx = -1;
+    int next = ComputeNextIndex();
+    if (next < 0 || next >= (int)g_playlist.size()) return;
+
+    // Create decode stream for next track
+    HSTREAM dec = 0;
+    g_lastDcaDec = nullptr;
+    g_dcaDecNext = nullptr;
+    if (IsDtsWav(g_playlist[next].path))
+        dec = CreateDtsStream(g_playlist[next].path);
+    if (dec && g_lastDcaDec) {
+        g_dcaDecNext = g_lastDcaDec; // save for gapless transition, don't activate
+        g_lastDcaDec = nullptr;
+    }
+    if (!dec)
+        dec = BASS_StreamCreateFile(FALSE, g_playlist[next].path, 0, 0,
+            BASS_UNICODE | BASS_SAMPLE_FLOAT | BASS_STREAM_DECODE);
+    if (!dec) return;
+
+    // Pre-apply normalization to decode stream
+    if (g_normalize) {
+        float peak = ScanPeak(g_playlist[next].path);
+        float normScale = 1.0f / peak;
+        if (normScale > 4.0f) normScale = 4.0f;
+        BASS_ChannelSetAttribute(dec, BASS_ATTRIB_VOL, normScale);
+    }
+
+    g_decNext = dec;
+    g_decNextIdx = next;
 }
 
 // ============================================================
@@ -1525,9 +2017,12 @@ void UpdateStatusBar()
 // ============================================================
 static double GetPlaybackFrac()
 {
-    if (!currentStream) return 0.0;
-    QWORD pos = BASS_ChannelGetPosition(currentStream, BASS_POS_BYTE);
-    QWORD len = BASS_ChannelGetLength(currentStream, BASS_POS_BYTE);
+    if (g_dcaDec && g_dcaDuration > 0)
+        return DcaGetPosition() / g_dcaDuration;
+    HSTREAM s = g_decStream ? g_decStream : currentStream;
+    if (!s) return 0.0;
+    QWORD pos = BASS_ChannelGetPosition(s, BASS_POS_BYTE);
+    QWORD len = BASS_ChannelGetLength(s, BASS_POS_BYTE);
     return (len > 0) ? (double)pos / (double)len : 0.0;
 }
 
@@ -5450,7 +5945,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         case IDM_HELP_ABOUT:
             MessageBox(hwnd,
-                L"Billy Pro V0.4\n\n"
+                L"Billy Pro V0.5\n\n"
                 L"Lightweight music player inspired by BillyMp3 (SheepFriends)\n\n"
                 L"Created by MRJN/CLD.",
                 L"About Billy Pro", MB_ICONINFORMATION);
@@ -5484,12 +5979,51 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
 
     case WM_PLAYNEXT:
-        KillTimer(g_hwnd, IDT_PLAYBACK);
-        SetWindowText(hTimeCur, L"0:00");
-        SetWindowText(hTimeRemain, L"");
-        InvalidateRect(hSeekCanvas, NULL, FALSE);
-        if (g_repeat && g_currentIndex >= 0) PlayIndex(g_currentIndex);
-        else PlayNext();
+        if (wParam == 1) {
+            // Gapless transition: GaplessProc already swapped decode streams
+            // Activate DTS decoder for the new track (if it's DTS)
+            g_dcaDec = g_dcaDecNext;
+            g_dcaDecNext = nullptr;
+            if (g_dcaDec) {
+                g_dcaDuration = g_dcaDec->totalDuration;
+                g_dcaSampleRate = g_dcaDec->sampleRate;
+                g_dcaChannels = g_dcaDec->nChannels;
+                g_dcaFramesOut = g_dcaDec->pcmFramesOut;
+            } else {
+                g_dcaDuration = 0; g_dcaSampleRate = 0; g_dcaChannels = 0; g_dcaFramesOut = 0;
+            }
+            g_currentIndex = g_decNextIdx;
+            g_decNextIdx = -1;
+            if (g_hwnd) LayoutControls(g_hwnd);
+            if (hTimeTot) {
+                wchar_t buf[32], tot[40];
+                FormatTime(GetTrackLength(), buf, _countof(buf));
+                swprintf_s(tot, L"/ %s", buf);
+                SetWindowText(hTimeTot, tot);
+            }
+            if (!g_browserActive) {
+                SendMessage(hListBox, LB_SETSEL, FALSE, (LPARAM)-1);
+                SendMessage(hListBox, LB_SETSEL, TRUE, (LPARAM)g_currentIndex);
+                SendMessage(hListBox, LB_SETCURSEL, g_currentIndex, 0);
+                SendMessage(hListBox, LB_SETTOPINDEX, max(0, g_currentIndex - 3), 0);
+            }
+            UpdatePlayBtn();
+            UpdateStatusBar();
+            UpdateWindowTitle();
+            UpdateTimeDisplays();
+            if (hSeekCanvas)   InvalidateRect(hSeekCanvas, NULL, FALSE);
+            if (hVolumeCanvas) InvalidateRect(hVolumeCanvas, NULL, FALSE);
+            PreloadNext();
+        }
+        else {
+            // End of playlist or no pre-loaded stream
+            KillTimer(g_hwnd, IDT_PLAYBACK);
+            SetWindowText(hTimeCur, L"0:00");
+            SetWindowText(hTimeRemain, L"");
+            InvalidateRect(hSeekCanvas, NULL, FALSE);
+            if (g_repeat && g_currentIndex >= 0) PlayIndex(g_currentIndex);
+            else PlayNext();
+        }
         UpdateThumbButtons();
         break;
 
@@ -5504,6 +6038,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (g_hwndAssoc && IsWindow(g_hwndAssoc))      DestroyWindow(g_hwndAssoc);
         FreeArtBytes();
         DragAcceptFiles(hwnd, FALSE);
+        if (g_decNext) { BASS_StreamFree(g_decNext); g_decNext = 0; }
+        if (g_decStream) { BASS_StreamFree(g_decStream); g_decStream = 0; }
         if (currentStream) { BASS_ChannelStop(currentStream); BASS_StreamFree(currentStream); }
         BASS_Free();
         // Unregister media key hotkeys
