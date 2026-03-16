@@ -35,7 +35,7 @@ Most modern music players are Electron apps or .NET wrappers that eat 200MB of R
 - **Native Win32** - compiled directly to machine code, zero managed runtime overhead
 
 ### 🎵 Audio
-- Plays **every format you'll ever need** - MP3, FLAC, AAC, OGG, WAV, WMA, OPUS, AIFF, M4A and more via the BASS audio library
+- Plays **every format you'll ever need** - MP3, FLAC, AAC, OGG, WAV, WMA, OPUS, AIFF, M4A, DTS and more via the BASS audio library
 - **Gapless-friendly playback** with seamless track transitions
 - **DSP effects chain** - Bass Boost with true peak limiting, Mono mixdown, Normalization
 - **Bass Boost** with a proper brickwall limiter - boosts low frequencies without introducing clipping or distortion. When the bass hits the ceiling, all frequencies duck together cleanly
