@@ -30,7 +30,7 @@ Most modern music players are Electron apps or .NET wrappers that eat 200MB of R
 
 ### ⚡ Performance
 - **~0% CPU** during playback - BASS handles audio on its own thread, the UI does nothing unless you touch it
-- **Under 5MB RAM** - the entire player fits comfortably alongside your music, not instead of it
+- **Under 10MB RAM** - the entire player fits comfortably alongside your music, not instead of it
 - **Instant startup** - no splash screen, no loading, no bullshit. Opens in under 100ms
 - **Native Win32** - compiled directly to machine code, zero managed runtime overhead
 
