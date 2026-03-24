@@ -28,13 +28,13 @@ Most modern music players are Electron apps or .NET wrappers that eat 200MB of R
 
 ## Features
 
-### ⚡ Performance
+###  Performance
 - **~0% CPU** during playback - BASS handles audio on its own thread, the UI does nothing unless you touch it
 - **Under 10MB RAM** - the entire player fits comfortably alongside your music, not instead of it
 - **Instant startup** - no splash screen, no loading, no bullshit. Opens in under 100ms
 - **Native Win32** - compiled directly to machine code, zero managed runtime overhead
 
-### 🎵 Audio
+###  Audio
 - Plays **every format you'll ever need** - MP3, FLAC, AAC, OGG, WAV, WMA, OPUS, AIFF, M4A, DTS and more via the BASS audio library
 - **Gapless-friendly playback** with seamless track transitions
 - **DSP effects chain** - Bass Boost with true peak limiting, Mono mixdown, Normalization
@@ -42,26 +42,26 @@ Most modern music players are Electron apps or .NET wrappers that eat 200MB of R
 - **Mono** - fold stereo to mono for single-speaker setups or hearing checks
 - **Normalization** - scans track peak and adjusts volume so every song plays at a consistent level
 
-### 🎛️ Controls
+###  Controls
 - Keyboard shortcuts for everything - Space to play/pause, N/P for next/previous, S for shuffle, R for repeat
 - **Seek bar** - click anywhere to jump, hold left/right arrow to scrub
 - **Volume bar** with segmented LED display - shows volume fill, audio peak hold, and live bass FFT in red
 - **Peak meter** with hold and decay
 - **System tray** - minimize to tray, restore on double-click
 
-### 📋 Playlist
+###  Playlist
 - Drag & drop files and folders directly onto the window
 - Multi-select with Ctrl+Click and Ctrl+A
 - Drag to reorder tracks
 - Delete key removes selected tracks
 - **CTRL+F** search - filter your playlist instantly
 
-### 🔧 Options
+###  Options
 - Adjustable **Bass Boost** parameters - low freq, high freq, gain (dB)
 - Settings saved to `BillyPro.ini` next to the executable - no registry pollution, fully portable
 - **Convert** dialog - batch convert your library to MP3/OGG/FLAC/WAV with quality control
 
-### 🖼️ Audio Information
+###  Audio Information
 - Full tag viewer - title, artist, album, year, genre, comment
 - **Embedded artwork** display with save-to-file support
 - Bitrate, sample rate, channels, duration, file size at a glance
