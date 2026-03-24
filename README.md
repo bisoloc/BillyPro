@@ -136,5 +136,3 @@ or its source code in any commercial product or service is
 strictly prohibited without explicit written permission.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
-
-*BillyPro v0.2 - small by design.*
