@@ -1,4 +1,4 @@
-// BillyPro.cpp  -  Win32 + BASS audio player  v0.4
+// BillyPro.cpp  -  Win32 + BASS audio player  v0.7
 // Compile:
 //   cl BillyPro.cpp /W3 /O2 /link bass.lib User32.lib Gdi32.lib
 //          Comctl32.lib Shell32.lib Ole32.lib Winmm.lib Uxtheme.lib
@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <map>
 #include "bass.h"
 #include "Resource.h"
 
@@ -43,9 +44,17 @@ extern "C" {
 #pragma comment(lib, "Comdlg32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "runtimeobject.lib")
 #include <winhttp.h>
 #include <dwmapi.h>
 #include <shobjidl.h>
+
+// SMTC (System Media Transport Controls) for lock screen / media overlay
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Media.h>
+#include <winrt/Windows.Storage.Streams.h>
+#include <SystemMediaTransportControlsInterop.h>
 
 // ============================================================
 //  IDs
@@ -70,6 +79,8 @@ extern "C" {
 #define ID_BTN_BASSBOOST    125
 #define ID_BTN_MEDIA        126
 #define ID_BTN_DSP          127
+#define ID_BTN_RECORD       129
+#define ID_BTN_BACK         128
 #define IDM_HELP_CONTROLS   2302
 #define IDM_OPTIONS         2401
 #define IDM_OPTIONS_SHOW    2402
@@ -88,7 +99,18 @@ extern "C" {
 // Library menu
 #define IDM_LIB_FAVORITES     2501
 #define IDM_LIB_PL_MANAGE     2502
+#define IDM_LIB_RADIO         2503
 #define IDM_LIB_PL_BASE       2510  // 2510..2599 = playlist entries
+
+// Internet Radio dialog
+#define ID_RADIO_SEARCH       440
+#define ID_RADIO_QUERY        441
+#define ID_RADIO_LIST         442
+#define ID_RADIO_PLAY         443
+#define ID_RADIO_STOP         444
+#define ID_RADIO_CLOSE        445
+#define ID_RADIO_STATUS       446
+#define ID_RADIO_GENRE        447
 
 // Search dialog
 #define ID_SEARCH_EDIT      201
@@ -110,6 +132,21 @@ extern "C" {
 #define ID_INFO_TRACK       414
 #define ID_INFO_GENRE       415
 #define ID_INFO_SAVE_TAGS   416
+#define ID_INFO_DISCOGS     417
+
+// Discogs tag browser dialog
+#define ID_DCG_ARTIST       420
+#define ID_DCG_TITLE        421
+#define ID_DCG_SEARCH       422
+#define ID_DCG_LIST         423
+#define ID_DCG_APPLY        424
+#define ID_DCG_CLOSE        425
+#define ID_DCG_TOKEN        426
+#define ID_DCG_STATUS       427
+#define ID_DCG_HELP         428
+#define ID_DCG_OPEN_URL     429
+#define ID_DCG_ARTWORK      430
+#define ID_DCG_FILLALL      431
 
 // Convert dialog
 #define IDM_FILE_CONVERT    2004
@@ -134,6 +171,11 @@ extern "C" {
 #define IDT_SEEK_REPEAT     2
 #define IDT_PEAK_DECAY      3   // volume peak meter decay
 #define IDT_PEAK_METER      4   // audio peak meter always-running
+#define IDT_RADIO_META      6   // poll ICY metadata for radio streams
+#define IDT_RADIO_DEBOUNCE  7   // auto-search after typing pause
+#define IDC_RADIO_FAV       448
+#define IDC_RADIO_UNFAV     449
+#define IDC_RADIO_PRESET_BASE 460  // 460..479 = genre preset buttons
 #define IDT_STATUS_SCROLL   5   // status bar text scroll
 #define WM_PLAYNEXT         (WM_APP + 1)
 #define WM_TRAYICON         (WM_APP + 2)
@@ -157,6 +199,7 @@ extern "C" {
 #define IDM_HELP_UPDATE     2303
 // View menu
 #define IDM_VIEW_DARKMODE       2201
+#define IDM_VIEW_MODERN         2202
 // M3U playlist
 #define IDM_FILE_OPENM3U        2005
 #define IDM_FILE_SAVEM3U        2006
@@ -211,7 +254,7 @@ static const Theme DARK = {
 static const wchar_t CLASS_NAME[] = L"BillyProWnd";
 static const wchar_t SEEK_CLASS[] = L"BillySeekBar";
 static const wchar_t VOL_CLASS[] = L"BillyVolBar";
-static const wchar_t APP_TITLE[] = L"Billy Pro";
+static const wchar_t APP_TITLE[] = L"BillyPro";
 static const wchar_t APP_VERSION[] = L"0.6";
 
 HWND g_hwnd = NULL;
@@ -240,8 +283,10 @@ DWORD   g_masterFreq  = 0;     // master output stream sample rate
 DWORD   g_masterChans = 0;     // master output stream channel count
 float   currentVolume = 0.8f;
 bool    g_rememberVolume = false;
+wchar_t g_discogsToken[128] = L"";  // Discogs personal access token
 bool    g_shuffle = false;
-bool    g_repeat = false;
+// Repeat mode: 0=off, 1=repeat track, 2=repeat playlist
+int     g_repeatMode = 0;
 bool    g_mono = false;
 bool    g_normalize = false;
 wchar_t g_iniPath[MAX_PATH] = L"";
@@ -263,6 +308,7 @@ bool  g_dspVinyl    = false;
 bool  g_dspHifi     = false;
 bool  g_dspBypass   = false;   // true = DSP button bypasses all extra effects
 HWND  hDspBtn       = NULL;
+HWND  hBackBtn      = NULL;
 // Reverb params
 float g_revMix    = 8.0f;    // 0-100  wet %
 float g_revRoom   = 75.0f;   // 0-100  room size (maps to feedback 0.5-0.96)
@@ -336,7 +382,9 @@ int g_currentIndex = -1;
 struct MediaBrowserItem { wchar_t path[MAX_PATH]; wchar_t display[MAX_PATH]; bool isDir; };
 std::vector<MediaBrowserItem> g_browserItems;
 bool   g_browserActive = false;
+bool   g_browserReturn = false;  // true = came from browser, show ← to go back
 wchar_t g_browserPath[MAX_PATH] = {};
+wchar_t g_browserReturnPath[MAX_PATH] = {};  // saved path to return to
 
 // Right-click context track index
 int  g_ctxTrackIndex  = -1;
@@ -369,6 +417,21 @@ static bool   g_convAbort     = false;
 static DWORD  g_convStartTick = 0;
 bool   g_trayAdded    = false;   // system tray icon active
 bool   g_darkMode     = false;   // dark theme enabled
+bool   g_modernStyle  = false;  // modern style: artwork thumbnails in playlist
+int    g_modernSize   = 0;      // 0=small(32), 1=medium(48), 2=large(64)
+// Recording state
+static bool    g_recording = false;
+static HDSP    g_recDsp = 0;
+static wchar_t g_recPath[MAX_PATH] = L"";
+static wchar_t g_recSaveDir[MAX_PATH] = L"";  // default recording save directory
+static volatile ULONGLONG g_recBytesIn = 0;    // PCM bytes fed to encoder (for size estimate)
+static HWND    hRecordBtn = NULL;
+
+// Internet Radio state (used by StopAudio/UpdateStatusBar before radio code is defined)
+static bool g_radioPlaying = false;
+static HSTREAM g_radioStream = 0;
+static wchar_t g_radioStationName[256] = L"";
+static wchar_t g_radioNowPlaying[512] = L"";
 bool   g_multiInst    = false;   // allow multiple instances (default: replace session)
 bool   g_dropAppend   = true;    // drag & drop appends to playlist (false = replace)
 HWND   g_hwndAssoc    = NULL;    // file associations dialog
@@ -381,6 +444,10 @@ static UINT           g_WM_TASKBARBUTTONCREATED = 0;
 #define THUMB_BTN_PREV   0
 #define THUMB_BTN_PLAY   1
 #define THUMB_BTN_NEXT   2
+
+// SMTC (System Media Transport Controls)
+static winrt::Windows::Media::SystemMediaTransportControls g_smtc{ nullptr };
+static winrt::event_token g_smtcToken{};
 
 // ============================================================
 //  Forward declarations
@@ -396,6 +463,8 @@ void StopAudio();
 
 // libFLAC decoder struct + globals (implementation after DTS section)
 #include <FLAC/stream_decoder.h>
+#include <FLAC/metadata.h>
+#include <FLAC/stream_encoder.h>
 struct FlacDecoder {
     FLAC__StreamDecoder* dec;
     int      sampleRate;
@@ -436,11 +505,17 @@ void SeekToSeconds(double sec);
 void UpdateVolume();
 void LayoutControls(HWND hwnd);
 void PreloadNext();
+void SaveSettings();
 
 void ApplyTheme();
 static void MenuInitOwnerDraw(HMENU hm);
 void RebuildShuffleOrder();
 void UpdateWindowTitle();
+static void RefreshListboxStars();
+static void SmtcInit(HWND hwnd);
+static void SmtcUpdatePlaybackStatus();
+static void SmtcUpdateMetadata();
+static void SmtcCleanup();
 void OpenSearchDialog();
 void OpenAudioInfoDialog(int trackIdx);
 void OpenAudioInfoForPath(const wchar_t* path);
@@ -493,6 +568,37 @@ void ClearPlaylist()
 {
     g_playlist.clear(); g_shuffleOrder.clear(); g_currentIndex = -1;
     if (hListBox) SendMessage(hListBox, LB_RESETCONTENT, 0, 0);
+}
+
+// Modern folder picker (IFileOpenDialog with FOS_PICKFOLDERS)
+// Returns true if user picked a folder, writes path to outPath
+static bool PickFolder(HWND hwndOwner, const wchar_t* title, wchar_t* outPath, int maxLen)
+{
+    IFileOpenDialog* pfd = NULL;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER,
+        IID_IFileOpenDialog, (void**)&pfd);
+    if (FAILED(hr) || !pfd) return false;
+    DWORD opts = 0;
+    pfd->GetOptions(&opts);
+    pfd->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    if (title) pfd->SetTitle(title);
+    hr = pfd->Show(hwndOwner);
+    if (SUCCEEDED(hr)) {
+        IShellItem* psi = NULL;
+        if (SUCCEEDED(pfd->GetResult(&psi)) && psi) {
+            PWSTR pszPath = NULL;
+            if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &pszPath)) && pszPath) {
+                wcsncpy_s(outPath, maxLen, pszPath, _TRUNCATE);
+                CoTaskMemFree(pszPath);
+                psi->Release();
+                pfd->Release();
+                return true;
+            }
+            psi->Release();
+        }
+    }
+    pfd->Release();
+    return false;
 }
 
 // Returns true if 'dir' is one of the configured media root folders
@@ -583,7 +689,14 @@ static void FillBrowser(const wchar_t* dirIn)
                 wcsncpy_s(it.display, fd.cFileName, _TRUNCATE);
                 it.isDir = false;
                 g_browserItems.push_back(it);
-                if (hListBox) SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)it.display);
+                if (hListBox) {
+                    wchar_t disp[MAX_PATH + 4];
+                    if (IsFavorite(full))
+                        swprintf_s(disp, L"\u2605 %s", it.display);
+                    else
+                        wcsncpy_s(disp, it.display, _TRUNCATE);
+                    SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)disp);
+                }
             }
         } while (FindNextFile(hf, &fd));
         FindClose(hf);
@@ -598,6 +711,7 @@ static void BrowserNavigate(int idx)
     MediaBrowserItem it = g_browserItems[idx];
     if (it.isDir) {
         FillBrowser(it.path);
+        if (g_hwnd) LayoutControls(g_hwnd); // update back button visibility
     } else {
         // Build playlist silently from browser audio files (for next/prev), stay in browser mode
         wchar_t clickedPath[MAX_PATH]; wcsncpy_s(clickedPath, it.path, _TRUNCATE);
@@ -614,8 +728,46 @@ static void BrowserNavigate(int idx)
             }
         }
         RebuildShuffleOrder();
-        // Play — g_browserActive stays true, so PlayIndex won't touch the listbox
+        // Switch to playlist view, but save browser path so ← can go back
+        wcsncpy_s(g_browserReturnPath, g_browserPath, _TRUNCATE);
+        g_browserReturn = true;
+        g_browserActive = false;
+        g_browserItems.clear();
+        SendMessage(hListBox, LB_RESETCONTENT, 0, 0);
+        for (auto& t : g_playlist)
+            SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)t.display);
+        RefreshListboxStars();
+        if (g_hwnd) LayoutControls(g_hwnd);
         if (foundIdx >= 0) PlayIndex(foundIdx);
+    }
+}
+
+// Map a playlist index to the corresponding browser listbox index (returns -1 if not found)
+static int BrowserListboxIndex(int playlistIdx)
+{
+    if (!g_browserActive || playlistIdx < 0 || playlistIdx >= (int)g_playlist.size()) return -1;
+    const wchar_t* path = g_playlist[playlistIdx].path;
+    for (int i = 0; i < (int)g_browserItems.size(); i++) {
+        if (!g_browserItems[i].isDir && _wcsicmp(g_browserItems[i].path, path) == 0)
+            return i;
+    }
+    return -1;
+}
+
+// Update listbox selection for the playing track, works in both normal and browser mode
+static void SelectPlayingTrack(int idx)
+{
+    if (!hListBox) return;
+    if (g_browserActive) {
+        int lbIdx = BrowserListboxIndex(idx);
+        if (lbIdx >= 0) {
+            SendMessage(hListBox, LB_SETCURSEL, lbIdx, 0);
+        }
+    } else {
+        SendMessage(hListBox, LB_SETSEL, FALSE, (LPARAM)-1);
+        SendMessage(hListBox, LB_SETSEL, TRUE, (LPARAM)idx);
+        SendMessage(hListBox, LB_SETCURSEL, idx, 0);
+        SendMessage(hListBox, LB_SETTOPINDEX, max(0, idx - 3), 0);
     }
 }
 
@@ -955,6 +1107,122 @@ void CALLBACK DSP_Hifi(HDSP handle, DWORD channel, void* buffer, DWORD length, v
     }
 }
 
+// --- Recording: real-time FLAC encoding via libFLAC stream encoder ---
+static FLAC__StreamEncoder* g_recEncoder = NULL;
+
+void CALLBACK DSP_Record(HDSP handle, DWORD channel, void* buffer, DWORD length, void* user)
+{
+    if (!g_recording || !g_recEncoder || length == 0) return;
+    float* buf = (float*)buffer;
+    DWORD floats = length / sizeof(float);
+    // Get channel count from encoder
+    BASS_CHANNELINFO ci = {};
+    BASS_ChannelGetInfo(channel, &ci);
+    int nch = ci.chans > 0 ? ci.chans : 2;
+    DWORD frames = floats / nch;
+    // Convert float [-1,1] to 32-bit int for FLAC (using 16-bit depth, stored in int32)
+    std::vector<FLAC__int32> pcm(floats);
+    for (DWORD i = 0; i < floats; i++) {
+        float s = buf[i];
+        if (s > 1.0f) s = 1.0f; if (s < -1.0f) s = -1.0f;
+        pcm[i] = (FLAC__int32)(s * 32767.0f);
+    }
+    FLAC__stream_encoder_process_interleaved(g_recEncoder, pcm.data(), frames);
+    g_recBytesIn += (ULONGLONG)frames * nch * 2; // 16-bit PCM bytes fed
+}
+
+static void StartRecording()
+{
+    if (g_recording || !currentStream) return;
+
+    // Build filename: name_YYYYMMDD_HHMMSS.flac
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t nameBase[256] = L"recording";
+    if (g_radioPlaying && g_radioStationName[0])
+        wcsncpy_s(nameBase, g_radioStationName, _TRUNCATE);
+    else if (g_currentIndex >= 0 && g_currentIndex < (int)g_playlist.size()) {
+        wcsncpy_s(nameBase, g_playlist[g_currentIndex].display, _TRUNCATE);
+        wchar_t* dot = wcsrchr(nameBase, L'.'); if (dot) *dot = 0;
+    }
+    // Sanitize
+    for (wchar_t* p = nameBase; *p; p++)
+        if (*p==L'\\'||*p==L'/'||*p==L':'||*p==L'*'||*p==L'?'||*p==L'"'||*p==L'<'||*p==L'>'||*p==L'|') *p=L'_';
+
+    wchar_t fileName[MAX_PATH];
+    _snwprintf_s(fileName, MAX_PATH, _TRUNCATE, L"%s_%04d%02d%02d_%02d%02d%02d.flac",
+        nameBase, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    wchar_t savePath[MAX_PATH];
+    if (g_recSaveDir[0] && GetFileAttributesW(g_recSaveDir) != INVALID_FILE_ATTRIBUTES) {
+        // Default save dir is set — auto-save there, no dialog
+        _snwprintf_s(savePath, MAX_PATH, _TRUNCATE, L"%s\\%s", g_recSaveDir, fileName);
+    } else {
+        // No default dir — ask user once, then remember the folder
+        wcsncpy_s(savePath, fileName, _TRUNCATE);
+        OPENFILENAME ofn = { sizeof(ofn) };
+        ofn.hwndOwner = g_hwnd; ofn.lpstrFile = savePath; ofn.nMaxFile = MAX_PATH;
+        ofn.lpstrFilter = L"FLAC Audio\0*.flac\0All Files\0*.*\0";
+        ofn.lpstrDefExt = L"flac"; ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+        if (!GetSaveFileName(&ofn)) return;
+        // Remember the chosen directory for next time
+        wcsncpy_s(g_recSaveDir, savePath, _TRUNCATE);
+        wchar_t* lastSep = wcsrchr(g_recSaveDir, L'\\');
+        if (lastSep) *lastSep = L'\0';
+        SaveSettings();
+    }
+
+    BASS_CHANNELINFO ci = {};
+    BASS_ChannelGetInfo(currentStream, &ci);
+    int nch = ci.chans > 0 ? ci.chans : 2;
+    int sr = ci.freq > 0 ? ci.freq : 44100;
+
+    // Create FLAC encoder
+    g_recEncoder = FLAC__stream_encoder_new();
+    if (!g_recEncoder) { MessageBox(g_hwnd, L"Failed to create FLAC encoder.", L"Record", MB_ICONERROR); return; }
+    FLAC__stream_encoder_set_channels(g_recEncoder, nch);
+    FLAC__stream_encoder_set_bits_per_sample(g_recEncoder, 16);
+    FLAC__stream_encoder_set_sample_rate(g_recEncoder, sr);
+    FLAC__stream_encoder_set_compression_level(g_recEncoder, 5);
+
+    // Convert path to UTF-8 for libFLAC
+    int uLen = WideCharToMultiByte(CP_UTF8, 0, savePath, -1, NULL, 0, NULL, NULL);
+    std::string u8path(uLen, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, savePath, -1, &u8path[0], uLen, NULL, NULL);
+
+    FLAC__StreamEncoderInitStatus initStatus = FLAC__stream_encoder_init_file(
+        g_recEncoder, u8path.c_str(), NULL, NULL);
+    if (initStatus != FLAC__STREAM_ENCODER_INIT_STATUS_OK) {
+        FLAC__stream_encoder_delete(g_recEncoder); g_recEncoder = NULL;
+        MessageBox(g_hwnd, L"Failed to init FLAC encoder.", L"Record", MB_ICONERROR);
+        return;
+    }
+
+    wcsncpy_s(g_recPath, savePath, _TRUNCATE);
+    g_recBytesIn = 0;
+    g_recDsp = BASS_ChannelSetDSP(currentStream, DSP_Record, NULL, 10);
+    g_recording = true;
+    if (hRecordBtn) InvalidateRect(hRecordBtn, NULL, TRUE);
+    // Trigger re-layout so remaining-time label gets wider for rec size display
+    if (g_hwnd) { RECT wr; GetClientRect(g_hwnd, &wr); SendMessage(g_hwnd, WM_SIZE, SIZE_RESTORED, MAKELPARAM(wr.right, wr.bottom)); }
+}
+
+static void StopRecording()
+{
+    if (!g_recording) return;
+    g_recording = false;  // stop DSP callback from writing more data
+    if (g_recDsp && currentStream) { BASS_ChannelRemoveDSP(currentStream, g_recDsp); g_recDsp = 0; }
+    if (g_recEncoder) {
+        // finish() seeks back and updates STREAMINFO with total_samples, making file seekable
+        FLAC__stream_encoder_finish(g_recEncoder);
+        FLAC__stream_encoder_delete(g_recEncoder);
+        g_recEncoder = NULL;
+    }
+    if (hRecordBtn) InvalidateRect(hRecordBtn, NULL, TRUE);
+    if (hTimeRemain) SetWindowText(hTimeRemain, L"");
+    // Restore normal label width
+    if (g_hwnd) { RECT wr; GetClientRect(g_hwnd, &wr); SendMessage(g_hwnd, WM_SIZE, SIZE_RESTORED, MAKELPARAM(wr.right, wr.bottom)); }
+}
+
 // ============================================================
 //  INI settings
 // ============================================================
@@ -1045,8 +1313,30 @@ static bool IsFavorite(const wchar_t* path)
 static void RefreshListboxStars()
 {
     if (!hListBox) return;
+    SendMessage(hListBox, WM_SETREDRAW, FALSE, 0);
+
+    // Browser mode: rebuild from browser items
+    if (g_browserActive) {
+        int sel = (int)SendMessage(hListBox, LB_GETCURSEL, 0, 0);
+        SendMessage(hListBox, LB_RESETCONTENT, 0, 0);
+        for (int i = 0; i < (int)g_browserItems.size(); i++) {
+            auto& bi = g_browserItems[i];
+            wchar_t disp[MAX_PATH + 4];
+            if (!bi.isDir && IsFavorite(bi.path))
+                swprintf_s(disp, L"\u2605 %s", bi.display);
+            else
+                wcsncpy_s(disp, bi.display, _TRUNCATE);
+            SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)disp);
+        }
+        if (sel >= 0 && sel < (int)g_browserItems.size())
+            SendMessage(hListBox, LB_SETCURSEL, sel, 0);
+        SendMessage(hListBox, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(hListBox, NULL, FALSE);
+        return;
+    }
+
+    // Normal playlist mode
     int sel = (int)SendMessage(hListBox, LB_GETCURSEL, 0, 0);
-    // Preserve multi-selection state
     int count = (int)SendMessage(hListBox, LB_GETCOUNT, 0, 0);
     std::vector<bool> selState(count);
     for (int i = 0; i < count; i++)
@@ -1056,16 +1346,17 @@ static void RefreshListboxStars()
     for (int i = 0; i < (int)g_playlist.size(); i++) {
         wchar_t disp[MAX_PATH + 4];
         if (!g_favActive && IsFavorite(g_playlist[i].path))
-            swprintf_s(disp, L"\u2605 %s", g_playlist[i].display);  // ★
+            swprintf_s(disp, L"\u2605 %s", g_playlist[i].display);
         else
             wcsncpy_s(disp, g_playlist[i].display, _TRUNCATE);
         SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)disp);
     }
-    // Restore selection
     for (int i = 0; i < min(count, (int)g_playlist.size()); i++)
         if (selState[i]) SendMessage(hListBox, LB_SETSEL, TRUE, i);
     if (sel >= 0 && sel < (int)g_playlist.size())
         SendMessage(hListBox, LB_SETCURSEL, sel, 0);
+    SendMessage(hListBox, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(hListBox, NULL, FALSE);
 }
 
 static void AddFavorite(const wchar_t* path)
@@ -1148,6 +1439,7 @@ static void LoadBppPlaylist(const wchar_t* path)
             SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)t.display);
     }
     g_currentIndex = -1;
+    RefreshListboxStars();
     UpdateStatusBar();
     UpdateWindowTitle();
 }
@@ -1187,7 +1479,7 @@ static void ShowNewPlaylistDialog(HWND hwnd, const wchar_t* trackPath)
     wchar_t file[MAX_PATH] = L"New Playlist.bpp";
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hwnd;
-    ofn.lpstrFilter = L"Billy Pro Playlist (*.bpp)\0*.bpp\0";
+    ofn.lpstrFilter = L"BillyPro Playlist (*.bpp)\0*.bpp\0";
     ofn.lpstrFile = file;
     ofn.nMaxFile = MAX_PATH;
     GetLibDir();
@@ -1227,7 +1519,9 @@ static void LibRestorePlaylist()
             SendMessage(hListBox, LB_SETSEL, FALSE, (LPARAM)-1);
             SendMessage(hListBox, LB_SETSEL, TRUE, g_currentIndex);
             SendMessage(hListBox, LB_SETCURSEL, g_currentIndex, 0);
+            SendMessage(hListBox, LB_SETTOPINDEX, max(0, g_currentIndex - 3), 0);
         }
+        SetFocus(hListBox);
     }
     RefreshListboxStars();
     UpdateStatusBar();
@@ -1260,9 +1554,23 @@ static void LibShowTracks(const std::vector<std::wstring>& paths)
         SendMessage(hListBox, LB_RESETCONTENT, 0, 0);
         for (auto& t : g_playlist)
             SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)t.display);
+        SetFocus(hListBox);
     }
     g_currentIndex = -1;
     g_browserActive = false;
+    // Try to find the currently playing track in this list and select it
+    if (currentStream && g_libSavedIndex >= 0 && g_libSavedIndex < (int)g_libSavedPlaylist.size()) {
+        const wchar_t* playingPath = g_libSavedPlaylist[g_libSavedIndex].path;
+        for (int i = 0; i < (int)g_playlist.size(); i++) {
+            if (_wcsicmp(g_playlist[i].path, playingPath) == 0) {
+                g_currentIndex = i;
+                SendMessage(hListBox, LB_SETSEL, TRUE, i);
+                SendMessage(hListBox, LB_SETCURSEL, i, 0);
+                SendMessage(hListBox, LB_SETTOPINDEX, max(0, i - 3), 0);
+                break;
+            }
+        }
+    }
     RefreshListboxStars();
     UpdateStatusBar();
     UpdateWindowTitle();
@@ -1336,6 +1644,7 @@ void SaveSettings()
     swprintf_s(buf, L"%d", (int)g_dspSaturate); WritePrivateProfileString(L"DSP", L"Saturate", buf, g_iniPath);
     swprintf_s(buf, L"%d", (int)g_dspVinyl);    WritePrivateProfileString(L"DSP", L"Vinyl",    buf, g_iniPath);
     swprintf_s(buf, L"%d", (int)g_dspHifi);     WritePrivateProfileString(L"DSP", L"Hifi",     buf, g_iniPath);
+    swprintf_s(buf, L"%d", (int)g_dspBypass); WritePrivateProfileString(L"DSP", L"Bypass",   buf, g_iniPath);
     swprintf_s(buf, L"%.1f", g_revMix);     WritePrivateProfileString(L"DSP", L"RevMix",    buf, g_iniPath);
     swprintf_s(buf, L"%.1f", g_revRoom);    WritePrivateProfileString(L"DSP", L"RevRoom",   buf, g_iniPath);
     swprintf_s(buf, L"%.1f", g_revWidth);   WritePrivateProfileString(L"DSP", L"RevWidth",  buf, g_iniPath);
@@ -1347,12 +1656,16 @@ void SaveSettings()
     swprintf_s(buf, L"%.1f", g_hfiWarmth);  WritePrivateProfileString(L"DSP", L"HfiWarmth", buf, g_iniPath);
     // Recording output dir
     WritePrivateProfileString(L"Paths", L"RecordOutDir", g_recOutDir, g_iniPath);
+    WritePrivateProfileString(L"Paths", L"RecordSaveDir", g_recSaveDir, g_iniPath);
+    WritePrivateProfileString(L"Discogs", L"Token", g_discogsToken, g_iniPath);
     // UI prefs
     swprintf_s(buf, L"%d", (int)g_darkMode);   WritePrivateProfileString(L"UI", L"DarkMode",      buf, g_iniPath);
+    swprintf_s(buf, L"%d", (int)g_modernStyle);WritePrivateProfileString(L"UI", L"ModernStyle",   buf, g_iniPath);
+    swprintf_s(buf, L"%d", g_modernSize);      WritePrivateProfileString(L"UI", L"ModernSize",    buf, g_iniPath);
     swprintf_s(buf, L"%d", (int)g_multiInst);  WritePrivateProfileString(L"UI", L"MultiInstance", buf, g_iniPath);
     swprintf_s(buf, L"%d", (int)g_dropAppend); WritePrivateProfileString(L"UI", L"DropAppend",    buf, g_iniPath);
     swprintf_s(buf, L"%d", (int)g_shuffle);    WritePrivateProfileString(L"UI", L"Shuffle",       buf, g_iniPath);
-    swprintf_s(buf, L"%d", (int)g_repeat);     WritePrivateProfileString(L"UI", L"Repeat",        buf, g_iniPath);
+    swprintf_s(buf, L"%d", g_repeatMode);       WritePrivateProfileString(L"UI", L"RepeatMode",    buf, g_iniPath);
     swprintf_s(buf, L"%.1f", g_seekStep);      WritePrivateProfileString(L"UI", L"SeekStep",      buf, g_iniPath);
     // Save all media folders as pipe-separated list
     {
@@ -1387,6 +1700,7 @@ void LoadSettings()
     g_dspSaturate = GETI(L"DSP", L"Saturate", 0) != 0;
     g_dspVinyl    = GETI(L"DSP", L"Vinyl",    0) != 0;
     g_dspHifi     = GETI(L"DSP", L"Hifi",     0) != 0;
+    g_dspBypass   = GETI(L"DSP", L"Bypass",   0) != 0;
     g_revMix     = GETF(L"DSP", L"RevMix",    8.0);
     g_revRoom    = GETF(L"DSP", L"RevRoom",   75.0);
     g_revWidth   = GETF(L"DSP", L"RevWidth",  80.0);
@@ -1397,11 +1711,16 @@ void LoadSettings()
     g_hfiBassDb  = GETF(L"DSP", L"HfiBass",   3.0);
     g_hfiWarmth  = GETF(L"DSP", L"HfiWarmth", 33.0);
     GetPrivateProfileString(L"Paths", L"RecordOutDir", L"", g_recOutDir, MAX_PATH, g_iniPath);
+    GetPrivateProfileString(L"Paths", L"RecordSaveDir", L"", g_recSaveDir, MAX_PATH, g_iniPath);
+    GetPrivateProfileString(L"Discogs", L"Token", L"", g_discogsToken, _countof(g_discogsToken), g_iniPath);
     g_darkMode   = GETI(L"UI", L"DarkMode",      0) != 0;
+    g_modernStyle= GETI(L"UI", L"ModernStyle",   0) != 0;
+    g_modernSize = max(0, min(2, GETI(L"UI", L"ModernSize", 0)));
     g_multiInst  = GETI(L"UI", L"MultiInstance", 0) != 0;
     g_dropAppend = GETI(L"UI", L"DropAppend",    1) != 0;
     g_shuffle    = GETI(L"UI", L"Shuffle",       0) != 0;
-    g_repeat     = GETI(L"UI", L"Repeat",        0) != 0;
+    g_repeatMode = GETI(L"UI", L"RepeatMode",    0);
+    if (g_repeatMode < 0 || g_repeatMode > 2) g_repeatMode = 0;
     g_seekStep   = GETF(L"UI", L"SeekStep",      5.0);
     if (g_seekStep < 1.0f) g_seekStep = 1.0f;
     // Load media folders — try new pipe-separated key first, fall back to legacy single key
@@ -1611,7 +1930,17 @@ void StopAudio()
     KillTimer(g_hwnd, IDT_PLAYBACK);
     KillTimer(g_hwnd, IDT_SEEK_REPEAT);
     KillTimer(g_hwnd, IDT_PEAK_METER);
+    KillTimer(g_hwnd, IDT_RADIO_META);
     g_seekKeyHeld = false;
+    // Stop recording if active
+    if (g_recording) StopRecording();
+    // Clean up radio state
+    if (g_radioPlaying) {
+        g_radioPlaying = false;
+        g_radioStream = 0; // will be freed with currentStream below
+        g_radioStationName[0] = L'\0';
+        g_radioNowPlaying[0] = L'\0';
+    }
     // Free decode streams first (before master, since GaplessProc reads them)
     g_dcaDec = nullptr;
     g_dcaDecNext = nullptr;
@@ -1645,6 +1974,7 @@ void StopAudio()
     UpdatePlayBtn();
     UpdateStatusBar();
     UpdateThumbButtons();
+    SmtcUpdatePlaybackStatus();
     SetWindowText(g_hwnd, APP_TITLE);
 }
 
@@ -1774,7 +2104,10 @@ void SeekToSeconds(double sec)
     HSTREAM seekTarget = g_decStream ? g_decStream : currentStream;
     double rawLen = BASS_ChannelBytes2Seconds(seekTarget,
         BASS_ChannelGetLength(seekTarget, BASS_POS_BYTE));
-    if (rawSec > rawLen) rawSec = rawLen;
+    // Clamp to 0.05s before end — seeking to the exact last byte fails in BASS,
+    // the remaining audio plays out naturally and triggers next track via GaplessProc
+    if (rawLen > 0.1 && rawSec > rawLen - 0.05) rawSec = rawLen - 0.05;
+    else if (rawSec > rawLen) rawSec = rawLen;
     BASS_ChannelLock(currentStream, TRUE);
     InterlockedExchange(&g_seeking, 1);
     BASS_ChannelSetPosition(seekTarget,
@@ -1820,10 +2153,38 @@ static double GetPlayPos()
 void UpdateTimeDisplays()
 {
     if (!currentStream) return;
+    // Show recording file size when recording
+    if (g_recording) {
+        // Estimate FLAC size from PCM bytes fed (~60% compression)
+        ULONGLONG sz = (ULONGLONG)(g_recBytesIn * 0.6);
+        // Try actual file size if available
+        if (g_recPath[0]) {
+            WIN32_FILE_ATTRIBUTE_DATA fa = {};
+            if (GetFileAttributesEx(g_recPath, GetFileExInfoStandard, &fa)) {
+                ULONGLONG diskSz = ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+                if (diskSz > 0) sz = diskSz;
+            }
+        }
+        wchar_t szBuf[32];
+        if (sz > 1024ULL * 1024 * 1024)
+            swprintf_s(szBuf, L"\u23FA %.1f GB", sz / (1024.0 * 1024.0 * 1024.0));
+        else if (sz > 1024ULL * 1024)
+            swprintf_s(szBuf, L"\u23FA %.1f MB", sz / (1024.0 * 1024.0));
+        else
+            swprintf_s(szBuf, L"\u23FA %.0f KB", max(1.0, sz / 1024.0));
+        if (hTimeRemain) SetWindowText(hTimeRemain, szBuf);
+    }
+    if (g_radioPlaying) {
+        // Radio: no meaningful time/remaining
+        if (hTimeCur) SetWindowText(hTimeCur, L"LIVE");
+        if (hTimeTot) SetWindowText(hTimeTot, L"");
+        if (!g_recording && hTimeRemain) SetWindowText(hTimeRemain, L"");
+        return;
+    }
     double pos = GetPlayPos(), len = GetTrackLength(), rem = len - pos;
     wchar_t buf[32];
     if (hTimeCur) { FormatTime(pos, buf, _countof(buf)); SetWindowText(hTimeCur, buf); }
-    if (hTimeRemain && rem >= 0) {
+    if (!g_recording && hTimeRemain && rem >= 0) {
         wchar_t r[32]; FormatTime(rem, r, _countof(r));
         swprintf_s(buf, L"-%s", r); SetWindowText(hTimeRemain, buf);
     }
@@ -2360,15 +2721,52 @@ void PlayIndex(int idx)
     if (idx < 0 || idx >= (int)g_playlist.size()) return;
     StopAudio();
     g_currentIndex = idx;
-    if (!g_browserActive) {
-        SendMessage(hListBox, LB_SETSEL, FALSE, (LPARAM)-1);
-        SendMessage(hListBox, LB_SETSEL, TRUE, (LPARAM)idx);
-        SendMessage(hListBox, LB_SETCURSEL, idx, 0);
-        SendMessage(hListBox, LB_SETTOPINDEX, max(0, idx - 3), 0);
-    }
+    SelectPlayingTrack(idx);
 
     // Create decode stream (DTS-WAV, FLAC via libFLAC, or normal BASS)
     HSTREAM dec = 0;
+    // Check if this is a URL (radio stream) — handle differently
+    bool isUrl = (wcsncmp(g_playlist[idx].path, L"http://", 7) == 0 ||
+                  wcsncmp(g_playlist[idx].path, L"https://", 8) == 0);
+    if (isUrl) {
+        // Stream URL — use BASS_StreamCreateURL directly (no decode/gapless)
+        int uLen = WideCharToMultiByte(CP_UTF8, 0, g_playlist[idx].path, -1, NULL, 0, NULL, NULL);
+        std::string url8(uLen, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, g_playlist[idx].path, -1, &url8[0], uLen, NULL, NULL);
+        HSTREAM stream = BASS_StreamCreateURL(url8.c_str(), 0, BASS_SAMPLE_FLOAT, NULL, NULL);
+        if (!stream) {
+            wchar_t msg[MAX_PATH + 80];
+            swprintf_s(msg, L"Cannot open:\n%s\n\nBASS error: %d",
+                g_playlist[idx].path, BASS_ErrorGetCode());
+            MessageBox(g_hwnd, msg, L"Playback Error", MB_ICONERROR);
+            return;
+        }
+        currentStream = stream;
+        g_radioStream = stream;
+        g_radioPlaying = true;
+        // Extract station name from display (strip ▶ prefix)
+        const wchar_t* dispName = g_playlist[idx].display;
+        if (dispName[0] == L'\u25B6' && dispName[1] == L' ') dispName += 2;
+        wcsncpy_s(g_radioStationName, dispName, _TRUNCATE);
+        g_radioNowPlaying[0] = L'\0';
+        BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_VOL, currentVolume);
+        ApplyDSP();
+        BASS_ChannelPlay(currentStream, FALSE);
+        SetTimer(g_hwnd, IDT_PLAYBACK, 16, NULL);
+        SetTimer(g_hwnd, IDT_PEAK_METER, 50, NULL);
+        SetTimer(g_hwnd, IDT_RADIO_META, 2000, NULL);
+        if (!g_browserActive) {
+            SendMessage(hListBox, LB_SETSEL, FALSE, (LPARAM)-1);
+            SendMessage(hListBox, LB_SETSEL, TRUE, (LPARAM)idx);
+            SendMessage(hListBox, LB_SETCURSEL, idx, 0);
+        }
+        UpdatePlayBtn();
+        UpdateStatusBar();
+        UpdateWindowTitle();
+        UpdateThumbButtons();
+        return;
+    }
+
     g_lastDcaDec = nullptr;
     g_lastFlacDec = nullptr;
     if (IsDtsWav(g_playlist[idx].path))
@@ -2445,6 +2843,10 @@ void PlayIndex(int idx)
     if (hSeekCanvas)   InvalidateRect(hSeekCanvas, NULL, FALSE);
     if (hVolumeCanvas) InvalidateRect(hVolumeCanvas, NULL, FALSE);
 
+    // SMTC: update lock screen / media overlay
+    SmtcUpdateMetadata();
+    SmtcUpdatePlaybackStatus();
+
     // Pre-load next track as decode stream
     PreloadNext();
 }
@@ -2467,13 +2869,16 @@ void TogglePlayPause()
     UpdatePlayBtn();
     UpdateStatusBar();
     UpdateThumbButtons();
+    SmtcUpdatePlaybackStatus();
 }
 
 void PlayNext()
 {
     if (g_playlist.empty()) return;
+    // Repeat Track: replay current
+    if (g_repeatMode == 1) { PlayIndex(g_currentIndex); return; }
     int next;
-    if (g_shuffle) {
+    if (g_shuffle && !g_shuffleOrder.empty()) {
         int p = 0;
         for (int i = 0; i < (int)g_shuffleOrder.size(); ++i)
             if (g_shuffleOrder[i] == g_currentIndex) { p = i; break; }
@@ -2482,7 +2887,7 @@ void PlayNext()
     else {
         next = g_currentIndex + 1;
         if (next >= (int)g_playlist.size()) {
-            if (g_repeat) next = 0; else { StopAudio(); return; }
+            if (g_repeatMode == 2) next = 0; else { StopAudio(); return; }
         }
     }
     PlayIndex(next);
@@ -2493,7 +2898,7 @@ void PlayPrev()
     if (g_playlist.empty()) return;
     if (currentStream && GetPlayPos() > 3.0) { SeekToSeconds(0); return; }
     int prev;
-    if (g_shuffle) {
+    if (g_shuffle && !g_shuffleOrder.empty()) {
         int p = 0;
         for (int i = 0; i < (int)g_shuffleOrder.size(); ++i)
             if (g_shuffleOrder[i] == g_currentIndex) { p = i; break; }
@@ -2501,7 +2906,7 @@ void PlayPrev()
     }
     else {
         prev = g_currentIndex - 1;
-        if (prev < 0) prev = g_repeat ? (int)g_playlist.size() - 1 : 0;
+        if (prev < 0) prev = (g_repeatMode == 2) ? (int)g_playlist.size() - 1 : 0;
     }
     PlayIndex(prev);
 }
@@ -2510,8 +2915,8 @@ void PlayPrev()
 static int ComputeNextIndex()
 {
     if (g_playlist.empty() || g_currentIndex < 0) return -1;
-    if (g_repeat) return g_currentIndex;
-    if (g_shuffle) {
+    if (g_repeatMode == 1) return g_currentIndex; // repeat track
+    if (g_shuffle && !g_shuffleOrder.empty()) {
         int p = 0;
         for (int i = 0; i < (int)g_shuffleOrder.size(); ++i)
             if (g_shuffleOrder[i] == g_currentIndex) { p = i; break; }
@@ -2519,7 +2924,7 @@ static int ComputeNextIndex()
     }
     int next = g_currentIndex + 1;
     if (next >= (int)g_playlist.size()) {
-        if (g_repeat) return 0;
+        if (g_repeatMode == 2) return 0; // repeat playlist
         return -1; // end of playlist, no repeat
     }
     return next;
@@ -2588,7 +2993,7 @@ void AddTrayIcon(HWND hwnd)
         LR_DEFAULTCOLOR);
     if (!nid.hIcon)
         nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
-    wcsncpy_s(nid.szTip, L"Billy Pro", _TRUNCATE);
+    wcsncpy_s(nid.szTip, L"BillyPro", _TRUNCATE);
     Shell_NotifyIcon(NIM_ADD, &nid);
     g_trayAdded = true;
 }
@@ -2613,9 +3018,9 @@ void UpdateTrayTooltip()
     nid.uID = 1;
     nid.uFlags = NIF_TIP;
     if (g_currentIndex >= 0 && g_currentIndex < (int)g_playlist.size())
-        swprintf_s(nid.szTip, L"Billy Pro - %s", g_playlist[g_currentIndex].display);
+        swprintf_s(nid.szTip, L"BillyPro - %s", g_playlist[g_currentIndex].display);
     else
-        wcsncpy_s(nid.szTip, L"Billy Pro", _TRUNCATE);
+        wcsncpy_s(nid.szTip, L"BillyPro", _TRUNCATE);
     Shell_NotifyIcon(NIM_MODIFY, &nid);
 }
 
@@ -2623,7 +3028,7 @@ void ShowTrayContextMenu(HWND hwnd)
 {
     POINT pt; GetCursorPos(&pt);
     HMENU hMenu = CreatePopupMenu();
-    AppendMenu(hMenu, MF_STRING, ID_TRAY_RESTORE, L"Restore Billy Pro");
+    AppendMenu(hMenu, MF_STRING, ID_TRAY_RESTORE, L"Restore BillyPro");
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hMenu, MF_STRING, IDM_PLAY_PLAYPAUSE, L"Play / Pause");
     AppendMenu(hMenu, MF_STRING, IDM_PLAY_NEXT, L"Next");
@@ -2653,7 +3058,13 @@ void UpdateStatusBar()
         swprintf_s(left, L"%d Files", (int)g_playlist.size());
 
     if (currentStream) {
-        if (g_currentIndex >= 0 && g_currentIndex < (int)g_playlist.size())
+        if (g_radioPlaying) {
+            // Radio mode: show station + now playing
+            if (g_radioNowPlaying[0])
+                _snwprintf_s(left, _countof(left), _TRUNCATE, L"\u25B6 %s  |  %s", g_radioStationName, g_radioNowPlaying);
+            else
+                _snwprintf_s(left, _countof(left), _TRUNCATE, L"\u25B6 %s", g_radioStationName);
+        } else if (g_currentIndex >= 0 && g_currentIndex < (int)g_playlist.size())
             swprintf_s(left, L"%d / %d  %s",
                 g_currentIndex + 1, (int)g_playlist.size(),
                 g_playlist[g_currentIndex].display);
@@ -3002,19 +3413,20 @@ static void VBar(HDC dc, int cx, int cy, int h2, COLORREF c)
     HBRUSH br = CreateSolidBrush(c); FillRect(dc, &r, br); DeleteObject(br);
 }
 
-enum BtnType { BTN_PREV, BTN_PLAY, BTN_PAUSE, BTN_STOP, BTN_NEXT, BTN_SHUFFLE, BTN_REPEAT, BTN_MONO, BTN_NORMALIZE, BTN_BASSBOOST, BTN_MEDIA, BTN_DSP };
+enum BtnType { BTN_PREV, BTN_PLAY, BTN_PAUSE, BTN_STOP, BTN_NEXT, BTN_SHUFFLE, BTN_REPEAT, BTN_MONO, BTN_NORMALIZE, BTN_BASSBOOST, BTN_MEDIA, BTN_DSP, BTN_BACK, BTN_RECORD };
 
 static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
 {
     HDC  dc = dis->hDC; RECT rc = dis->rcItem;
     bool pressed = (dis->itemState & ODS_SELECTED) != 0;
     bool toggled = (type == BTN_SHUFFLE && g_shuffle)
-        || (type == BTN_REPEAT && g_repeat)
+        || (type == BTN_REPEAT && g_repeatMode != 0)
         || (type == BTN_MONO && g_mono)
         || (type == BTN_NORMALIZE && g_normalize)
         || (type == BTN_BASSBOOST && g_bassBoost)
         || (type == BTN_MEDIA && g_mediaActive)
         || (type == BTN_DSP && !g_dspBypass && (g_dspReverb || g_dspSaturate || g_dspVinyl || g_dspHifi))
+        || (type == BTN_RECORD && g_recording)
         ;
 
     // No border - Billy style. Hover = light blue tint, pressed = slightly darker.
@@ -3072,14 +3484,35 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
         HBRUSH b = CreateSolidBrush(sym); FillRect(dc, &bar, b); DeleteObject(b);
         break;
     }
+    case BTN_RECORD: {
+        // Record circle — hover highlight matches transport buttons (blue tint)
+        bool recHover = (g_hoveredBtn == dis->hwndItem);
+        COLORREF recFace = toggled ? g_theme.accent
+            : pressed ? 0xC8DCF4
+            : recHover ? 0xF0D2B4
+            : g_theme.bg;
+        HBRUSH recBg = CreateSolidBrush(recFace); FillRect(dc, &rc, recBg); DeleteObject(recBg);
+        COLORREF circCol = g_recording ? 0x0000FF
+            : (recHover || pressed) ? 0x1A1A1A
+            : (g_darkMode ? 0x909090 : 0x1A1A1A);
+        HBRUSH rb = CreateSolidBrush(circCol);
+        HPEN rp = CreatePen(PS_SOLID, 1, circCol);
+        HBRUSH orb = (HBRUSH)SelectObject(dc, rb);
+        HPEN orp = (HPEN)SelectObject(dc, rp);
+        Ellipse(dc, cx - 4, cy - 4, cx + 5, cy + 5);
+        SelectObject(dc, orb); SelectObject(dc, orp);
+        DeleteObject(rb); DeleteObject(rp);
+        break;
+    }
     case BTN_MONO:
     case BTN_NORMALIZE:
     case BTN_BASSBOOST:
     case BTN_DSP:
     case BTN_SHUFFLE:
     case BTN_REPEAT:
-    case BTN_MEDIA: {
-        sym = (pressed || toggled) ? 0xFFFFFF : g_theme.text;  // use theme color so dark mode works
+    case BTN_MEDIA:
+    case BTN_BACK: {
+        sym = (pressed || toggled) ? 0xFFFFFF : (hovered && g_darkMode) ? 0x1A1A1A : g_theme.text;  // black text on hover in dark mode for contrast
         // Buttons keep a visible border
         HPEN spn = CreatePen(PS_SOLID, 1, g_theme.btnBorder);
         HPEN sop = (HPEN)SelectObject(dc, spn);
@@ -3094,12 +3527,14 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
         const wchar_t* lbl = L"";
         switch (type) {
         case BTN_SHUFFLE:    lbl = L"Shuffle"; break;
-        case BTN_REPEAT:     lbl = L"Repeat";  break;
+        case BTN_REPEAT:     lbl = (g_repeatMode == 1) ? L"Rep.1" : (g_repeatMode == 2) ? L"Rep.All" : L"Repeat"; break;
         case BTN_MONO:       lbl = L"Mono";    break;
         case BTN_NORMALIZE:  lbl = L"Norm";    break;
         case BTN_BASSBOOST:  lbl = L"BassBoost"; break;
-        case BTN_MEDIA:      lbl = g_mediaActive ? L"\u2605" : L"\u2606"; break;  // ★ / ☆
+        case BTN_MEDIA:      lbl = L"Library"; break;
         case BTN_DSP:        lbl = L"DSP";     break;
+        case BTN_BACK:       lbl = L"\u2190";  break;  // ←
+        // BTN_RECORD handled above as transport button (no border)
         default:             lbl = L"";        break;
         }
         DrawText(dc, lbl, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -3125,6 +3560,23 @@ LRESULT CALLBACK BtnHotProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         g_hoveredBtn = NULL;
         InvalidateRect(hwnd, NULL, TRUE);
         UpdateWindow(hwnd);
+    }
+    // Right-click on Repeat button: show mode picker
+    if (msg == WM_RBUTTONUP && hwnd == hRepeatBtn) {
+        HMENU hm = CreatePopupMenu();
+        AppendMenu(hm, MF_STRING | (g_repeatMode == 0 ? MF_CHECKED : 0), 1, L"Repeat Off");
+        AppendMenu(hm, MF_STRING | (g_repeatMode == 1 ? MF_CHECKED : 0), 2, L"Repeat Track");
+        AppendMenu(hm, MF_STRING | (g_repeatMode == 2 ? MF_CHECKED : 0), 3, L"Repeat Playlist");
+        POINT pt; GetCursorPos(&pt);
+        int cmd = TrackPopupMenu(hm, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwnd, NULL);
+        DestroyMenu(hm);
+        if (cmd >= 1 && cmd <= 3) {
+            g_repeatMode = cmd - 1;
+            CheckMenuItem(GetMenu(g_hwnd), IDM_PLAY_REPEAT,
+                MF_BYCOMMAND | (g_repeatMode ? MF_CHECKED : MF_UNCHECKED));
+            InvalidateRect(hRepeatBtn, NULL, TRUE);
+        }
+        return 0;
     }
     return CallWindowProc(g_OldBtnProc, hwnd, msg, wParam, lParam);
 }
@@ -3169,7 +3621,7 @@ static void ReorderTrack(int srcIdx, int destIdx)
         if (g_currentIndex >= destIdx && g_currentIndex < srcIdx) g_currentIndex++;
     }
 
-    // Rebuild listbox with star prefixes
+    // Rebuild listbox with star prefixes (RefreshListboxStars handles WM_SETREDRAW internally)
     RefreshListboxStars();
     SendMessage(hListBox, LB_SETCURSEL, destIdx, 0);
     SendMessage(hListBox, LB_SETTOPINDEX, topIdx, 0);
@@ -3396,11 +3848,14 @@ void ShowTrackContextMenu(HWND hwnd, int trackIdx, POINT pt)
         AppendMenu(hPlSub, MF_STRING, IDC_CTX_PL_NEW, L"New Playlist...");
         AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hPlSub, L"Add to Playlist");
     }
+    bool isUrl = (wcsncmp(g_ctxFilePath, L"http://", 7) == 0 || wcsncmp(g_ctxFilePath, L"https://", 8) == 0);
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenu(hMenu, MF_STRING, IDC_CTX_AUDIOINFO,    L"Audio Information...");
-    AppendMenu(hMenu, MF_STRING, IDC_CTX_PROPERTIES,   L"Properties...");
-    AppendMenu(hMenu, MF_STRING, IDC_CTX_OPENLOCATION, L"Open File Location");
-    AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+    if (!isUrl) {
+        AppendMenu(hMenu, MF_STRING, IDC_CTX_AUDIOINFO,    L"Audio Information...");
+        AppendMenu(hMenu, MF_STRING, IDC_CTX_PROPERTIES,   L"Properties...");
+        AppendMenu(hMenu, MF_STRING, IDC_CTX_OPENLOCATION, L"Open File Location");
+        AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+    }
     AppendMenu(hMenu, MF_STRING, IDC_CTX_REMOVE, L"Remove");
 
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwnd, NULL);
@@ -3559,34 +4014,414 @@ static HBITMAP LoadEmbeddedArtworkSized(HSTREAM stream, int size)
     return NULL;
 }
 
-// Write ID3v2.3 tags to an MP3 file (re-writes the header, preserves audio data)
-static bool WriteID3v2ToMP3(const wchar_t* path,
-    const wchar_t* title, const wchar_t* artist, const wchar_t* album,
-    const wchar_t* year,  const wchar_t* track,  const wchar_t* genre)
+// ============================================================
+//  Artwork thumbnail cache for Modern Style listbox
+// ============================================================
+static int GetThumbSz() { static const int sizes[] = {32, 48, 64}; return sizes[max(0, min(2, g_modernSize))]; }
+#define THUMB_SZ GetThumbSz()
+// Cache: path -> HBITMAP (NULL = no artwork, use placeholder)
+// Special sentinel: (HBITMAP)1 means "not yet loaded"
+static std::map<std::wstring, HBITMAP> g_thumbCache;
+static HBITMAP g_thumbPlaceholder = NULL;  // music note placeholder
+
+static void ClearThumbCache()
 {
-    // Read file
-    HANDLE hf = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (hf == INVALID_HANDLE_VALUE) return false;
-    LARGE_INTEGER fs; GetFileSizeEx(hf, &fs);
-    if (fs.QuadPart > 500LL * 1024 * 1024) { CloseHandle(hf); return false; } // 500 MB guard
+    for (auto& p : g_thumbCache)
+        if (p.second && p.second != (HBITMAP)1) DeleteObject(p.second);
+    g_thumbCache.clear();
+}
 
-    // Find start of audio data — skip existing ID3v2 header
-    BYTE hdr[10]; DWORD rd;
-    ReadFile(hf, hdr, 10, &rd, NULL);
-    DWORD audioOffset = 0;
-    if (rd == 10 && memcmp(hdr, "ID3", 3) == 0) {
-        DWORD sz = ((DWORD)(hdr[6] & 0x7F) << 21) | ((DWORD)(hdr[7] & 0x7F) << 14) |
-                   ((DWORD)(hdr[8] & 0x7F) << 7)  | (hdr[9] & 0x7F);
-        audioOffset = 10 + sz;
+static HBITMAP CreatePlaceholderBitmap()
+{
+    HDC hdcScreen = GetDC(NULL);
+    HDC hdc = CreateCompatibleDC(hdcScreen);
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = THUMB_SZ;
+    bi.bmiHeader.biHeight = -THUMB_SZ;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = NULL;
+    HBITMAP hbm = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    HBITMAP old = (HBITMAP)SelectObject(hdc, hbm);
+    // Fill with contrasting background
+    RECT rc = { 0, 0, THUMB_SZ, THUMB_SZ };
+    HBRUSH br = CreateSolidBrush(g_darkMode ? 0x484848 : 0xCCCCCC);
+    FillRect(hdc, &rc, br); DeleteObject(br);
+    // Border for visibility
+    HPEN pen = CreatePen(PS_SOLID, 1, g_darkMode ? 0x606060 : 0xAAAAAA);
+    HPEN op = (HPEN)SelectObject(hdc, pen);
+    SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, 0, 0, THUMB_SZ, THUMB_SZ);
+    SelectObject(hdc, op); DeleteObject(pen);
+    // Draw music note symbol
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, g_darkMode ? 0xBBBBBB : 0x666666);
+    HFONT hf = CreateFont(-20, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI Symbol");
+    HFONT of = (HFONT)SelectObject(hdc, hf);
+    DrawText(hdc, L"\u266B", 1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE); // ♫
+    SelectObject(hdc, of); DeleteObject(hf);
+    SelectObject(hdc, old);
+    DeleteDC(hdc);
+    ReleaseDC(NULL, hdcScreen);
+    return hbm;
+}
+
+// Get or load artwork thumbnail for a file path (returns placeholder if no artwork)
+// Decode raw image bytes (JPEG/PNG) to an HBITMAP scaled to size×size via WIC
+static HBITMAP DecodeImageToThumb(const BYTE* imgData, DWORD imgSize, int size)
+{
+    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, imgSize);
+    if (!hg) return NULL;
+    void* mem = GlobalLock(hg);
+    if (!mem) { GlobalFree(hg); return NULL; }
+    memcpy(mem, imgData, imgSize);
+    GlobalUnlock(hg);
+
+    HBITMAP result = NULL;
+    IStream* pStream = NULL;
+    if (SUCCEEDED(CreateStreamOnHGlobal(hg, FALSE, &pStream))) {
+        IWICImagingFactory* pFact = NULL;
+        CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+            IID_IWICImagingFactory, (void**)&pFact);
+        if (pFact) {
+            IWICBitmapDecoder* pDec = NULL;
+            pFact->CreateDecoderFromStream(pStream, NULL, WICDecodeMetadataCacheOnLoad, &pDec);
+            if (pDec) {
+                IWICBitmapFrameDecode* pFrame = NULL;
+                pDec->GetFrame(0, &pFrame);
+                if (pFrame) {
+                    IWICBitmapScaler* pScale = NULL;
+                    pFact->CreateBitmapScaler(&pScale);
+                    if (pScale) {
+                        pScale->Initialize(pFrame, size, size, WICBitmapInterpolationModeCubic);
+                        IWICFormatConverter* pConv = NULL;
+                        pFact->CreateFormatConverter(&pConv);
+                        if (pConv) {
+                            pConv->Initialize(pScale, GUID_WICPixelFormat32bppBGRA,
+                                WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom);
+                            HDC hdc = GetDC(NULL);
+                            BITMAPINFO bi = {};
+                            bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                            bi.bmiHeader.biWidth = size; bi.bmiHeader.biHeight = -size;
+                            bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+                            BYTE* bits = NULL;
+                            result = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, (void**)&bits, NULL, 0);
+                            ReleaseDC(NULL, hdc);
+                            if (result && bits)
+                                pConv->CopyPixels(NULL, size * 4, size * size * 4, bits);
+                            pConv->Release();
+                        }
+                        pScale->Release();
+                    }
+                    pFrame->Release();
+                }
+                pDec->Release();
+            }
+            pFact->Release();
+        }
+        pStream->Release();
     }
-    DWORD audioSize = (audioOffset < (DWORD)fs.QuadPart) ? ((DWORD)fs.QuadPart - audioOffset) : 0;
-    std::vector<BYTE> audio(audioSize);
-    SetFilePointer(hf, audioOffset, NULL, FILE_BEGIN);
-    ReadFile(hf, audio.data(), audioSize, &rd, NULL);
-    CloseHandle(hf);
+    GlobalFree(hg);
+    return result;
+}
 
-    // Build ID3v2.3 frames (UTF-8 encoding byte = 3)
-    std::vector<BYTE> frames;
+// Read ID3v2 APIC artwork directly from file (no BASS, no temp files, no globals)
+// Try to load artwork from ID3v2 tags (MP3, some WAV)
+static HBITMAP LoadThumbFromID3v2(FILE* f, int size)
+{
+    BYTE hdr[10];
+    fseek(f, 0, SEEK_SET);
+    if (fread(hdr, 1, 10, f) != 10 || memcmp(hdr, "ID3", 3) != 0) return NULL;
+    DWORD tagSize = ((hdr[6] & 0x7F) << 21) | ((hdr[7] & 0x7F) << 14) |
+        ((hdr[8] & 0x7F) << 7) | (hdr[9] & 0x7F);
+    BYTE ver = hdr[3];
+    if (tagSize > 8 * 1024 * 1024) return NULL;
+    std::vector<BYTE> tag(tagSize);
+    if (fread(tag.data(), 1, tagSize, f) != tagSize) return NULL;
+
+    const BYTE* p = tag.data();
+    const BYTE* end = p + tagSize;
+    while (p + 10 < end) {
+        char fid[5] = {}; memcpy(fid, p, 4);
+        DWORD fsize;
+        if (ver >= 4) fsize = ((p[4] & 0x7F) << 21) | ((p[5] & 0x7F) << 14) | ((p[6] & 0x7F) << 7) | (p[7] & 0x7F);
+        else          fsize = (p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7];
+        p += 10;
+        if (fsize == 0 || p + fsize > end) break;
+        if (strcmp(fid, "APIC") == 0 && fsize > 10) {
+            const BYTE* fp = p; fp++;
+            while (fp < p + fsize && *fp) fp++;
+            if (fp < p + fsize) fp++;
+            if (fp < p + fsize) fp++;
+            while (fp < p + fsize && *fp) fp++;
+            if (fp < p + fsize) fp++;
+            DWORD imgSize = (DWORD)(p + fsize - fp);
+            if (imgSize > 100) return DecodeImageToThumb(fp, imgSize, size);
+        }
+        p += fsize;
+    }
+    return NULL;
+}
+
+// Try to load artwork from FLAC metadata (METADATA_BLOCK_PICTURE, type 6)
+static HBITMAP LoadThumbFromFLAC(FILE* f, int size)
+{
+    BYTE magic[4];
+    fseek(f, 0, SEEK_SET);
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "fLaC", 4) != 0) return NULL;
+
+    // Parse metadata blocks
+    while (true) {
+        BYTE blockHdr[4];
+        if (fread(blockHdr, 1, 4, f) != 4) return NULL;
+        bool isLast = (blockHdr[0] & 0x80) != 0;
+        int blockType = blockHdr[0] & 0x7F;
+        DWORD blockLen = ((DWORD)blockHdr[1] << 16) | ((DWORD)blockHdr[2] << 8) | blockHdr[3];
+
+        if (blockType == 6 && blockLen > 32) { // PICTURE block
+            std::vector<BYTE> block(blockLen);
+            if (fread(block.data(), 1, blockLen, f) != blockLen) return NULL;
+            const BYTE* bp = block.data();
+            // PICTURE block format: pictureType(4) + mimeLen(4) + mime + descLen(4) + desc +
+            //                       width(4) + height(4) + depth(4) + colors(4) + dataLen(4) + data
+            if (blockLen < 32) return NULL;
+            DWORD mimeLen = ((DWORD)bp[4] << 24) | ((DWORD)bp[5] << 16) | ((DWORD)bp[6] << 8) | bp[7];
+            DWORD off = 8 + mimeLen;
+            if (off + 4 > blockLen) return NULL;
+            DWORD descLen = ((DWORD)bp[off] << 24) | ((DWORD)bp[off+1] << 16) | ((DWORD)bp[off+2] << 8) | bp[off+3];
+            off += 4 + descLen;
+            if (off + 20 > blockLen) return NULL;
+            off += 16; // skip width, height, depth, colors
+            DWORD dataLen = ((DWORD)bp[off] << 24) | ((DWORD)bp[off+1] << 16) | ((DWORD)bp[off+2] << 8) | bp[off+3];
+            off += 4;
+            if (off + dataLen > blockLen || dataLen < 100) return NULL;
+            return DecodeImageToThumb(bp + off, dataLen, size);
+        } else {
+            fseek(f, blockLen, SEEK_CUR);
+        }
+        if (isLast) break;
+    }
+    return NULL;
+}
+
+// Try to load artwork from WAV file (check for ID3v2 chunk inside RIFF)
+static HBITMAP LoadThumbFromWAV(FILE* f, int size)
+{
+    BYTE hdr[12];
+    fseek(f, 0, SEEK_SET);
+    if (fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) return NULL;
+
+    // Search for "id3 " or "ID3 " or "ID32" chunk inside the WAV
+    while (true) {
+        BYTE ch[8];
+        if (fread(ch, 1, 8, f) != 8) break;
+        DWORD sz = ch[4] | (ch[5] << 8) | (ch[6] << 16) | (ch[7] << 24);
+        if (sz == 0 || sz > 50 * 1024 * 1024) break; // sanity check
+        bool isId3 = (memcmp(ch, "id3 ", 4) == 0 || memcmp(ch, "ID3 ", 4) == 0 || memcmp(ch, "ID32", 4) == 0);
+        if (isId3 && sz > 10) {
+            // Read the ID3v2 data from the chunk directly (don't seek to file start)
+            long chunkStart = ftell(f);
+            BYTE id3hdr[10];
+            if (fread(id3hdr, 1, 10, f) == 10 && memcmp(id3hdr, "ID3", 3) == 0) {
+                DWORD tagSize = ((id3hdr[6] & 0x7F) << 21) | ((id3hdr[7] & 0x7F) << 14) |
+                    ((id3hdr[8] & 0x7F) << 7) | (id3hdr[9] & 0x7F);
+                BYTE ver = id3hdr[3];
+                if (tagSize > 0 && tagSize <= sz && tagSize <= 8 * 1024 * 1024) {
+                    std::vector<BYTE> tag(tagSize);
+                    if (fread(tag.data(), 1, tagSize, f) == tagSize) {
+                        const BYTE* p = tag.data();
+                        const BYTE* end = p + tagSize;
+                        while (p + 10 < end) {
+                            char fid[5] = {}; memcpy(fid, p, 4);
+                            DWORD fsize;
+                            if (ver >= 4) fsize = ((p[4] & 0x7F) << 21) | ((p[5] & 0x7F) << 14) | ((p[6] & 0x7F) << 7) | (p[7] & 0x7F);
+                            else          fsize = (p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7];
+                            p += 10;
+                            if (fsize == 0 || p + fsize > end) break;
+                            if (strcmp(fid, "APIC") == 0 && fsize > 10) {
+                                const BYTE* fp = p; fp++;
+                                while (fp < p + fsize && *fp) fp++;
+                                if (fp < p + fsize) fp++;
+                                if (fp < p + fsize) fp++;
+                                while (fp < p + fsize && *fp) fp++;
+                                if (fp < p + fsize) fp++;
+                                DWORD imgSize = (DWORD)(p + fsize - fp);
+                                if (imgSize > 100) return DecodeImageToThumb(fp, imgSize, size);
+                            }
+                            p += fsize;
+                        }
+                    }
+                }
+            }
+            fseek(f, chunkStart + ((sz + 1) & ~1), SEEK_SET);
+        } else {
+            fseek(f, (sz + 1) & ~1, SEEK_CUR); // chunks are word-aligned
+        }
+    }
+    return NULL;
+}
+
+static HBITMAP LoadThumbFromFile(const wchar_t* path, int size)
+{
+    FILE* f = NULL;
+    _wfopen_s(&f, path, L"rb");
+    if (!f) return NULL;
+
+    // Detect format from file header
+    BYTE peek[4] = {};
+    fread(peek, 1, 4, f);
+    fseek(f, 0, SEEK_SET);
+
+    HBITMAP result = NULL;
+    if (memcmp(peek, "ID3", 3) == 0) {
+        // MP3 with ID3v2
+        result = LoadThumbFromID3v2(f, size);
+    } else if (memcmp(peek, "fLaC", 4) == 0) {
+        // FLAC
+        result = LoadThumbFromFLAC(f, size);
+    } else if (memcmp(peek, "RIFF", 4) == 0) {
+        // WAV — check for embedded ID3v2 chunk
+        result = LoadThumbFromWAV(f, size);
+    }
+    fclose(f);
+
+    // Fallback: use BASS to read ID3v2 tags (handles non-standard tag locations in WAV/etc.)
+    if (!result) {
+        HSTREAM s = BASS_StreamCreateFile(FALSE, path, 0, 0,
+            BASS_UNICODE | BASS_STREAM_DECODE | BASS_SAMPLE_FLOAT);
+        if (s) {
+            const void* id3v2 = BASS_ChannelGetTags(s, BASS_TAG_ID3V2);
+            if (id3v2) {
+                const BYTE* data = (const BYTE*)id3v2;
+                if (memcmp(data, "ID3", 3) == 0) {
+                    DWORD tagSize = ((data[6] & 0x7F) << 21) | ((data[7] & 0x7F) << 14) |
+                        ((data[8] & 0x7F) << 7) | (data[9] & 0x7F);
+                    BYTE ver = data[3];
+                    const BYTE* p = data + 10;
+                    const BYTE* end = data + 10 + tagSize;
+                    while (p + 10 < end) {
+                        char fid[5] = {}; memcpy(fid, p, 4);
+                        DWORD fsize;
+                        if (ver >= 4) fsize = ((p[4] & 0x7F) << 21) | ((p[5] & 0x7F) << 14) | ((p[6] & 0x7F) << 7) | (p[7] & 0x7F);
+                        else          fsize = (p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7];
+                        p += 10;
+                        if (fsize == 0 || p + fsize > end) break;
+                        if (strcmp(fid, "APIC") == 0 && fsize > 10) {
+                            const BYTE* fp = p; fp++;
+                            while (fp < p + fsize && *fp) fp++;
+                            if (fp < p + fsize) fp++;
+                            if (fp < p + fsize) fp++;
+                            while (fp < p + fsize && *fp) fp++;
+                            if (fp < p + fsize) fp++;
+                            DWORD imgSize = (DWORD)(p + fsize - fp);
+                            if (imgSize > 100) {
+                                result = DecodeImageToThumb(fp, imgSize, size);
+                                if (result) { BASS_StreamFree(s); return result; }
+                            }
+                        }
+                        p += fsize;
+                    }
+                }
+            }
+            BASS_StreamFree(s);
+        }
+    }
+
+    return result;
+}
+
+static HBITMAP GetThumbForPath(const wchar_t* path)
+{
+    std::wstring key(path);
+    auto it = g_thumbCache.find(key);
+    if (it != g_thumbCache.end())
+        return it->second ? it->second : g_thumbPlaceholder;
+
+    // Read artwork directly from file — no BASS, no temp files
+    HBITMAP bm = LoadThumbFromFile(path, THUMB_SZ);
+    g_thumbCache[key] = bm;
+    return bm ? bm : g_thumbPlaceholder;
+}
+
+static void RecreateListbox()
+{
+    if (!hListBox || !g_hwnd) return;
+    HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(g_hwnd, GWLP_HINSTANCE);
+
+    // Save state
+    int topIdx = (int)SendMessage(hListBox, LB_GETTOPINDEX, 0, 0);
+    int curSel = (int)SendMessage(hListBox, LB_GETCURSEL, 0, 0);
+
+    // Destroy old
+    DestroyWindow(hListBox);
+
+    // Create new with or without owner-draw
+    DWORD style = WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_EXTENDEDSEL;
+    if (g_modernStyle) style |= LBS_OWNERDRAWFIXED | LBS_HASSTRINGS;
+
+    hListBox = CreateWindowEx(0, L"LISTBOX", NULL, style,
+        0, 0, 0, 0, g_hwnd, (HMENU)ID_LISTBOX, hInst, NULL);
+    SendMessage(hListBox, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+    SendMessage(hListBox, LB_SETITEMHEIGHT, 0, g_modernStyle ? (THUMB_SZ + 4) : 20);
+
+    // Subclass
+    g_OldListProc = (WNDPROC)SetWindowLongPtr(hListBox, GWLP_WNDPROC, (LONG_PTR)ListBoxProc);
+
+    // Theme
+    SetWindowTheme(hListBox, g_darkMode ? L"DarkMode_Explorer" : L"Explorer", NULL);
+
+    // Repopulate
+    if (g_browserActive) {
+        for (auto& bi : g_browserItems) {
+            wchar_t disp[MAX_PATH + 4];
+            if (!bi.isDir && IsFavorite(bi.path))
+                swprintf_s(disp, L"\u2605 %s", bi.display);
+            else
+                wcsncpy_s(disp, bi.display, _TRUNCATE);
+            SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)disp);
+        }
+    } else {
+        for (auto& t : g_playlist) {
+            wchar_t disp[MAX_PATH + 4];
+            if (!g_favActive && IsFavorite(t.path))
+                swprintf_s(disp, L"\u2605 %s", t.display);
+            else
+                wcsncpy_s(disp, t.display, _TRUNCATE);
+            SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)disp);
+        }
+    }
+
+    // Restore state
+    if (curSel >= 0) {
+        SendMessage(hListBox, LB_SETSEL, TRUE, curSel);
+        SendMessage(hListBox, LB_SETCURSEL, curSel, 0);
+    }
+    if (topIdx >= 0) SendMessage(hListBox, LB_SETTOPINDEX, topIdx, 0);
+
+    LayoutControls(g_hwnd);
+    SetFocus(hListBox);
+}
+
+static void ToggleModernStyle()
+{
+    g_modernStyle = !g_modernStyle;
+    if (g_modernStyle && !g_thumbPlaceholder)
+        g_thumbPlaceholder = CreatePlaceholderBitmap();
+    CheckMenuItem(GetMenu(g_hwnd), IDM_VIEW_MODERN,
+        g_modernStyle ? MF_CHECKED : MF_UNCHECKED);
+    RecreateListbox();
+}
+
+// Write ID3v2.3 tags to an MP3 file (re-writes the header, preserves audio data)
+// Helper: build ID3v2.3 text frames from tag fields
+static void BuildID3v2TextFrames(std::vector<BYTE>& frames,
+    const wchar_t* title, const wchar_t* artist, const wchar_t* album,
+    const wchar_t* year, const wchar_t* track, const wchar_t* genre)
+{
     struct TagEntry { const char* id; const wchar_t* val; };
     TagEntry tags[] = {
         {"TIT2", title}, {"TPE1", artist}, {"TALB", album},
@@ -3598,18 +4433,81 @@ static bool WriteID3v2ToMP3(const wchar_t* path,
         if (utfN <= 1) continue;
         std::vector<char> utf(utfN);
         WideCharToMultiByte(CP_UTF8, 0, te.val, -1, utf.data(), utfN, NULL, NULL);
-        DWORD fds = 1 + (DWORD)(utfN - 1); // enc byte + string (no null term)
+        DWORD fds = 1 + (DWORD)(utfN - 1);
         for (int c = 0; c < 4; c++) frames.push_back((BYTE)te.id[c]);
         frames.push_back((BYTE)((fds >> 24) & 0xFF));
         frames.push_back((BYTE)((fds >> 16) & 0xFF));
-        frames.push_back((BYTE)((fds >> 8)  & 0xFF));
+        frames.push_back((BYTE)((fds >> 8) & 0xFF));
         frames.push_back((BYTE)(fds & 0xFF));
-        frames.push_back(0); frames.push_back(0); // flags
+        frames.push_back(0); frames.push_back(0);
         frames.push_back(3); // UTF-8
         for (int i = 0; i < utfN - 1; i++) frames.push_back((BYTE)utf[i]);
     }
+}
 
-    // 256-byte padding
+// Helper: extract existing APIC frame from an ID3v2 tag block
+static std::vector<BYTE> ExtractAPICFrame(const BYTE* tagData, DWORD tagSize, BYTE ver)
+{
+    const BYTE* p = tagData;
+    const BYTE* end = p + tagSize;
+    while (p + 10 < end) {
+        char fid[5] = {}; memcpy(fid, p, 4);
+        DWORD fsize;
+        if (ver >= 4) fsize = ((p[4] & 0x7F) << 21) | ((p[5] & 0x7F) << 14) | ((p[6] & 0x7F) << 7) | (p[7] & 0x7F);
+        else          fsize = (p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7];
+        if (fsize == 0 || p + 10 + fsize > end) break;
+        if (strcmp(fid, "APIC") == 0 && fsize > 10) {
+            // Return the entire frame (header + data)
+            std::vector<BYTE> frame(p, p + 10 + fsize);
+            return frame;
+        }
+        p += 10 + fsize;
+    }
+    return {};
+}
+
+static std::vector<BYTE> BuildAPICFrame(const BYTE* imgData, DWORD imgSize); // forward decl
+
+static bool WriteID3v2ToMP3(const wchar_t* path,
+    const wchar_t* title, const wchar_t* artist, const wchar_t* album,
+    const wchar_t* year,  const wchar_t* track,  const wchar_t* genre)
+{
+    HANDLE hf = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER fs; GetFileSizeEx(hf, &fs);
+    if (fs.QuadPart > 500LL * 1024 * 1024) { CloseHandle(hf); return false; }
+
+    BYTE hdr[10]; DWORD rd;
+    ReadFile(hf, hdr, 10, &rd, NULL);
+    DWORD audioOffset = 0;
+    std::vector<BYTE> existingAPIC;
+    if (rd == 10 && memcmp(hdr, "ID3", 3) == 0) {
+        DWORD sz = ((DWORD)(hdr[6] & 0x7F) << 21) | ((DWORD)(hdr[7] & 0x7F) << 14) |
+                   ((DWORD)(hdr[8] & 0x7F) << 7)  | (hdr[9] & 0x7F);
+        audioOffset = 10 + sz;
+        // Read existing tag to preserve APIC
+        std::vector<BYTE> oldTag(sz);
+        SetFilePointer(hf, 10, NULL, FILE_BEGIN);
+        ReadFile(hf, oldTag.data(), sz, &rd, NULL);
+        existingAPIC = ExtractAPICFrame(oldTag.data(), sz, hdr[3]);
+    }
+    DWORD audioSize = (audioOffset < (DWORD)fs.QuadPart) ? ((DWORD)fs.QuadPart - audioOffset) : 0;
+    std::vector<BYTE> audio(audioSize);
+    SetFilePointer(hf, audioOffset, NULL, FILE_BEGIN);
+    ReadFile(hf, audio.data(), audioSize, &rd, NULL);
+    CloseHandle(hf);
+
+    // Build new text frames
+    std::vector<BYTE> frames;
+    BuildID3v2TextFrames(frames, title, artist, album, year, track, genre);
+    // Artwork: prefer g_artBytes (new from Discogs), fall back to existing APIC from file
+    if (g_artBytes && g_artSize > 100) {
+        auto apicFrame = BuildAPICFrame(g_artBytes, g_artSize);
+        frames.insert(frames.end(), apicFrame.begin(), apicFrame.end());
+    } else if (!existingAPIC.empty()) {
+        frames.insert(frames.end(), existingAPIC.begin(), existingAPIC.end());
+    }
+
     DWORD padSz = 256;
     DWORD bodySize = (DWORD)frames.size() + padSz;
     BYTE ss[4] = { (BYTE)((bodySize >> 21) & 0x7F), (BYTE)((bodySize >> 14) & 0x7F),
@@ -3626,6 +4524,1751 @@ static bool WriteID3v2ToMP3(const wchar_t* path,
     if (!audio.empty()) WriteFile(hf, audio.data(), audioSize, &wr, NULL);
     CloseHandle(hf);
     return true;
+}
+
+// Write Vorbis Comment tags to a FLAC file using libFLAC metadata API
+static bool WriteTagsToFLAC(const wchar_t* path,
+    const wchar_t* title, const wchar_t* artist, const wchar_t* album,
+    const wchar_t* year, const wchar_t* track, const wchar_t* genre)
+{
+    // libFLAC uses char* paths — convert to UTF-8
+    int utfLen = WideCharToMultiByte(CP_UTF8, 0, path, -1, NULL, 0, NULL, NULL);
+    std::string utf8path(utfLen, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, path, -1, &utf8path[0], utfLen, NULL, NULL);
+
+    FLAC__Metadata_Chain* chain = FLAC__metadata_chain_new();
+    if (!chain) return false;
+    if (!FLAC__metadata_chain_read(chain, utf8path.c_str())) {
+        FLAC__metadata_chain_delete(chain);
+        return false;
+    }
+
+    FLAC__Metadata_Iterator* iter = FLAC__metadata_iterator_new();
+    if (!iter) { FLAC__metadata_chain_delete(chain); return false; }
+    FLAC__metadata_iterator_init(iter, chain);
+
+    // Find existing VORBIS_COMMENT block, or create one
+    FLAC__StreamMetadata* vc = NULL;
+    do {
+        FLAC__StreamMetadata* block = FLAC__metadata_iterator_get_block(iter);
+        if (block->type == FLAC__METADATA_TYPE_VORBIS_COMMENT) {
+            vc = block;
+            break;
+        }
+    } while (FLAC__metadata_iterator_next(iter));
+
+    if (!vc) {
+        // No existing VC block — create and insert one
+        vc = FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
+        if (!vc) { FLAC__metadata_iterator_delete(iter); FLAC__metadata_chain_delete(chain); return false; }
+        FLAC__metadata_iterator_insert_block_after(iter, vc);
+    }
+
+    // Helper: set or replace a comment field
+    auto setField = [&](const char* fieldName, const wchar_t* value) {
+        if (!value || !value[0]) return;
+        int vLen = WideCharToMultiByte(CP_UTF8, 0, value, -1, NULL, 0, NULL, NULL);
+        std::string utf8val(vLen, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, value, -1, &utf8val[0], vLen, NULL, NULL);
+        utf8val.resize(vLen - 1); // remove null
+
+        std::string entry = std::string(fieldName) + "=" + utf8val;
+        FLAC__StreamMetadata_VorbisComment_Entry e;
+        e.length = (FLAC__uint32)entry.size();
+        e.entry = (FLAC__byte*)entry.c_str();
+
+        // Find and replace existing, or append
+        int idx = FLAC__metadata_object_vorbiscomment_find_entry_from(vc, 0, fieldName);
+        if (idx >= 0)
+            FLAC__metadata_object_vorbiscomment_set_comment(vc, (unsigned)idx, e, /*copy=*/true);
+        else
+            FLAC__metadata_object_vorbiscomment_append_comment(vc, e, /*copy=*/true);
+    };
+
+    setField("TITLE", title);
+    setField("ARTIST", artist);
+    setField("ALBUM", album);
+    setField("DATE", year);
+    setField("TRACKNUMBER", track);
+    setField("GENRE", genre);
+
+    // Add artwork if available (from Discogs download or existing)
+    if (g_artBytes && g_artSize > 100) {
+        // Remove existing PICTURE blocks first
+        FLAC__metadata_iterator_init(iter, chain);
+        do {
+            FLAC__StreamMetadata* block = FLAC__metadata_iterator_get_block(iter);
+            if (block->type == FLAC__METADATA_TYPE_PICTURE) {
+                FLAC__metadata_iterator_delete_block(iter, false);
+                break; // restart would be safer but one is enough for most files
+            }
+        } while (FLAC__metadata_iterator_next(iter));
+        // Create new PICTURE block
+        FLAC__StreamMetadata* pic = FLAC__metadata_object_new(FLAC__METADATA_TYPE_PICTURE);
+        if (pic) {
+            const char* mime = "image/jpeg";
+            if (g_artBytes[0] == 0x89 && g_artBytes[1] == 'P') mime = "image/png";
+            FLAC__metadata_object_picture_set_mime_type(pic, (char*)mime, true);
+            FLAC__metadata_object_picture_set_description(pic, (FLAC__byte*)"", true);
+            pic->data.picture.type = FLAC__STREAM_METADATA_PICTURE_TYPE_FRONT_COVER;
+            pic->data.picture.width = 0;
+            pic->data.picture.height = 0;
+            pic->data.picture.depth = 0;
+            pic->data.picture.colors = 0;
+            FLAC__metadata_object_picture_set_data(pic, g_artBytes, g_artSize, true);
+            // Seek to end of chain and insert
+            FLAC__metadata_iterator_init(iter, chain);
+            while (FLAC__metadata_iterator_next(iter)) {}
+            FLAC__metadata_iterator_insert_block_after(iter, pic);
+        }
+    }
+
+    FLAC__metadata_chain_sort_padding(chain);
+    bool ok = FLAC__metadata_chain_write(chain, /*padding=*/true, /*preserve_stat=*/false);
+
+    FLAC__metadata_iterator_delete(iter);
+    FLAC__metadata_chain_delete(chain);
+    return ok;
+}
+
+// Write ID3v2 tags to a WAV file (embeds an "id3 " chunk in the RIFF structure)
+static bool WriteID3v2ToWAV(const wchar_t* path,
+    const wchar_t* title, const wchar_t* artist, const wchar_t* album,
+    const wchar_t* year, const wchar_t* track, const wchar_t* genre)
+{
+    // Read entire file
+    HANDLE hf = CreateFile(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER fs; GetFileSizeEx(hf, &fs);
+    if (fs.QuadPart > 2LL * 1024 * 1024 * 1024) { CloseHandle(hf); return false; } // 2GB guard
+
+    std::vector<BYTE> fileData((size_t)fs.QuadPart);
+    DWORD rd; ReadFile(hf, fileData.data(), (DWORD)fs.QuadPart, &rd, NULL);
+    CloseHandle(hf);
+    if (rd != (DWORD)fs.QuadPart) return false;
+
+    // Verify RIFF/WAVE
+    if (rd < 12 || memcmp(fileData.data(), "RIFF", 4) != 0 || memcmp(fileData.data() + 8, "WAVE", 4) != 0)
+        return false;
+
+    // Build ID3v2 text frames + preserve existing artwork from old id3 chunk
+    std::vector<BYTE> frames;
+    BuildID3v2TextFrames(frames, title, artist, album, year, track, genre);
+    // Artwork: prefer g_artBytes (new from Discogs), fall back to existing APIC
+    if (g_artBytes && g_artSize > 100) {
+        auto apicFrame = BuildAPICFrame(g_artBytes, g_artSize);
+        frames.insert(frames.end(), apicFrame.begin(), apicFrame.end());
+    } else {
+        size_t scanPos = 12;
+        while (scanPos + 8 <= fileData.size()) {
+            DWORD chSz = fileData[scanPos+4] | (fileData[scanPos+5] << 8) | (fileData[scanPos+6] << 16) | (fileData[scanPos+7] << 24);
+            if (chSz == 0 || chSz > 50 * 1024 * 1024) break;
+            bool isId3Ch = (memcmp(&fileData[scanPos], "id3 ", 4) == 0 || memcmp(&fileData[scanPos], "ID3 ", 4) == 0 || memcmp(&fileData[scanPos], "ID32", 4) == 0);
+            if (isId3Ch && chSz > 10) {
+                size_t dataStart = scanPos + 8;
+                if (dataStart + 10 <= fileData.size() && memcmp(&fileData[dataStart], "ID3", 3) == 0) {
+                    DWORD oldTagSz = ((fileData[dataStart+6] & 0x7F) << 21) | ((fileData[dataStart+7] & 0x7F) << 14) |
+                        ((fileData[dataStart+8] & 0x7F) << 7) | (fileData[dataStart+9] & 0x7F);
+                    if (dataStart + 10 + oldTagSz <= fileData.size()) {
+                        auto apic = ExtractAPICFrame(&fileData[dataStart + 10], oldTagSz, fileData[dataStart + 3]);
+                        if (!apic.empty()) frames.insert(frames.end(), apic.begin(), apic.end());
+                    }
+                }
+                break;
+            }
+            scanPos += 8 + ((chSz + 1) & ~1);
+        }
+    }
+
+    DWORD padSz = 64;
+    DWORD bodySize = (DWORD)frames.size() + padSz;
+    BYTE ss[4] = { (BYTE)((bodySize >> 21) & 0x7F), (BYTE)((bodySize >> 14) & 0x7F),
+                   (BYTE)((bodySize >> 7) & 0x7F), (BYTE)(bodySize & 0x7F) };
+
+    // Build id3 chunk: "id3 " + size(4 LE) + ID3v2 header + frames + padding
+    std::vector<BYTE> id3Chunk;
+    // ID3v2 header
+    BYTE id3hdr[10] = {'I','D','3', 3, 0, 0, ss[0], ss[1], ss[2], ss[3]};
+    for (int i = 0; i < 10; i++) id3Chunk.push_back(id3hdr[i]);
+    for (auto b : frames) id3Chunk.push_back(b);
+    for (DWORD i = 0; i < padSz; i++) id3Chunk.push_back(0);
+
+    // Remove existing "id3 " or "ID3 " or "ID32" chunk from the WAV
+    std::vector<BYTE> newFile;
+    newFile.insert(newFile.end(), fileData.begin(), fileData.begin() + 12); // RIFF header
+    size_t pos = 12;
+    while (pos + 8 <= fileData.size()) {
+        DWORD chunkSz = fileData[pos+4] | (fileData[pos+5] << 8) | (fileData[pos+6] << 16) | (fileData[pos+7] << 24);
+        DWORD alignedSz = (chunkSz + 1) & ~1;
+        bool isId3 = (memcmp(&fileData[pos], "id3 ", 4) == 0 || memcmp(&fileData[pos], "ID3 ", 4) == 0 || memcmp(&fileData[pos], "ID32", 4) == 0);
+        if (!isId3) {
+            size_t end = pos + 8 + alignedSz;
+            if (end > fileData.size()) end = fileData.size();
+            newFile.insert(newFile.end(), fileData.begin() + pos, fileData.begin() + end);
+        }
+        pos += 8 + alignedSz;
+    }
+
+    // Append new id3 chunk
+    DWORD id3ChunkSz = (DWORD)id3Chunk.size();
+    BYTE chunkHdr[8] = {'i','d','3',' ', (BYTE)(id3ChunkSz&0xFF), (BYTE)((id3ChunkSz>>8)&0xFF),
+                        (BYTE)((id3ChunkSz>>16)&0xFF), (BYTE)((id3ChunkSz>>24)&0xFF)};
+    newFile.insert(newFile.end(), chunkHdr, chunkHdr + 8);
+    newFile.insert(newFile.end(), id3Chunk.begin(), id3Chunk.end());
+    if (id3ChunkSz & 1) newFile.push_back(0); // pad to word boundary
+
+    // Fix RIFF size
+    DWORD riffSize = (DWORD)(newFile.size() - 8);
+    newFile[4] = (BYTE)(riffSize & 0xFF);
+    newFile[5] = (BYTE)((riffSize >> 8) & 0xFF);
+    newFile[6] = (BYTE)((riffSize >> 16) & 0xFF);
+    newFile[7] = (BYTE)((riffSize >> 24) & 0xFF);
+
+    // Write back
+    hf = CreateFile(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+    DWORD wr;
+    WriteFile(hf, newFile.data(), (DWORD)newFile.size(), &wr, NULL);
+    CloseHandle(hf);
+    return wr == (DWORD)newFile.size();
+}
+
+// ============================================================
+//  Discogs Tag Database lookup dialog
+// ============================================================
+static HWND g_hwndDiscogs = NULL;
+static HBITMAP g_dcgPreviewBmp = NULL; // artwork preview bitmap
+static HWND g_hwndInfoParent = NULL; // the Audio Info dialog that opened us
+
+struct DiscogsResult {
+    int id;
+    wchar_t title[256];
+    wchar_t artist[256];
+    wchar_t year[16];
+    wchar_t genre[128];
+    wchar_t label[128];
+    wchar_t coverUrl[512];
+    wchar_t resourceUrl[512]; // API URL for full release details
+    wchar_t display[512]; // for listbox
+};
+static std::vector<DiscogsResult> g_dcgResults;
+
+// Helper: URL-encode a UTF-8 string
+static std::string UrlEncode(const wchar_t* wide)
+{
+    int utfLen = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+    std::string utf(utfLen, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide, -1, &utf[0], utfLen, NULL, NULL);
+    utf.resize(utfLen - 1); // remove null
+    std::string out;
+    for (char c : utf) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~')
+            out += c;
+        else {
+            char hex[4]; sprintf_s(hex, "%%%02X", (unsigned char)c);
+            out += hex;
+        }
+    }
+    return out;
+}
+
+// Simple JSON value extractor — finds "key":"value" or "key":number
+// Returns empty string if not found. Only works for flat/shallow JSON.
+static std::wstring JsonGet(const char* json, const char* key)
+{
+    char needle[128]; sprintf_s(needle, "\"%s\"", key);
+    const char* p = strstr(json, needle);
+    if (!p) return L"";
+    p += strlen(needle);
+    while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
+    if (!*p) return L"";
+    std::string utf8val;
+    if (*p == '"') {
+        p++;
+        while (*p && *p != '"') {
+            if (*p == '\\' && *(p+1)) {
+                p++;
+                if (*p == 'n') utf8val += '\n';
+                else if (*p == 't') utf8val += '\t';
+                else if (*p == 'u' && p[1] && p[2] && p[3] && p[4]) {
+                    // \uXXXX unicode escape
+                    char hex[5] = {p[1],p[2],p[3],p[4],0};
+                    wchar_t wc = (wchar_t)strtol(hex, NULL, 16);
+                    char mb[8] = {};
+                    WideCharToMultiByte(CP_UTF8, 0, &wc, 1, mb, 8, NULL, NULL);
+                    utf8val += mb;
+                    p += 4;
+                }
+                else utf8val += *p;
+            } else {
+                utf8val += *p;
+            }
+            p++;
+        }
+    } else {
+        while (*p && *p != ',' && *p != '}' && *p != ']' && *p != ' ') {
+            utf8val += *p; p++;
+        }
+    }
+    // Proper UTF-8 to wchar_t conversion
+    if (utf8val.empty()) return L"";
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8val.c_str(), -1, NULL, 0);
+    std::wstring result(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8val.c_str(), -1, &result[0], wlen);
+    if (!result.empty() && result.back() == L'\0') result.pop_back();
+    return result;
+}
+
+// HTTP GET via WinHTTP, returns UTF-8 response body (empty on error)
+static std::string DiscogsHttpGet(const wchar_t* url, int timeoutSec = 8)
+{
+    std::string result;
+    // Parse URL: skip "https://"
+    const wchar_t* p = url;
+    if (wcsncmp(p, L"https://", 8) == 0) p += 8;
+    else if (wcsncmp(p, L"http://", 7) == 0) p += 7;
+    const wchar_t* pathStart = wcschr(p, L'/');
+    std::wstring host(p, pathStart ? pathStart - p : wcslen(p));
+    std::wstring path(pathStart ? pathStart : L"/");
+
+    HINTERNET hSession = WinHttpOpen(L"BillyPro/0.5", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return result;
+    WinHttpSetTimeouts(hSession, timeoutSec * 1000, timeoutSec * 1000, timeoutSec * 1000, timeoutSec * 1000);
+    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return result; }
+    HINTERNET hReq = WinHttpOpenRequest(hConnect, L"GET", path.c_str(), NULL,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hReq) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return result; }
+
+    // Add auth header if token is set
+    if (g_discogsToken[0]) {
+        wchar_t auth[256]; swprintf_s(auth, L"Authorization: Discogs token=%s", g_discogsToken);
+        WinHttpAddRequestHeaders(hReq, auth, (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+    }
+
+    if (WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(hReq, NULL)) {
+        DWORD size = 0;
+        while (WinHttpQueryDataAvailable(hReq, &size) && size > 0) {
+            std::string buf(size, '\0');
+            DWORD read = 0;
+            WinHttpReadData(hReq, &buf[0], size, &read);
+            result.append(buf, 0, read);
+        }
+    }
+    WinHttpCloseHandle(hReq);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return result;
+}
+
+// Download binary data (image) from a URL
+static std::vector<BYTE> HttpGetBinary(const wchar_t* url, int timeoutSec = 10)
+{
+    std::vector<BYTE> result;
+    const wchar_t* p = url;
+    bool https = (wcsncmp(p, L"https://", 8) == 0);
+    if (https) p += 8;
+    else if (wcsncmp(p, L"http://", 7) == 0) p += 7;
+    else return result;
+    const wchar_t* pathStart = wcschr(p, L'/');
+    std::wstring host(p, pathStart ? pathStart - p : wcslen(p));
+    std::wstring path(pathStart ? pathStart : L"/");
+
+    HINTERNET hSession = WinHttpOpen(L"BillyPro/0.5", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return result;
+    WinHttpSetTimeouts(hSession, timeoutSec * 1000, timeoutSec * 1000, timeoutSec * 1000, timeoutSec * 1000);
+    INTERNET_PORT port = https ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT;
+    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), port, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return result; }
+    DWORD flags = https ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hReq = WinHttpOpenRequest(hConnect, L"GET", path.c_str(), NULL,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!hReq) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return result; }
+    if (WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(hReq, NULL)) {
+        DWORD size = 0;
+        while (WinHttpQueryDataAvailable(hReq, &size) && size > 0) {
+            size_t oldSz = result.size();
+            result.resize(oldSz + size);
+            DWORD read = 0;
+            WinHttpReadData(hReq, &result[oldSz], size, &read);
+            result.resize(oldSz + read);
+        }
+    }
+    WinHttpCloseHandle(hReq);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return result;
+}
+
+// Build an APIC (ID3v2 picture) frame from raw JPEG/PNG bytes
+static std::vector<BYTE> BuildAPICFrame(const BYTE* imgData, DWORD imgSize)
+{
+    std::vector<BYTE> frame;
+    if (!imgData || imgSize < 100) return frame;
+    // Detect mime type
+    const char* mime = "image/jpeg";
+    if (imgData[0] == 0x89 && imgData[1] == 'P' && imgData[2] == 'N' && imgData[3] == 'G')
+        mime = "image/png";
+    size_t mimeLen = strlen(mime);
+    // APIC frame: encoding(1) + mime(null-term) + pictType(1) + desc(null-term) + imgData
+    DWORD fsize = 1 + (DWORD)mimeLen + 1 + 1 + 1 + imgSize;
+    // Frame header: "APIC" + size(4 BE) + flags(2)
+    frame.push_back('A'); frame.push_back('P'); frame.push_back('I'); frame.push_back('C');
+    frame.push_back((BYTE)((fsize >> 24) & 0xFF));
+    frame.push_back((BYTE)((fsize >> 16) & 0xFF));
+    frame.push_back((BYTE)((fsize >> 8) & 0xFF));
+    frame.push_back((BYTE)(fsize & 0xFF));
+    frame.push_back(0); frame.push_back(0); // flags
+    frame.push_back(0); // encoding: Latin-1
+    for (size_t i = 0; i < mimeLen; i++) frame.push_back((BYTE)mime[i]);
+    frame.push_back(0); // null term for mime
+    frame.push_back(3); // picture type: Cover (front)
+    frame.push_back(0); // empty description null term
+    frame.insert(frame.end(), imgData, imgData + imgSize);
+    return frame;
+}
+
+// Parse filename into artist and title: "Artist - Title.ext" -> artist, title
+// Check if a string is a vinyl side marker: A, B, C, D, A1, A2, B1, B2, AA, BB, etc.
+static bool IsVinylSide(const wchar_t* s, int len)
+{
+    if (len < 1 || len > 3) return false;
+    // Single letter A-D
+    if (len == 1 && s[0] >= L'A' && s[0] <= L'D') return true;
+    // Letter + digit: A1, B2, C3, D1
+    if (len == 2 && s[0] >= L'A' && s[0] <= L'D' && s[1] >= L'0' && s[1] <= L'9') return true;
+    // Double letter: AA, BB
+    if (len == 2 && s[0] == s[1] && s[0] >= L'A' && s[0] <= L'D') return true;
+    // Letter + digit + digit: A10, B12
+    if (len == 3 && s[0] >= L'A' && s[0] <= L'D' && s[1] >= L'0' && s[1] <= L'9' && s[2] >= L'0' && s[2] <= L'9') return true;
+    return false;
+}
+
+static void ParseFilename(const wchar_t* filename, wchar_t* artist, int aLen, wchar_t* title, int tLen)
+{
+    artist[0] = title[0] = L'\0';
+    // Copy filename without extension
+    wchar_t name[MAX_PATH];
+    wcsncpy_s(name, filename, _TRUNCATE);
+    wchar_t* dot = wcsrchr(name, L'.'); if (dot) *dot = L'\0';
+    // Skip leading track numbers like "01. " or "01 - "
+    wchar_t* p = name;
+    while (*p >= L'0' && *p <= L'9') p++;
+    while (*p == L'.' || *p == L' ' || *p == L'-') p++;
+
+    // Find all " - " separators
+    std::vector<wchar_t*> seps;
+    {
+        wchar_t* s = p;
+        while ((s = wcsstr(s, L" - ")) != NULL) {
+            seps.push_back(s);
+            s += 3;
+        }
+    }
+
+    if (seps.empty()) {
+        // No separator — entire string is the title
+        wcsncpy_s(title, tLen, p, _TRUNCATE);
+    } else if (seps.size() == 1) {
+        // One separator: check if left part is a vinyl side marker
+        *seps[0] = L'\0';
+        if (IsVinylSide(p, (int)wcslen(p))) {
+            // "A - Artist - Title" with only one sep means "A - Rest"
+            // Rest is the title (no artist detected)
+            wcsncpy_s(title, tLen, seps[0] + 3, _TRUNCATE);
+        } else {
+            wcsncpy_s(artist, aLen, p, _TRUNCATE);
+            wcsncpy_s(title, tLen, seps[0] + 3, _TRUNCATE);
+        }
+    } else {
+        // Multiple separators: check if first part is a vinyl side marker
+        *seps[0] = L'\0';
+        if (IsVinylSide(p, (int)wcslen(p))) {
+            // Skip the side marker, split on the NEXT separator
+            // "C - Nu Moon - Stone Venus" → artist="Nu Moon", title="Stone Venus"
+            *seps[1] = L'\0';
+            wcsncpy_s(artist, aLen, seps[0] + 3, _TRUNCATE);
+            wcsncpy_s(title, tLen, seps[1] + 3, _TRUNCATE);
+        } else {
+            // First part is the artist, rest is the title
+            wcsncpy_s(artist, aLen, p, _TRUNCATE);
+            // Rejoin remaining parts as title (everything after first " - ")
+            *seps[0] = L' '; // restore
+            wcsncpy_s(title, tLen, seps[0] + 3, _TRUNCATE);
+        }
+    }
+}
+
+// Search Discogs and populate g_dcgResults
+static void DiscogsSearch(const wchar_t* artist, const wchar_t* title, HWND hStatus)
+{
+    g_dcgResults.clear();
+    if (hStatus) SetWindowText(hStatus, L"Searching Discogs...");
+
+    // Build search query
+    std::wstring query;
+    if (artist[0] && title[0])
+        query = std::wstring(artist) + L" " + title;
+    else if (title[0])
+        query = title;
+    else if (artist[0])
+        query = artist;
+    else { if (hStatus) SetWindowText(hStatus, L"Enter artist or title to search."); return; }
+
+    std::string enc = UrlEncode(query.c_str());
+    wchar_t url[1024];
+    // Convert encoded query to wide
+    wchar_t wenc[512] = {};
+    MultiByteToWideChar(CP_UTF8, 0, enc.c_str(), -1, wenc, 512);
+    swprintf_s(url, L"https://api.discogs.com/database/search?q=%s&type=release&per_page=20", wenc);
+
+    std::string resp = DiscogsHttpGet(url);
+    if (resp.empty()) {
+        if (hStatus) SetWindowText(hStatus, L"Failed to connect. Check internet/token.");
+        return;
+    }
+
+    // Parse results — find each "results":[...] entry
+    // Simple approach: scan for "id": patterns within the results array
+    const char* results = strstr(resp.c_str(), "\"results\"");
+    if (!results) {
+        if (hStatus) SetWindowText(hStatus, L"No results found.");
+        return;
+    }
+    const char* arr = strchr(results, '[');
+    if (!arr) { if (hStatus) SetWindowText(hStatus, L"No results found."); return; }
+
+    // Scan for individual result objects within the array
+    const char* p2 = arr + 1;
+    int count = 0;
+    while (count < 20) {
+        const char* objStart = strchr(p2, '{');
+        if (!objStart) break;
+        // Find matching closing brace (simple depth tracking)
+        int depth = 1;
+        const char* q = objStart + 1;
+        while (*q && depth > 0) {
+            if (*q == '{') depth++;
+            else if (*q == '}') depth--;
+            q++;
+        }
+        if (depth != 0) break;
+
+        // Extract fields from this object
+        std::string obj(objStart, q - objStart);
+        DiscogsResult dr = {};
+        std::wstring wid = JsonGet(obj.c_str(), "id");
+        dr.id = wid.empty() ? 0 : _wtoi(wid.c_str());
+        std::wstring wtitle = JsonGet(obj.c_str(), "title");
+        wcsncpy_s(dr.title, wtitle.c_str(), _TRUNCATE);
+        std::wstring wyear = JsonGet(obj.c_str(), "year");
+        wcsncpy_s(dr.year, wyear.c_str(), _TRUNCATE);
+        std::wstring wcountry = JsonGet(obj.c_str(), "country");
+        std::wstring wlabel = JsonGet(obj.c_str(), "label");
+        std::wstring wcover = JsonGet(obj.c_str(), "cover_image");
+        wcsncpy_s(dr.coverUrl, wcover.c_str(), _TRUNCATE);
+        // Build Discogs web URL from ID
+        swprintf_s(dr.resourceUrl, L"https://www.discogs.com/release/%d", dr.id);
+
+        // The "title" field from search is usually "Artist - Title"
+        // Parse it
+        wchar_t* dashSep = wcsstr(dr.title, L" - ");
+        if (dashSep) {
+            *dashSep = L'\0';
+            wcsncpy_s(dr.artist, dr.title, _TRUNCATE);
+            wcsncpy_s(dr.title, dashSep + 3, _TRUNCATE);
+        }
+
+        // Genre: search results have "genre":["Electronic",...]
+        const char* genreArr = strstr(obj.c_str(), "\"genre\"");
+        if (genreArr) {
+            const char* gb = strchr(genreArr, '[');
+            if (gb) {
+                const char* gs = strchr(gb, '"');
+                if (gs) {
+                    gs++;
+                    const char* ge = strchr(gs, '"');
+                    if (ge) {
+                        std::string g(gs, ge - gs);
+                        wchar_t wg[128] = {};
+                        MultiByteToWideChar(CP_UTF8, 0, g.c_str(), -1, wg, 128);
+                        wcsncpy_s(dr.genre, wg, _TRUNCATE);
+                    }
+                }
+            }
+        }
+
+        // Build display string
+        _snwprintf_s(dr.display, _countof(dr.display), _TRUNCATE, L"%s - %s%s%s%s%s",
+            dr.artist[0] ? dr.artist : L"?",
+            dr.title,
+            dr.year[0] ? L" (" : L"",
+            dr.year,
+            dr.year[0] ? L")" : L"",
+            dr.genre[0] ? (std::wstring(L" [") + dr.genre + L"]").c_str() : L"");
+
+        g_dcgResults.push_back(dr);
+        p2 = q;
+        count++;
+    }
+
+    if (hStatus) {
+        wchar_t msg[64]; swprintf_s(msg, L"Found %d result(s).", count);
+        SetWindowText(hStatus, msg);
+    }
+}
+
+// Fetch full release details from Discogs and extract more precise track info
+static void DiscogsFetchRelease(int releaseId, DiscogsResult* out)
+{
+    wchar_t url[256]; swprintf_s(url, L"https://api.discogs.com/releases/%d", releaseId);
+    std::string resp = DiscogsHttpGet(url);
+    if (resp.empty()) return;
+
+    // Extract fields
+    std::wstring wtitle = JsonGet(resp.c_str(), "title");
+    if (!wtitle.empty()) wcsncpy_s(out->title, wtitle.c_str(), _TRUNCATE);
+    std::wstring wyear = JsonGet(resp.c_str(), "year");
+    if (!wyear.empty()) wcsncpy_s(out->year, wyear.c_str(), _TRUNCATE);
+
+    // Artists array: get first artist name
+    const char* artists = strstr(resp.c_str(), "\"artists\"");
+    if (artists) {
+        std::wstring aname = JsonGet(artists, "name");
+        if (!aname.empty()) wcsncpy_s(out->artist, aname.c_str(), _TRUNCATE);
+    }
+
+    // Genres
+    const char* genres = strstr(resp.c_str(), "\"genres\"");
+    if (genres) {
+        const char* gb = strchr(genres, '[');
+        if (gb) {
+            const char* gs = strchr(gb, '"');
+            if (gs) {
+                gs++;
+                const char* ge = strchr(gs, '"');
+                if (ge) {
+                    std::string g(gs, ge - gs);
+                    wchar_t wg[128] = {};
+                    MultiByteToWideChar(CP_UTF8, 0, g.c_str(), -1, wg, 128);
+                    wcsncpy_s(out->genre, wg, _TRUNCATE);
+                }
+            }
+        }
+    }
+
+    // Labels
+    const char* labels = strstr(resp.c_str(), "\"labels\"");
+    if (labels) {
+        std::wstring lname = JsonGet(labels, "name");
+        if (!lname.empty()) wcsncpy_s(out->label, lname.c_str(), _TRUNCATE);
+    }
+}
+
+// Fetch tracklist from a Discogs release, returns vector of track titles
+static std::vector<std::wstring> DiscogsFetchTracklist(int releaseId)
+{
+    std::vector<std::wstring> tracks;
+    wchar_t url[256]; swprintf_s(url, L"https://api.discogs.com/releases/%d", releaseId);
+    std::string resp = DiscogsHttpGet(url);
+    if (resp.empty()) return tracks;
+
+    // Find "tracklist" array
+    const char* tl = strstr(resp.c_str(), "\"tracklist\"");
+    if (!tl) return tracks;
+    const char* arr = strchr(tl, '[');
+    if (!arr) return tracks;
+
+    // Parse each track object — look for "title" within each {...}
+    const char* p = arr + 1;
+    while (true) {
+        const char* objStart = strchr(p, '{');
+        if (!objStart) break;
+        int depth = 1;
+        const char* q = objStart + 1;
+        while (*q && depth > 0) {
+            if (*q == '{') depth++;
+            else if (*q == '}') depth--;
+            q++;
+        }
+        if (depth != 0) break;
+
+        std::string obj(objStart, q - objStart);
+        // Only include actual tracks (type_ == "track" or no type_)
+        std::wstring type = JsonGet(obj.c_str(), "type_");
+        if (type.empty() || type == L"track") {
+            std::wstring title = JsonGet(obj.c_str(), "title");
+            if (!title.empty())
+                tracks.push_back(title);
+        }
+        p = q;
+    }
+    return tracks;
+}
+
+// Batch write tags to playlist files from a Discogs release
+static void DiscogsFillAllTracks(int releaseId, DiscogsResult* release, HWND hStatus)
+{
+    // Build file list from either playlist or browser items (whichever is active)
+    std::vector<std::wstring> files;
+    if (g_browserActive) {
+        for (auto& bi : g_browserItems)
+            if (!bi.isDir) files.push_back(bi.path);
+    } else {
+        for (auto& t : g_playlist)
+            files.push_back(t.path);
+    }
+    if (files.empty()) {
+        if (hStatus) SetWindowText(hStatus, L"No audio files found in current view.");
+        return;
+    }
+
+    if (hStatus) SetWindowText(hStatus, L"Fetching tracklist...");
+    std::vector<std::wstring> tracklist = DiscogsFetchTracklist(releaseId);
+    if (tracklist.empty()) {
+        if (hStatus) SetWindowText(hStatus, L"No tracklist found for this release.");
+        return;
+    }
+
+    int fileCount = (int)files.size();
+    int trackCount = (int)tracklist.size();
+    int toWrite = min(fileCount, trackCount);
+
+    wchar_t msg[256];
+    swprintf_s(msg, L"Release has %d track(s), playlist has %d file(s).\nWill tag %d file(s). Continue?",
+        trackCount, fileCount, toWrite);
+    if (MessageBox(g_hwndDiscogs, msg, L"Fill All Tracks", MB_YESNO | MB_ICONQUESTION) != IDYES)
+        return;
+
+    // Stop playback if any of these files is playing
+    bool wasPlaying = (currentStream != 0);
+    int savedIdx = g_currentIndex;
+    double savedPos = GetPlayPos();
+    if (wasPlaying) StopAudio();
+
+    // Download artwork once
+    std::vector<BYTE> artImg;
+    if (release->coverUrl[0]) {
+        if (hStatus) SetWindowText(hStatus, L"Downloading artwork...");
+        artImg = HttpGetBinary(release->coverUrl);
+        if (!artImg.empty() && artImg.size() > 100) {
+            FreeArtBytes();
+            g_artSize = (DWORD)artImg.size();
+            g_artBytes = new BYTE[g_artSize];
+            memcpy(g_artBytes, artImg.data(), g_artSize);
+        }
+    }
+
+    // Strip disambiguation from artist
+    wchar_t cleanArtist[256];
+    wcsncpy_s(cleanArtist, release->artist, _TRUNCATE);
+    {
+        wchar_t* paren = wcsrchr(cleanArtist, L'(');
+        if (paren && paren > cleanArtist) {
+            wchar_t* inner = paren + 1;
+            bool isNum = true;
+            while (*inner && *inner != L')') { if (*inner < L'0' || *inner > L'9') isNum = false; inner++; }
+            if (isNum && *inner == L')') {
+                wchar_t* trim = paren;
+                while (trim > cleanArtist && *(trim - 1) == L' ') trim--;
+                *trim = L'\0';
+            }
+        }
+    }
+
+    int okCount = 0;
+    for (int i = 0; i < toWrite; i++) {
+        wchar_t statusMsg[128];
+        swprintf_s(statusMsg, L"Writing tags %d/%d...", i + 1, toWrite);
+        if (hStatus) SetWindowText(hStatus, statusMsg);
+
+        const wchar_t* path = files[i].c_str();
+        const wchar_t* ext = wcsrchr(path, L'.');
+        wchar_t trackNum[8]; swprintf_s(trackNum, L"%d", i + 1);
+        const wchar_t* trackTitle = tracklist[i].c_str();
+
+        bool ok = false;
+        if (ext && _wcsicmp(ext, L".mp3") == 0)
+            ok = WriteID3v2ToMP3(path, trackTitle, cleanArtist, release->title, release->year, trackNum, release->genre);
+        else if (ext && _wcsicmp(ext, L".flac") == 0)
+            ok = WriteTagsToFLAC(path, trackTitle, cleanArtist, release->title, release->year, trackNum, release->genre);
+        else if (ext && _wcsicmp(ext, L".wav") == 0)
+            ok = WriteID3v2ToWAV(path, trackTitle, cleanArtist, release->title, release->year, trackNum, release->genre);
+        if (ok) okCount++;
+    }
+
+    // Clear thumbnail cache for all files
+    ClearThumbCache();
+    if (hListBox) InvalidateRect(hListBox, NULL, FALSE);
+
+    // Restart playback
+    if (wasPlaying && savedIdx >= 0 && savedIdx < (int)g_playlist.size()) {
+        PlayIndex(savedIdx);
+        if (savedPos > 1.0) SeekToSeconds(savedPos);
+    }
+
+    swprintf_s(msg, L"Done. Tagged %d/%d file(s) successfully.", okCount, toWrite);
+    if (hStatus) SetWindowText(hStatus, msg);
+    FreeArtBytes(); // clean up after batch write
+}
+
+static LRESULT CALLBACK DiscogsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_CREATE: {
+        if (g_darkMode) { BOOL dk = TRUE; DwmSetWindowAttribute(hwnd, 20, &dk, sizeof(dk)); DwmSetWindowAttribute(hwnd, 19, &dk, sizeof(dk)); }
+        HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
+        int cw = 580, y = 8;
+
+        // Token field + "?" help button
+        HWND hTokLbl = CreateWindow(L"STATIC", L"API Token:",
+            WS_CHILD | WS_VISIBLE, 8, y + 2, 70, 16, hwnd, (HMENU)IDC_STATIC, hInst, NULL);
+        SendMessage(hTokLbl, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        HWND hTok = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", g_discogsToken,
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_PASSWORD,
+            80, y, cw - 118, 22, hwnd, (HMENU)ID_DCG_TOKEN, hInst, NULL);
+        SendMessage(hTok, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        HWND hHelp = CreateWindow(L"BUTTON", L"?",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            cw - 32, y, 24, 22, hwnd, (HMENU)ID_DCG_HELP, hInst, NULL);
+        SendMessage(hHelp, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
+        y += 28;
+
+        // Artist / Title fields + Search
+        HWND hArtLbl = CreateWindow(L"STATIC", L"Artist:",
+            WS_CHILD | WS_VISIBLE, 8, y + 2, 44, 16, hwnd, (HMENU)IDC_STATIC, hInst, NULL);
+        SendMessage(hArtLbl, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        HWND hArt = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            54, y, 200, 22, hwnd, (HMENU)ID_DCG_ARTIST, hInst, NULL);
+        SendMessage(hArt, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        HWND hTitLbl = CreateWindow(L"STATIC", L"Title:",
+            WS_CHILD | WS_VISIBLE, 260, y + 2, 36, 16, hwnd, (HMENU)IDC_STATIC, hInst, NULL);
+        SendMessage(hTitLbl, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        HWND hTit = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            298, y, cw - 306 - 76, 22, hwnd, (HMENU)ID_DCG_TITLE, hInst, NULL);
+        SendMessage(hTit, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        HWND hSrch = CreateWindow(L"BUTTON", L"Search",
+            WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+            cw - 76, y, 68, 24, hwnd, (HMENU)ID_DCG_SEARCH, hInst, NULL);
+        SendMessage(hSrch, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        y += 30;
+
+        // Left side: Results list. Right side: artwork preview
+        int artSz = 120;
+        int listW = cw - 16 - artSz - 8;
+        HWND hList = CreateWindowEx(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            8, y, listW, 220, hwnd, (HMENU)ID_DCG_LIST, hInst, NULL);
+        SendMessage(hList, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+
+        // Artwork preview (owner-draw static)
+        CreateWindow(L"STATIC", NULL,
+            WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
+            8 + listW + 8, y, artSz, artSz, hwnd, (HMENU)ID_DCG_ARTWORK, hInst, NULL);
+        // "Open in Browser" button below artwork
+        HWND hOpenUrl = CreateWindow(L"BUTTON", L"\u2197 Open in Browser",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            8 + listW + 8, y + artSz + 4, artSz, 24, hwnd, (HMENU)ID_DCG_OPEN_URL, hInst, NULL);
+        SendMessage(hOpenUrl, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        y += 226;
+
+        // Status
+        HWND hStat = CreateWindow(L"STATIC", L"Enter search terms or auto-parsed from filename.",
+            WS_CHILD | WS_VISIBLE, 8, y, cw - 16, 16, hwnd, (HMENU)ID_DCG_STATUS, hInst, NULL);
+        SendMessage(hStat, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        y += 22;
+
+        // Apply + Fill All + Close
+        HWND hApply = CreateWindow(L"BUTTON", L"Apply Tags",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            8, y, 100, 26, hwnd, (HMENU)ID_DCG_APPLY, hInst, NULL);
+        SendMessage(hApply, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
+        HWND hFillAll = CreateWindow(L"BUTTON", L"Fill All Tracks",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            114, y, 120, 26, hwnd, (HMENU)ID_DCG_FILLALL, hInst, NULL);
+        SendMessage(hFillAll, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        HWND hClo = CreateWindow(L"BUTTON", L"Close",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            cw - 78, y, 70, 26, hwnd, (HMENU)ID_DCG_CLOSE, hInst, NULL);
+        SendMessage(hClo, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+
+        // Auto-parse filename into fields
+        if (g_hwndInfoParent) {
+            wchar_t fn[MAX_PATH] = {};
+            // Get path from Audio Info static (the path edit control)
+            // Use the static s_filePath stored in InfoWndProc
+            GetWindowText(g_hwndInfoParent, fn, MAX_PATH); // window title has filename
+        }
+        break;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case ID_DCG_SEARCH: {
+            // Save token
+            GetDlgItemText(hwnd, ID_DCG_TOKEN, g_discogsToken, _countof(g_discogsToken));
+            SaveSettings();
+            // Get search terms
+            wchar_t artist[256] = {}, title[256] = {};
+            GetDlgItemText(hwnd, ID_DCG_ARTIST, artist, 256);
+            GetDlgItemText(hwnd, ID_DCG_TITLE, title, 256);
+            HWND hStatus = GetDlgItem(hwnd, ID_DCG_STATUS);
+            DiscogsSearch(artist, title, hStatus);
+            // Populate list
+            HWND hList = GetDlgItem(hwnd, ID_DCG_LIST);
+            SendMessage(hList, LB_RESETCONTENT, 0, 0);
+            for (auto& r : g_dcgResults)
+                SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)r.display);
+            if (!g_dcgResults.empty())
+                SendMessage(hList, LB_SETCURSEL, 0, 0);
+            break;
+        }
+        case ID_DCG_APPLY: {
+            HWND hList = GetDlgItem(hwnd, ID_DCG_LIST);
+            int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
+            if (sel == LB_ERR || sel >= (int)g_dcgResults.size()) {
+                MessageBox(hwnd, L"Select a result first.", L"Discogs", MB_ICONWARNING);
+                break;
+            }
+            SetDlgItemText(hwnd, ID_DCG_STATUS, L"Fetching release details...");
+            DiscogsResult& r = g_dcgResults[sel];
+            DiscogsFetchRelease(r.id, &r);
+            // Strip Discogs disambiguation "(N)" from artist name
+            {
+                wchar_t* paren = wcsrchr(r.artist, L'(');
+                if (paren && paren > r.artist) {
+                    // Check it's just a number in parens at the end, e.g. " (8)"
+                    wchar_t* inner = paren + 1;
+                    bool isNum = true;
+                    while (*inner && *inner != L')') { if (*inner < L'0' || *inner > L'9') isNum = false; inner++; }
+                    if (isNum && *inner == L')') {
+                        // Trim trailing space before the paren
+                        wchar_t* trim = paren;
+                        while (trim > r.artist && *(trim-1) == L' ') trim--;
+                        *trim = L'\0';
+                    }
+                }
+            }
+            // Populate Audio Info fields
+            if (g_hwndInfoParent && IsWindow(g_hwndInfoParent)) {
+                SetDlgItemText(g_hwndInfoParent, ID_INFO_TITLE, r.title);
+                SetDlgItemText(g_hwndInfoParent, ID_INFO_ARTIST, r.artist);
+                SetDlgItemText(g_hwndInfoParent, ID_INFO_ALBUM, r.title); // release title = album
+                SetDlgItemText(g_hwndInfoParent, ID_INFO_YEAR, r.year);
+                SetDlgItemText(g_hwndInfoParent, ID_INFO_GENRE, r.genre);
+            }
+            // Download cover artwork from Discogs
+            if (r.coverUrl[0]) {
+                SetDlgItemText(hwnd, ID_DCG_STATUS, L"Downloading cover artwork...");
+                std::vector<BYTE> imgData = HttpGetBinary(r.coverUrl);
+                if (!imgData.empty() && imgData.size() > 100) {
+                    // Store as global artwork bytes for Save Tags to embed
+                    FreeArtBytes();
+                    g_artSize = (DWORD)imgData.size();
+                    g_artBytes = new BYTE[g_artSize];
+                    memcpy(g_artBytes, imgData.data(), g_artSize);
+                    // Detect extension
+                    if (imgData[0] == 0x89 && imgData[1] == 'P') wcscpy_s(g_artExt, L".png");
+                    else wcscpy_s(g_artExt, L".jpg");
+                    // Refresh artwork display in Audio Info
+                    if (g_hwndInfoParent && IsWindow(g_hwndInfoParent)) {
+                        HWND hArtCtl = GetDlgItem(g_hwndInfoParent, ID_INFO_ARTWORK);
+                        if (hArtCtl) InvalidateRect(hArtCtl, NULL, TRUE);
+                    }
+                    SetDlgItemText(hwnd, ID_DCG_STATUS, L"Tags + artwork applied. Click Save Tags to write.");
+                } else {
+                    SetDlgItemText(hwnd, ID_DCG_STATUS, L"Tags applied (artwork download failed). Click Save Tags to write.");
+                }
+            } else {
+                SetDlgItemText(hwnd, ID_DCG_STATUS, L"Tags applied (no cover available). Click Save Tags to write.");
+            }
+            break;
+        }
+        case ID_DCG_LIST:
+            if (HIWORD(wParam) == LBN_DBLCLK) {
+                SendMessage(hwnd, WM_COMMAND, ID_DCG_APPLY, 0);
+            }
+            if (HIWORD(wParam) == LBN_SELCHANGE) {
+                // Load artwork preview for selected result
+                HWND hList2 = GetDlgItem(hwnd, ID_DCG_LIST);
+                int sel2 = (int)SendMessage(hList2, LB_GETCURSEL, 0, 0);
+                if (g_dcgPreviewBmp) { DeleteObject(g_dcgPreviewBmp); g_dcgPreviewBmp = NULL; }
+                if (sel2 >= 0 && sel2 < (int)g_dcgResults.size() && g_dcgResults[sel2].coverUrl[0]) {
+                    SetDlgItemText(hwnd, ID_DCG_STATUS, L"Loading preview...");
+                    std::vector<BYTE> img = HttpGetBinary(g_dcgResults[sel2].coverUrl);
+                    if (!img.empty() && img.size() > 100) {
+                        g_dcgPreviewBmp = DecodeImageToThumb(img.data(), (DWORD)img.size(), 120);
+                        // Store image bytes so Apply Tags can embed them
+                        FreeArtBytes();
+                        g_artSize = (DWORD)img.size();
+                        g_artBytes = new BYTE[g_artSize];
+                        memcpy(g_artBytes, img.data(), g_artSize);
+                        if (img[0] == 0x89 && img[1] == 'P') wcscpy_s(g_artExt, L".png");
+                        else wcscpy_s(g_artExt, L".jpg");
+                        // Update Audio Info artwork preview in real-time
+                        if (g_hwndInfoParent && IsWindow(g_hwndInfoParent)) {
+                            // Send a custom refresh: decode at 220px for the info dialog
+                            HBITMAP hNewArt = DecodeImageToThumb(img.data(), (DWORD)img.size(), 220);
+                            if (hNewArt) {
+                                // The hArt static is in InfoWndProc — post a message to refresh it
+                                // Simplest: just invalidate the artwork control
+                                SendMessage(g_hwndInfoParent, WM_APP + 10, (WPARAM)hNewArt, 0);
+                            }
+                        }
+                    }
+                    SetDlgItemText(hwnd, ID_DCG_STATUS,
+                        g_dcgPreviewBmp ? L"Preview loaded. Double-click or Apply to use." : L"No preview available.");
+                }
+                HWND hArtPrev = GetDlgItem(hwnd, ID_DCG_ARTWORK);
+                if (hArtPrev) InvalidateRect(hArtPrev, NULL, TRUE);
+            }
+            break;
+        case ID_DCG_HELP:
+            ShellExecute(hwnd, L"open", L"https://www.discogs.com/settings/developers", NULL, NULL, SW_SHOW);
+            break;
+        case ID_DCG_OPEN_URL: {
+            HWND hList3 = GetDlgItem(hwnd, ID_DCG_LIST);
+            int sel3 = (int)SendMessage(hList3, LB_GETCURSEL, 0, 0);
+            if (sel3 >= 0 && sel3 < (int)g_dcgResults.size() && g_dcgResults[sel3].resourceUrl[0])
+                ShellExecute(hwnd, L"open", g_dcgResults[sel3].resourceUrl, NULL, NULL, SW_SHOW);
+            else
+                MessageBox(hwnd, L"Select a result first.", L"Discogs", MB_ICONWARNING);
+            break;
+        }
+        case ID_DCG_FILLALL: {
+            HWND hList4 = GetDlgItem(hwnd, ID_DCG_LIST);
+            int sel4 = (int)SendMessage(hList4, LB_GETCURSEL, 0, 0);
+            if (sel4 == LB_ERR || sel4 >= (int)g_dcgResults.size()) {
+                MessageBox(hwnd, L"Select a release first.", L"Fill All", MB_ICONWARNING);
+                break;
+            }
+            DiscogsResult& r4 = g_dcgResults[sel4];
+            DiscogsFetchRelease(r4.id, &r4);
+            // Strip disambiguation
+            {
+                wchar_t* pa = wcsrchr(r4.artist, L'(');
+                if (pa && pa > r4.artist) {
+                    wchar_t* in = pa + 1; bool num = true;
+                    while (*in && *in != L')') { if (*in < L'0' || *in > L'9') num = false; in++; }
+                    if (num && *in == L')') { wchar_t* t = pa; while (t > r4.artist && *(t-1)==L' ') t--; *t = L'\0'; }
+                }
+            }
+            DiscogsFillAllTracks(r4.id, &r4, GetDlgItem(hwnd, ID_DCG_STATUS));
+            break;
+        }
+        case ID_DCG_CLOSE:
+        case IDCANCEL:
+            DestroyWindow(hwnd);
+            break;
+        }
+        break;
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lParam;
+        if (dis->CtlID == ID_DCG_ARTWORK) {
+            HDC dc = dis->hDC; RECT rc = dis->rcItem;
+            if (g_dcgPreviewBmp) {
+                HDC mdc = CreateCompatibleDC(dc);
+                HBITMAP ob = (HBITMAP)SelectObject(mdc, g_dcgPreviewBmp);
+                int w = rc.right - rc.left, h = rc.bottom - rc.top;
+                StretchBlt(dc, rc.left, rc.top, w, h, mdc, 0, 0, 120, 120, SRCCOPY);
+                SelectObject(mdc, ob); DeleteDC(mdc);
+                HPEN pen = CreatePen(PS_SOLID, 1, g_darkMode ? 0x555555 : 0xBBBBBB);
+                HPEN op = (HPEN)SelectObject(dc, pen);
+                SelectObject(dc, GetStockObject(NULL_BRUSH));
+                Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
+                SelectObject(dc, op); DeleteObject(pen);
+            } else {
+                HBRUSH br = CreateSolidBrush(g_darkMode ? 0x383838 : 0xDDDDDD);
+                FillRect(dc, &rc, br); DeleteObject(br);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, g_darkMode ? 0x888888 : 0x777777);
+                HFONT of = (HFONT)SelectObject(dc, g_fontUI);
+                DrawText(dc, L"No Preview", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(dc, of);
+            }
+            return TRUE;
+        }
+        break;
+    }
+    case WM_ERASEBKGND: {
+        HDC dc = (HDC)wParam; RECT rc; GetClientRect(hwnd, &rc);
+        FillRect(dc, &rc, g_brBg); return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wParam;
+        SetTextColor(dc, g_theme.text); SetBkColor(dc, g_theme.bg);
+        return (LRESULT)g_brBg;
+    }
+    case WM_CTLCOLORLISTBOX: {
+        HDC dc = (HDC)wParam;
+        SetTextColor(dc, g_theme.text); SetBkColor(dc, g_theme.bgList);
+        return (LRESULT)g_brList;
+    }
+    case WM_KEYDOWN: if (wParam == VK_ESCAPE) DestroyWindow(hwnd); break;
+    case WM_DESTROY:
+        if (g_dcgPreviewBmp) { DeleteObject(g_dcgPreviewBmp); g_dcgPreviewBmp = NULL; }
+        g_hwndDiscogs = NULL; g_dcgResults.clear(); break;
+    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static void OpenDiscogsDialog(HWND hwndInfoParent, const wchar_t* filename)
+{
+    if (g_hwndDiscogs && IsWindow(g_hwndDiscogs)) { SetForegroundWindow(g_hwndDiscogs); return; }
+    g_hwndInfoParent = hwndInfoParent;
+    HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(g_hwnd, GWLP_HINSTANCE);
+    static const wchar_t DCG_CLASS[] = L"BillyDiscogsWnd";
+    static bool dcgReg = false;
+    if (!dcgReg) {
+        WNDCLASS wc = {}; wc.lpfnWndProc = DiscogsWndProc; wc.hInstance = hInst;
+        wc.lpszClassName = DCG_CLASS; wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_BILLYPRO));
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1); RegisterClass(&wc); dcgReg = true;
+    }
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE;
+    RECT cr = { 0, 0, 580, 380 }; AdjustWindowRect(&cr, style, FALSE);
+    int dw = cr.right - cr.left, dh = cr.bottom - cr.top;
+    g_hwndDiscogs = CreateWindowEx(WS_EX_APPWINDOW, DCG_CLASS,
+        L"Tag Database (Discogs)", style, 0, 0, dw, dh, NULL, NULL, hInst, NULL);
+    // Center over info dialog
+    RECT pr; GetWindowRect(hwndInfoParent, &pr);
+    SetWindowPos(g_hwndDiscogs, NULL,
+        pr.left + (pr.right - pr.left - dw) / 2,
+        pr.top + (pr.bottom - pr.top - dh) / 2,
+        dw, dh, SWP_NOZORDER);
+    // Auto-fill artist/title from filename
+    if (filename && filename[0]) {
+        wchar_t artist[256] = {}, title[256] = {};
+        ParseFilename(Filename(filename), artist, 256, title, 256);
+        SetDlgItemText(g_hwndDiscogs, ID_DCG_ARTIST, artist);
+        SetDlgItemText(g_hwndDiscogs, ID_DCG_TITLE, title);
+    }
+}
+
+// ============================================================
+//  Internet Radio (radio-browser.info API)
+// ============================================================
+static HWND g_hwndRadio = NULL;
+// g_radioStream, g_radioPlaying, g_radioStationName, g_radioNowPlaying declared in globals section
+
+// Saved radio favorites
+struct RadioFav { std::wstring name; std::wstring url; std::wstring uuid; };
+static std::vector<RadioFav> g_radioFavs;
+
+static void GetRadioFavPath(wchar_t* out, int maxLen)
+{
+    GetIniPath();
+    wcsncpy_s(out, maxLen, g_iniPath, _TRUNCATE);
+    wchar_t* sl = wcsrchr(out, L'\\'); if (sl) sl[1] = L'\0';
+    wcscat_s(out, maxLen, L"library\\");
+    CreateDirectoryW(out, NULL);
+    wcscat_s(out, maxLen, L"radio_favorites.txt");
+}
+
+static void LoadRadioFavs()
+{
+    g_radioFavs.clear();
+    wchar_t path[MAX_PATH]; GetRadioFavPath(path, MAX_PATH);
+    FILE* f = NULL; _wfopen_s(&f, path, L"r,ccs=UTF-8");
+    if (!f) return;
+    wchar_t line[1024];
+    while (fgetws(line, _countof(line), f)) {
+        int len = (int)wcslen(line);
+        while (len > 0 && (line[len-1] == L'\r' || line[len-1] == L'\n')) line[--len] = 0;
+        if (len == 0) continue;
+        // Format: name|url|uuid
+        wchar_t* p1 = wcschr(line, L'|');
+        if (!p1) continue;
+        *p1 = 0; wchar_t* p2 = wcschr(p1 + 1, L'|');
+        RadioFav rf;
+        rf.name = line;
+        if (p2) { *p2 = 0; rf.url = p1 + 1; rf.uuid = p2 + 1; }
+        else { rf.url = p1 + 1; }
+        g_radioFavs.push_back(rf);
+    }
+    fclose(f);
+}
+
+static void SaveRadioFavs()
+{
+    wchar_t path[MAX_PATH]; GetRadioFavPath(path, MAX_PATH);
+    FILE* f = NULL; _wfopen_s(&f, path, L"w,ccs=UTF-8");
+    if (!f) return;
+    for (auto& rf : g_radioFavs)
+        fwprintf(f, L"%s|%s|%s\n", rf.name.c_str(), rf.url.c_str(), rf.uuid.c_str());
+    fclose(f);
+}
+
+static bool IsRadioFav(const wchar_t* url)
+{
+    for (auto& rf : g_radioFavs) if (rf.url == url) return true;
+    return false;
+}
+
+struct RadioStation {
+    wchar_t name[256];
+    wchar_t country[64];
+    wchar_t codec[32];      // MP3, AAC+, OGG, etc.
+    wchar_t tags[256];      // genre/tags
+    wchar_t url[512];       // stream URL
+    wchar_t uuid[64];       // station UUID
+    int     bitrate;
+    int     votes;
+    wchar_t display[512];
+};
+static std::vector<RadioStation> g_radioResults;
+
+// radio-browser.info servers (try multiple on failure)
+static const wchar_t* g_radioServers[] = {
+    L"de1.api.radio-browser.info",
+    L"de2.api.radio-browser.info",
+    L"at1.api.radio-browser.info",
+    L"nl1.api.radio-browser.info",
+    L"fi1.api.radio-browser.info",
+};
+static const int g_radioServerCount = 5;
+
+// HTTP GET for radio API — tries multiple servers on failure
+static std::string RadioHttpGet(const wchar_t* path)
+{
+    // Randomize server order
+    int order[5] = {0,1,2,3,4};
+    for (int i = 4; i > 0; i--) std::swap(order[i], order[rand() % (i+1)]);
+
+    for (int attempt = 0; attempt < g_radioServerCount; attempt++) {
+        const wchar_t* host = g_radioServers[order[attempt]];
+        std::string result;
+        HINTERNET hSession = WinHttpOpen(L"BillyPro/0.5", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) continue;
+        WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 5000);
+        HINTERNET hConnect = WinHttpConnect(hSession, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (!hConnect) { WinHttpCloseHandle(hSession); continue; }
+        HINTERNET hReq = WinHttpOpenRequest(hConnect, L"GET", path, NULL,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        if (!hReq) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); continue; }
+        if (WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+            WinHttpReceiveResponse(hReq, NULL)) {
+        DWORD size = 0;
+        while (WinHttpQueryDataAvailable(hReq, &size) && size > 0) {
+            std::string buf(size, '\0');
+            DWORD read = 0;
+            WinHttpReadData(hReq, &buf[0], size, &read);
+            result.append(buf, 0, read);
+        }
+        }
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        if (!result.empty()) return result; // success — stop retrying
+    }
+    return ""; // all servers failed
+}
+
+static void RadioSearch(const wchar_t* query, const wchar_t* genre, HWND hStatus)
+{
+    g_radioResults.clear();
+    if (hStatus) SetWindowText(hStatus, L"Searching stations...");
+
+    std::string encQuery = UrlEncode(query && query[0] ? query : L"");
+    std::string encGenre = UrlEncode(genre && genre[0] ? genre : L"");
+
+    wchar_t path[1024];
+    wchar_t wq[512] = {}, wg[256] = {};
+    MultiByteToWideChar(CP_UTF8, 0, encQuery.c_str(), -1, wq, 512);
+    MultiByteToWideChar(CP_UTF8, 0, encGenre.c_str(), -1, wg, 256);
+
+    if (wq[0] && wg[0])
+        swprintf_s(path, L"/json/stations/search?name=%s&tag=%s&limit=50&order=votes&reverse=true", wq, wg);
+    else if (wq[0])
+        swprintf_s(path, L"/json/stations/search?name=%s&limit=50&order=votes&reverse=true", wq);
+    else if (wg[0])
+        swprintf_s(path, L"/json/stations/search?tag=%s&limit=50&order=votes&reverse=true", wg);
+    else
+        swprintf_s(path, L"/json/stations/topvote?limit=50");
+
+    std::string resp = RadioHttpGet(path);
+    if (resp.empty()) {
+        if (hStatus) SetWindowText(hStatus, L"Failed to connect. Try again.");
+        return;
+    }
+
+    // Parse JSON array of station objects
+    const char* p = resp.c_str();
+    const char* arrStart = strchr(p, '[');
+    if (!arrStart) { if (hStatus) SetWindowText(hStatus, L"No results."); return; }
+    p = arrStart + 1;
+    int count = 0;
+    while (count < 50) {
+        const char* objStart = strchr(p, '{');
+        if (!objStart) break;
+        int depth = 1;
+        const char* q = objStart + 1;
+        while (*q && depth > 0) { if (*q == '{') depth++; else if (*q == '}') depth--; q++; }
+        if (depth != 0) break;
+        std::string obj(objStart, q - objStart);
+
+        RadioStation rs = {};
+        std::wstring wname = JsonGet(obj.c_str(), "name");
+        wcsncpy_s(rs.name, wname.c_str(), _TRUNCATE);
+        std::wstring wcountry = JsonGet(obj.c_str(), "countrycode");
+        wcsncpy_s(rs.country, wcountry.c_str(), _TRUNCATE);
+        std::wstring wtags = JsonGet(obj.c_str(), "tags");
+        wcsncpy_s(rs.tags, wtags.c_str(), _TRUNCATE);
+        std::wstring wurl = JsonGet(obj.c_str(), "url_resolved");
+        if (wurl.empty()) wurl = JsonGet(obj.c_str(), "url");
+        wcsncpy_s(rs.url, wurl.c_str(), _TRUNCATE);
+        std::wstring wuuid = JsonGet(obj.c_str(), "stationuuid");
+        wcsncpy_s(rs.uuid, wuuid.c_str(), _TRUNCATE);
+        std::wstring wbr = JsonGet(obj.c_str(), "bitrate");
+        rs.bitrate = wbr.empty() ? 0 : _wtoi(wbr.c_str());
+        std::wstring wcodec = JsonGet(obj.c_str(), "codec");
+        wcsncpy_s(rs.codec, wcodec.empty() ? L"?" : wcodec.c_str(), _TRUNCATE);
+        std::wstring wvotes = JsonGet(obj.c_str(), "votes");
+        rs.votes = wvotes.empty() ? 0 : _wtoi(wvotes.c_str());
+
+        if (rs.url[0] && rs.name[0]) {
+            // Build display: Name | Codec | Bitrate | Country
+            bool fav = IsRadioFav(rs.url);
+            _snwprintf_s(rs.display, _countof(rs.display), _TRUNCATE,
+                L"%s%s  |  %s  %dkbps  [%s]",
+                fav ? L"\u2605 " : L"", rs.name, rs.codec, rs.bitrate, rs.country);
+            g_radioResults.push_back(rs);
+            count++;
+        }
+        p = q;
+    }
+
+    if (hStatus) {
+        wchar_t msg[64]; swprintf_s(msg, L"Found %d station(s).", count);
+        SetWindowText(hStatus, msg);
+    }
+}
+
+// Register a click with the API (as per guidelines)
+static void RadioRegisterClick(const wchar_t* uuid)
+{
+    wchar_t path[256]; swprintf_s(path, L"/json/url/%s", uuid);
+    RadioHttpGet(path); // fire and forget
+}
+
+static void RadioPlayStation(int idx)
+{
+    if (idx < 0 || idx >= (int)g_radioResults.size()) return;
+    RadioStation& rs = g_radioResults[idx];
+
+    // Stop any existing playback (normal or radio)
+    StopAudio();
+    if (g_radioStream) { BASS_StreamFree(g_radioStream); g_radioStream = 0; }
+    g_radioPlaying = false;
+
+    // Register click with API
+    RadioRegisterClick(rs.uuid);
+
+    // Store station info
+    wcsncpy_s(g_radioStationName, rs.name, _TRUNCATE);
+    g_radioNowPlaying[0] = L'\0';
+
+    // Convert URL to char* for BASS
+    int uLen = WideCharToMultiByte(CP_UTF8, 0, rs.url, -1, NULL, 0, NULL, NULL);
+    std::string url8(uLen, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, rs.url, -1, &url8[0], uLen, NULL, NULL);
+
+    if (g_hwndRadio) SetDlgItemText(g_hwndRadio, ID_RADIO_STATUS, L"Connecting...");
+
+    // Open stream as currentStream — gets DSP, volume meter, everything
+    HSTREAM stream = BASS_StreamCreateURL(url8.c_str(), 0,
+        BASS_SAMPLE_FLOAT, NULL, NULL);
+    if (!stream) {
+        wchar_t err[128]; swprintf_s(err, L"Failed to open stream (BASS error %d)", BASS_ErrorGetCode());
+        if (g_hwndRadio) SetDlgItemText(g_hwndRadio, ID_RADIO_STATUS, err);
+        return;
+    }
+
+    // Use as main currentStream — DSP, volume, peak meter all work
+    currentStream = stream;
+    g_radioStream = stream;
+    g_radioPlaying = true;
+
+    // Apply volume and DSP
+    BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_VOL, currentVolume);
+    ApplyDSP();
+    ApplyPitch();
+    BASS_ChannelPlay(currentStream, FALSE);
+
+    // Start timers for UI updates + metadata polling
+    SetTimer(g_hwnd, IDT_PLAYBACK, 16, NULL);
+    SetTimer(g_hwnd, IDT_PEAK_METER, 50, NULL);
+    SetTimer(g_hwnd, IDT_RADIO_META, 2000, NULL); // poll metadata every 2s
+
+    // Add station to playlist view
+    ClearPlaylist();
+    Track t = {};
+    wcsncpy_s(t.path, rs.url, _TRUNCATE);
+    _snwprintf_s(t.display, _countof(t.display), _TRUNCATE, L"\u25B6 %s", rs.name);
+    g_playlist.push_back(t);
+    if (hListBox) {
+        SendMessage(hListBox, LB_RESETCONTENT, 0, 0);
+        SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)t.display);
+        SendMessage(hListBox, LB_SETCURSEL, 0, 0);
+    }
+    g_currentIndex = 0;
+
+    // Update UI
+    UpdatePlayBtn();
+    UpdateStatusBar();
+    UpdateThumbButtons();
+    wchar_t title[512];
+    _snwprintf_s(title, _countof(title), _TRUNCATE, L"%s - BillyPro", rs.name);
+    SetWindowText(g_hwnd, title);
+
+    if (g_hwndRadio) {
+        wchar_t status[512];
+        _snwprintf_s(status, _countof(status), _TRUNCATE, L"\u25B6 %s", rs.name);
+        SetDlgItemText(g_hwndRadio, ID_RADIO_STATUS, status);
+    }
+}
+
+static LRESULT CALLBACK RadioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_CREATE: {
+        if (g_darkMode) { BOOL dk = TRUE; DwmSetWindowAttribute(hwnd, 20, &dk, sizeof(dk)); DwmSetWindowAttribute(hwnd, 19, &dk, sizeof(dk)); }
+        HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
+        int cw = 560, y = 8;
+
+        // Search fields
+        HWND hLbl = CreateWindow(L"STATIC", L"Search:",
+            WS_CHILD | WS_VISIBLE, 8, y + 2, 48, 16, hwnd, (HMENU)IDC_STATIC, hInst, NULL);
+        SendMessage(hLbl, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        HWND hQuery = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            58, y, 200, 22, hwnd, (HMENU)ID_RADIO_QUERY, hInst, NULL);
+        SendMessage(hQuery, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        HWND hGLbl = CreateWindow(L"STATIC", L"Genre:",
+            WS_CHILD | WS_VISIBLE, 264, y + 2, 42, 16, hwnd, (HMENU)IDC_STATIC, hInst, NULL);
+        SendMessage(hGLbl, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        HWND hGenre = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            308, y, 160, 22, hwnd, (HMENU)ID_RADIO_GENRE, hInst, NULL);
+        SendMessage(hGenre, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        HWND hSrch = CreateWindow(L"BUTTON", L"Search",
+            WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+            cw - 76, y, 68, 24, hwnd, (HMENU)ID_RADIO_SEARCH, hInst, NULL);
+        SendMessage(hSrch, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        y += 28;
+
+        // Genre preset buttons (two rows)
+        {
+            static const struct { const wchar_t* label; const wchar_t* tag; } presets[] = {
+                {L"\u2605 Favs", L""},  {L"Top", L"__top__"},  {L"Electronic", L"electronic"},
+                {L"House", L"house"},  {L"Techno", L"techno"},  {L"DnB", L"drum and bass"},
+                {L"Ambient", L"ambient"},  {L"Chillout", L"chillout"},  {L"Trance", L"trance"},
+                {L"Jazz", L"jazz"},  {L"Rock", L"rock"},  {L"Pop", L"pop"},
+                {L"Classical", L"classical"},  {L"Hip-Hop", L"hip hop"},  {L"Lounge", L"lounge"},
+                {L"News", L"news"},  {L"Talk", L"talk"},  {L"80s", L"80s"},
+            };
+            HFONT hSmall = CreateFont(-11, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+            int bx = 8, bw = 56, bh2 = 20, gap = 2;
+            for (int i = 0; i < 18; i++) {
+                if (i == 9) { bx = 8; y += bh2 + gap; } // second row
+                HWND hPre = CreateWindow(L"BUTTON", presets[i].label,
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    bx, y, bw, bh2, hwnd, (HMENU)(UINT_PTR)(IDC_RADIO_PRESET_BASE + i), hInst, NULL);
+                SendMessage(hPre, WM_SETFONT, (WPARAM)hSmall, TRUE);
+                bx += bw + gap;
+            }
+            // Don't delete hSmall — it's used by the buttons for their lifetime
+            y += bh2 + 4;
+        }
+
+        // Results list
+        HWND hList = CreateWindowEx(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            8, y, cw - 16, 260, hwnd, (HMENU)ID_RADIO_LIST, hInst, NULL);
+        SendMessage(hList, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        y += 286;
+
+        // Status
+        HWND hStat = CreateWindow(L"STATIC", L"Search for stations or leave empty for top stations.",
+            WS_CHILD | WS_VISIBLE, 8, y, cw - 16, 16, hwnd, (HMENU)ID_RADIO_STATUS, hInst, NULL);
+        SendMessage(hStat, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        y += 22;
+
+        // Play / Stop / Close
+        HWND hPlay = CreateWindow(L"BUTTON", L"\u25B6 Play",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            8, y, 80, 26, hwnd, (HMENU)ID_RADIO_PLAY, hInst, NULL);
+        SendMessage(hPlay, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
+        HWND hStop = CreateWindow(L"BUTTON", L"\u25A0 Stop",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            94, y, 80, 26, hwnd, (HMENU)ID_RADIO_STOP, hInst, NULL);
+        SendMessage(hStop, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        HWND hClo = CreateWindow(L"BUTTON", L"Close",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            cw - 78, y, 70, 26, hwnd, (HMENU)ID_RADIO_CLOSE, hInst, NULL);
+        SendMessage(hClo, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        y += 30;
+
+        // Credit link
+        HWND hCredit = CreateWindow(L"STATIC", L"Powered by radio-browser.info",
+            WS_CHILD | WS_VISIBLE | SS_CENTER | SS_NOTIFY,
+            8, y, cw - 16, 14, hwnd, (HMENU)499, hInst, NULL);
+        {
+            HFONT hSmallF = CreateFont(-11, 0, 0, 0, FW_NORMAL, 0, TRUE/*underline*/, 0,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+            SendMessage(hCredit, WM_SETFONT, (WPARAM)hSmallF, TRUE);
+        }
+
+        // Load and show saved radio favorites
+        LoadRadioFavs();
+        if (!g_radioFavs.empty()) {
+            HWND hListInit = GetDlgItem(hwnd, ID_RADIO_LIST);
+            g_radioResults.clear();
+            for (auto& rf : g_radioFavs) {
+                RadioStation rs = {};
+                wcsncpy_s(rs.name, rf.name.c_str(), _TRUNCATE);
+                wcsncpy_s(rs.url, rf.url.c_str(), _TRUNCATE);
+                wcsncpy_s(rs.uuid, rf.uuid.c_str(), _TRUNCATE);
+                _snwprintf_s(rs.display, _countof(rs.display), _TRUNCATE, L"\u2605 %s", rs.name);
+                g_radioResults.push_back(rs);
+                SendMessage(hListInit, LB_ADDSTRING, 0, (LPARAM)rs.display);
+            }
+            SetDlgItemText(hwnd, ID_RADIO_STATUS,
+                L"Showing saved favorites. Search to find new stations.");
+        }
+        break;
+    }
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) { DestroyWindow(hwnd); return 0; }
+        if (wParam == VK_RETURN) {
+            SendMessage(hwnd, WM_COMMAND, ID_RADIO_SEARCH, 0);
+            return 0;
+        }
+        if (wParam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            HWND hFoc = GetFocus();
+            if (hFoc) SendMessage(hFoc, EM_SETSEL, 0, -1);
+            return 0;
+        }
+        break;
+    case WM_COMMAND:
+        // Handle Enter in edit fields (EN_KILLFOCUS won't work, use IDOK default button)
+        if ((LOWORD(wParam) == ID_RADIO_QUERY || LOWORD(wParam) == ID_RADIO_GENRE) && HIWORD(wParam) == EN_CHANGE) {
+            // Reset debounce timer — search triggers 1s after last keystroke
+            KillTimer(hwnd, IDT_RADIO_DEBOUNCE);
+            wchar_t q[8] = {}; GetDlgItemText(hwnd, ID_RADIO_QUERY, q, 8);
+            wchar_t g[8] = {}; GetDlgItemText(hwnd, ID_RADIO_GENRE, g, 8);
+            if (q[0] || g[0]) // only auto-search if something is typed
+                SetTimer(hwnd, IDT_RADIO_DEBOUNCE, 1000, NULL);
+            break;
+        }
+        // Genre preset buttons
+        {
+            int cmd = LOWORD(wParam);
+            if (cmd >= IDC_RADIO_PRESET_BASE && cmd < IDC_RADIO_PRESET_BASE + 20) {
+                static const wchar_t* presetTags[] = {
+                    L"", L"__top__", L"electronic", L"house", L"techno", L"drum and bass",
+                    L"ambient", L"chillout", L"trance", L"jazz", L"rock", L"pop",
+                    L"classical", L"hip hop", L"lounge", L"news", L"talk", L"80s",
+                };
+                int pi = cmd - IDC_RADIO_PRESET_BASE;
+                if (pi == 0) {
+                    // Favorites
+                    LoadRadioFavs();
+                    g_radioResults.clear();
+                    HWND hList = GetDlgItem(hwnd, ID_RADIO_LIST);
+                    SendMessage(hList, LB_RESETCONTENT, 0, 0);
+                    for (auto& rf : g_radioFavs) {
+                        RadioStation rs = {};
+                        wcsncpy_s(rs.name, rf.name.c_str(), _TRUNCATE);
+                        wcsncpy_s(rs.url, rf.url.c_str(), _TRUNCATE);
+                        wcsncpy_s(rs.uuid, rf.uuid.c_str(), _TRUNCATE);
+                        _snwprintf_s(rs.display, _countof(rs.display), _TRUNCATE, L"\u2605 %s", rs.name);
+                        g_radioResults.push_back(rs);
+                        SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)rs.display);
+                    }
+                    SetDlgItemText(hwnd, ID_RADIO_STATUS, L"Showing saved favorites.");
+                } else if (pi == 1) {
+                    // Top stations
+                    SetDlgItemText(hwnd, ID_RADIO_QUERY, L"");
+                    SetDlgItemText(hwnd, ID_RADIO_GENRE, L"");
+                    SendMessage(hwnd, WM_COMMAND, ID_RADIO_SEARCH, 0);
+                } else if (pi < 18) {
+                    SetDlgItemText(hwnd, ID_RADIO_QUERY, L"");
+                    SetDlgItemText(hwnd, ID_RADIO_GENRE, presetTags[pi]);
+                    SendMessage(hwnd, WM_COMMAND, ID_RADIO_SEARCH, 0);
+                }
+                break;
+            }
+        }
+        switch (LOWORD(wParam)) {
+        case ID_RADIO_SEARCH: {
+            wchar_t query[256] = {}, genre[128] = {};
+            GetDlgItemText(hwnd, ID_RADIO_QUERY, query, 256);
+            GetDlgItemText(hwnd, ID_RADIO_GENRE, genre, 128);
+            RadioSearch(query, genre, GetDlgItem(hwnd, ID_RADIO_STATUS));
+            HWND hList = GetDlgItem(hwnd, ID_RADIO_LIST);
+            SendMessage(hList, LB_RESETCONTENT, 0, 0);
+            for (auto& rs : g_radioResults)
+                SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)rs.display);
+            if (!g_radioResults.empty())
+                SendMessage(hList, LB_SETCURSEL, 0, 0);
+            break;
+        }
+        case ID_RADIO_LIST:
+            if (HIWORD(wParam) == LBN_DBLCLK) {
+                int sel = (int)SendMessage(GetDlgItem(hwnd, ID_RADIO_LIST), LB_GETCURSEL, 0, 0);
+                if (sel >= 0) RadioPlayStation(sel);
+            }
+            break;
+        case ID_RADIO_PLAY: {
+            int sel = (int)SendMessage(GetDlgItem(hwnd, ID_RADIO_LIST), LB_GETCURSEL, 0, 0);
+            if (sel >= 0) RadioPlayStation(sel);
+            else SetDlgItemText(hwnd, ID_RADIO_STATUS, L"Select a station first.");
+            break;
+        }
+        case ID_RADIO_STOP:
+            if (g_radioPlaying) {
+                StopAudio();
+                SetDlgItemText(hwnd, ID_RADIO_STATUS, L"Stopped.");
+            }
+            break;
+        case 499: // Credit link click
+            ShellExecute(hwnd, L"open", L"https://www.radio-browser.info/", NULL, NULL, SW_SHOW);
+            break;
+        case IDC_RADIO_FAV: {
+            // Add selected station to radio favorites
+            HWND hList = GetDlgItem(hwnd, ID_RADIO_LIST);
+            int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
+            if (sel >= 0 && sel < (int)g_radioResults.size()) {
+                RadioStation& rs = g_radioResults[sel];
+                if (!IsRadioFav(rs.url)) {
+                    RadioFav rf; rf.name = rs.name; rf.url = rs.url; rf.uuid = rs.uuid;
+                    g_radioFavs.push_back(rf);
+                    SaveRadioFavs();
+                    // Update display to show star
+                    _snwprintf_s(rs.display, _countof(rs.display), _TRUNCATE,
+                        L"\u2605 %s  |  %s  %dkbps  [%s]", rs.name, rs.codec, rs.bitrate, rs.country);
+                    SendMessage(hList, LB_DELETESTRING, sel, 0);
+                    SendMessage(hList, LB_INSERTSTRING, sel, (LPARAM)rs.display);
+                    SendMessage(hList, LB_SETCURSEL, sel, 0);
+                    SetDlgItemText(hwnd, ID_RADIO_STATUS, L"\u2605 Added to favorites.");
+                }
+            }
+            break;
+        }
+        case IDC_RADIO_UNFAV: {
+            HWND hList = GetDlgItem(hwnd, ID_RADIO_LIST);
+            int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
+            if (sel >= 0 && sel < (int)g_radioResults.size()) {
+                RadioStation& rs = g_radioResults[sel];
+                for (auto it = g_radioFavs.begin(); it != g_radioFavs.end(); ++it) {
+                    if (it->url == rs.url) { g_radioFavs.erase(it); SaveRadioFavs(); break; }
+                }
+                // Update display to remove star
+                _snwprintf_s(rs.display, _countof(rs.display), _TRUNCATE,
+                    L"%s  |  %s  %dkbps  [%s]", rs.name, rs.codec, rs.bitrate, rs.country);
+                SendMessage(hList, LB_DELETESTRING, sel, 0);
+                SendMessage(hList, LB_INSERTSTRING, sel, (LPARAM)rs.display);
+                SendMessage(hList, LB_SETCURSEL, sel, 0);
+                SetDlgItemText(hwnd, ID_RADIO_STATUS, L"Removed from favorites.");
+            }
+            break;
+        }
+        case ID_RADIO_CLOSE:
+        case IDCANCEL:
+            DestroyWindow(hwnd);
+            break;
+        }
+        break;
+    case WM_TIMER:
+        if (wParam == IDT_RADIO_DEBOUNCE) {
+            KillTimer(hwnd, IDT_RADIO_DEBOUNCE);
+            // Auto-search after 1s typing pause
+            SendMessage(hwnd, WM_COMMAND, ID_RADIO_SEARCH, 0);
+        }
+        break;
+    case WM_NOTIFY: break; // placeholder
+    case WM_CONTEXTMENU: {
+        // Right-click on results list
+        HWND hList = GetDlgItem(hwnd, ID_RADIO_LIST);
+        if ((HWND)wParam == hList) {
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            // Convert to client coords for hit test
+            POINT cpt = pt; ScreenToClient(hList, &cpt);
+            int idx = (int)SendMessage(hList, LB_ITEMFROMPOINT, 0, MAKELPARAM(cpt.x, cpt.y));
+            if (!HIWORD(idx) && LOWORD(idx) < (UINT)g_radioResults.size()) {
+                SendMessage(hList, LB_SETCURSEL, LOWORD(idx), 0);
+                HMENU hMenu = CreatePopupMenu();
+                bool isFav = IsRadioFav(g_radioResults[LOWORD(idx)].url);
+                AppendMenu(hMenu, MF_STRING, ID_RADIO_PLAY, L"\u25B6 Play");
+                AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+                if (isFav)
+                    AppendMenu(hMenu, MF_STRING, IDC_RADIO_UNFAV, L"Remove from Favorites");
+                else
+                    AppendMenu(hMenu, MF_STRING, IDC_RADIO_FAV, L"\u2605 Save as Favorite");
+                TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+                DestroyMenu(hMenu);
+            }
+        }
+        return 0;
+    }
+    case WM_ERASEBKGND: {
+        HDC dc = (HDC)wParam; RECT rc; GetClientRect(hwnd, &rc);
+        FillRect(dc, &rc, g_brBg); return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)wParam;
+        SetTextColor(dc, g_theme.text); SetBkColor(dc, g_theme.bg);
+        return (LRESULT)g_brBg;
+    }
+    case WM_CTLCOLORLISTBOX: {
+        HDC dc = (HDC)wParam;
+        SetTextColor(dc, g_theme.text); SetBkColor(dc, g_theme.bgList);
+        return (LRESULT)g_brList;
+    }
+    case WM_DESTROY:
+        // Don't stop radio on dialog close — keep playing
+        g_hwndRadio = NULL;
+        g_radioResults.clear();
+        break;
+    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static void OpenRadioDialog()
+{
+    if (g_hwndRadio && IsWindow(g_hwndRadio)) { SetForegroundWindow(g_hwndRadio); return; }
+    HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(g_hwnd, GWLP_HINSTANCE);
+    static const wchar_t RADIO_CLASS[] = L"BillyRadioWnd";
+    static bool radioReg = false;
+    if (!radioReg) {
+        WNDCLASS wc = {}; wc.lpfnWndProc = RadioWndProc; wc.hInstance = hInst;
+        wc.lpszClassName = RADIO_CLASS; wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_BILLYPRO));
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1); RegisterClass(&wc); radioReg = true;
+    }
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE;
+    RECT cr = { 0, 0, 560, 460 }; AdjustWindowRect(&cr, style, FALSE);
+    int dw = cr.right - cr.left, dh = cr.bottom - cr.top;
+    g_hwndRadio = CreateWindowEx(WS_EX_APPWINDOW, RADIO_CLASS,
+        L"Internet Radio", style, 0, 0, dw, dh, NULL, NULL, hInst, NULL);
+    RECT pr; GetWindowRect(g_hwnd, &pr);
+    SetWindowPos(g_hwndRadio, NULL,
+        pr.left + (pr.right - pr.left - dw) / 2,
+        pr.top + (pr.bottom - pr.top - dh) / 2,
+        dw, dh, SWP_NOZORDER);
 }
 
 static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -3661,23 +6304,7 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
             lx, 10, artW, artH, hwnd, (HMENU)ID_INFO_ARTWORK, hInst, NULL);
 
-        // Art hint label
-        HWND hHint = CreateWindow(L"STATIC", L"Drag artwork to desktop to extract",
-            WS_CHILD | WS_VISIBLE | SS_CENTER,
-            lx, artH + 14, artW, 16, hwnd, (HMENU)(UINT_PTR)(IDC_STATIC), hInst, NULL);
-        SendMessage(hHint, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-
-        // Save Artwork button
-        HWND hSaveArt = CreateWindow(L"BUTTON", L"Save Artwork...",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            lx, artH + 34, artW / 2 - 2, 24, hwnd, (HMENU)ID_INFO_SAVE_ART, hInst, NULL);
-        SendMessage(hSaveArt, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-
-        // Replace Artwork button
-        HWND hRepArt = CreateWindow(L"BUTTON", L"Replace...",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            lx + artW / 2 + 2, artH + 34, artW / 2 - 2, 24, hwnd, (HMENU)ID_INFO_REPLACE_ART, hInst, NULL);
-        SendMessage(hRepArt, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        // (artwork buttons removed — artwork is managed via Tag Database / Discogs)
 
         // === Right side: format info read-only ===
         int ry = 10;
@@ -3742,23 +6369,208 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         HWND hTrack = MakeField(L"Track #:", ID_INFO_TRACK, 22);
         HWND hGenre = MakeField(L"Genre:", ID_INFO_GENRE, 22);
 
-        // Populate tag fields from ID3v1
+        // Populate tag fields — try ID3v2 first (what we write), fall back to ID3v1
         if (s) {
-            TAG_ID3* id3 = (TAG_ID3*)BASS_ChannelGetTags(s, BASS_TAG_ID3);
-            if (id3) {
-                wchar_t w[256] = {};
-                MultiByteToWideChar(CP_ACP, 0, id3->title, sizeof(id3->title), w, 256); SetWindowText(hTitle, w);
-                MultiByteToWideChar(CP_ACP, 0, id3->artist, sizeof(id3->artist), w, 256); SetWindowText(hArtist, w);
-                MultiByteToWideChar(CP_ACP, 0, id3->album, sizeof(id3->album), w, 256); SetWindowText(hAlbum, w);
-                MultiByteToWideChar(CP_ACP, 0, id3->year, sizeof(id3->year), w, 256); SetWindowText(hYear, w);
+            bool tagsRead = false;
+            // ID3v2: parse TIT2, TPE1, TALB, TYER/TDRC, TRCK, TCON frames
+            const void* id3v2raw = BASS_ChannelGetTags(s, BASS_TAG_ID3V2);
+            if (id3v2raw) {
+                const BYTE* data = (const BYTE*)id3v2raw;
+                if (memcmp(data, "ID3", 3) == 0) {
+                    DWORD tagSize = ((data[6] & 0x7F) << 21) | ((data[7] & 0x7F) << 14) |
+                        ((data[8] & 0x7F) << 7) | (data[9] & 0x7F);
+                    BYTE ver = data[3];
+                    const BYTE* p = data + 10;
+                    const BYTE* end = data + 10 + tagSize;
+                    while (p + 10 < end) {
+                        char fid[5] = {}; memcpy(fid, p, 4);
+                        DWORD fsize;
+                        if (ver >= 4) fsize = ((p[4] & 0x7F) << 21) | ((p[5] & 0x7F) << 14) | ((p[6] & 0x7F) << 7) | (p[7] & 0x7F);
+                        else          fsize = (p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7];
+                        p += 10;
+                        if (fsize == 0 || p + fsize > end) break;
+                        // Text frames: first byte = encoding (0=Latin1, 1=UTF16, 2=UTF16BE, 3=UTF8)
+                        HWND target = NULL;
+                        if (strcmp(fid, "TIT2") == 0) target = hTitle;
+                        else if (strcmp(fid, "TPE1") == 0) target = hArtist;
+                        else if (strcmp(fid, "TALB") == 0) target = hAlbum;
+                        else if (strcmp(fid, "TYER") == 0 || strcmp(fid, "TDRC") == 0) target = hYear;
+                        else if (strcmp(fid, "TRCK") == 0) target = hTrack;
+                        else if (strcmp(fid, "TCON") == 0) target = hGenre;
+                        if (target && fsize > 1) {
+                            BYTE enc = p[0];
+                            wchar_t val[256] = {};
+                            if (enc == 3) { // UTF-8
+                                MultiByteToWideChar(CP_UTF8, 0, (const char*)(p + 1), fsize - 1, val, 255);
+                            } else if (enc == 0) { // Latin-1
+                                MultiByteToWideChar(CP_ACP, 0, (const char*)(p + 1), fsize - 1, val, 255);
+                            } else if (enc == 1 || enc == 2) { // UTF-16
+                                int charCount = min((int)(fsize - 1) / 2, 255);
+                                const wchar_t* src = (const wchar_t*)(p + 1);
+                                // Skip BOM if present
+                                if (charCount > 0 && (src[0] == 0xFEFF || src[0] == 0xFFFE)) { src++; charCount--; }
+                                wcsncpy_s(val, src, charCount);
+                            }
+                            if (val[0]) { SetWindowText(target, val); tagsRead = true; }
+                        }
+                        p += fsize;
+                    }
+                }
             }
-            // Load artwork at 220x220
+            // Fallback: Vorbis Comments via BASS_TAG_OGG (FLAC/OGG)
+            if (!tagsRead) {
+                const char* ogg = BASS_ChannelGetTags(s, BASS_TAG_OGG);
+                if (ogg) {
+                    while (*ogg) {
+                        const char* eq = strchr(ogg, '=');
+                        if (eq) {
+                            int keyLen = (int)(eq - ogg);
+                            const char* val = eq + 1;
+                            wchar_t wval[256] = {};
+                            MultiByteToWideChar(CP_UTF8, 0, val, -1, wval, 255);
+                            HWND target = NULL;
+                            if (_strnicmp(ogg, "TITLE", keyLen) == 0 && keyLen == 5) target = hTitle;
+                            else if (_strnicmp(ogg, "ARTIST", keyLen) == 0 && keyLen == 6) target = hArtist;
+                            else if (_strnicmp(ogg, "ALBUM", keyLen) == 0 && keyLen == 5) target = hAlbum;
+                            else if (_strnicmp(ogg, "DATE", keyLen) == 0 && keyLen == 4) target = hYear;
+                            else if (_strnicmp(ogg, "TRACKNUMBER", keyLen) == 0 && keyLen == 11) target = hTrack;
+                            else if (_strnicmp(ogg, "GENRE", keyLen) == 0 && keyLen == 5) target = hGenre;
+                            if (target && wval[0]) { SetWindowText(target, wval); tagsRead = true; }
+                        }
+                        ogg += strlen(ogg) + 1;
+                    }
+                }
+            }
+            // Fallback: read FLAC Vorbis Comments directly via libFLAC metadata API
+            if (!tagsRead) {
+                const wchar_t* fext = wcsrchr(s_filePath, L'.');
+                if (fext && _wcsicmp(fext, L".flac") == 0) {
+                    int uLen = WideCharToMultiByte(CP_UTF8, 0, s_filePath, -1, NULL, 0, NULL, NULL);
+                    std::string u8path(uLen, '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, s_filePath, -1, &u8path[0], uLen, NULL, NULL);
+                    FLAC__Metadata_Chain* fc = FLAC__metadata_chain_new();
+                    if (fc && FLAC__metadata_chain_read(fc, u8path.c_str())) {
+                        FLAC__Metadata_Iterator* fi = FLAC__metadata_iterator_new();
+                        if (fi) {
+                            FLAC__metadata_iterator_init(fi, fc);
+                            do {
+                                FLAC__StreamMetadata* blk = FLAC__metadata_iterator_get_block(fi);
+                                if (blk->type == FLAC__METADATA_TYPE_VORBIS_COMMENT) {
+                                    FLAC__StreamMetadata_VorbisComment& vc = blk->data.vorbis_comment;
+                                    for (FLAC__uint32 ci = 0; ci < vc.num_comments; ci++) {
+                                        const char* entry = (const char*)vc.comments[ci].entry;
+                                        const char* eq = strchr(entry, '=');
+                                        if (!eq) continue;
+                                        int kl = (int)(eq - entry);
+                                        const char* val = eq + 1;
+                                        wchar_t wv[256] = {};
+                                        MultiByteToWideChar(CP_UTF8, 0, val, -1, wv, 255);
+                                        HWND tgt = NULL;
+                                        if (_strnicmp(entry, "TITLE", kl) == 0 && kl == 5) tgt = hTitle;
+                                        else if (_strnicmp(entry, "ARTIST", kl) == 0 && kl == 6) tgt = hArtist;
+                                        else if (_strnicmp(entry, "ALBUM", kl) == 0 && kl == 5) tgt = hAlbum;
+                                        else if (_strnicmp(entry, "DATE", kl) == 0 && kl == 4) tgt = hYear;
+                                        else if (_strnicmp(entry, "TRACKNUMBER", kl) == 0 && kl == 11) tgt = hTrack;
+                                        else if (_strnicmp(entry, "GENRE", kl) == 0 && kl == 5) tgt = hGenre;
+                                        if (tgt && wv[0]) { SetWindowText(tgt, wv); tagsRead = true; }
+                                    }
+                                    break;
+                                }
+                            } while (FLAC__metadata_iterator_next(fi));
+                            FLAC__metadata_iterator_delete(fi);
+                        }
+                    }
+                    if (fc) FLAC__metadata_chain_delete(fc);
+                }
+            }
+            // Fallback for WAV: parse RIFF chunks for "id3 " chunk containing ID3v2
+            if (!tagsRead) {
+                FILE* wavf = NULL;
+                _wfopen_s(&wavf, s_filePath, L"rb");
+                if (wavf) {
+                    BYTE whdr[12];
+                    if (fread(whdr, 1, 12, wavf) == 12 && memcmp(whdr, "RIFF", 4) == 0 && memcmp(whdr + 8, "WAVE", 4) == 0) {
+                        while (true) {
+                            BYTE ch[8];
+                            if (fread(ch, 1, 8, wavf) != 8) break;
+                            DWORD sz = ch[4] | (ch[5] << 8) | (ch[6] << 16) | (ch[7] << 24);
+                            if (sz == 0 || sz > 50 * 1024 * 1024) break;
+                            bool isId3 = (memcmp(ch, "id3 ", 4) == 0 || memcmp(ch, "ID3 ", 4) == 0 || memcmp(ch, "ID32", 4) == 0);
+                            if (isId3 && sz > 10) {
+                                BYTE id3h[10];
+                                if (fread(id3h, 1, 10, wavf) == 10 && memcmp(id3h, "ID3", 3) == 0) {
+                                    DWORD tagSz = ((id3h[6] & 0x7F) << 21) | ((id3h[7] & 0x7F) << 14) |
+                                        ((id3h[8] & 0x7F) << 7) | (id3h[9] & 0x7F);
+                                    BYTE wver = id3h[3];
+                                    if (tagSz > 0 && tagSz <= sz && tagSz <= 8 * 1024 * 1024) {
+                                        std::vector<BYTE> wtag(tagSz);
+                                        if (fread(wtag.data(), 1, tagSz, wavf) == tagSz) {
+                                            const BYTE* wp = wtag.data();
+                                            const BYTE* wend = wp + tagSz;
+                                            while (wp + 10 < wend) {
+                                                char wfid[5] = {}; memcpy(wfid, wp, 4);
+                                                DWORD wfsize;
+                                                if (wver >= 4) wfsize = ((wp[4] & 0x7F) << 21) | ((wp[5] & 0x7F) << 14) | ((wp[6] & 0x7F) << 7) | (wp[7] & 0x7F);
+                                                else           wfsize = (wp[4] << 24) | (wp[5] << 16) | (wp[6] << 8) | wp[7];
+                                                wp += 10;
+                                                if (wfsize == 0 || wp + wfsize > wend) break;
+                                                HWND wtarget = NULL;
+                                                if (strcmp(wfid, "TIT2") == 0) wtarget = hTitle;
+                                                else if (strcmp(wfid, "TPE1") == 0) wtarget = hArtist;
+                                                else if (strcmp(wfid, "TALB") == 0) wtarget = hAlbum;
+                                                else if (strcmp(wfid, "TYER") == 0 || strcmp(wfid, "TDRC") == 0) wtarget = hYear;
+                                                else if (strcmp(wfid, "TRCK") == 0) wtarget = hTrack;
+                                                else if (strcmp(wfid, "TCON") == 0) wtarget = hGenre;
+                                                if (wtarget && wfsize > 1) {
+                                                    BYTE wenc = wp[0];
+                                                    wchar_t wval[256] = {};
+                                                    if (wenc == 3) MultiByteToWideChar(CP_UTF8, 0, (const char*)(wp + 1), wfsize - 1, wval, 255);
+                                                    else if (wenc == 0) MultiByteToWideChar(CP_ACP, 0, (const char*)(wp + 1), wfsize - 1, wval, 255);
+                                                    if (wval[0]) { SetWindowText(wtarget, wval); tagsRead = true; }
+                                                }
+                                                wp += wfsize;
+                                            }
+                                        }
+                                    }
+                                }
+                                break; // found id3 chunk, done
+                            } else {
+                                fseek(wavf, (sz + 1) & ~1, SEEK_CUR);
+                            }
+                        }
+                    }
+                    fclose(wavf);
+                }
+            }
+            // Fallback: ID3v1 (old fixed-length tags at end of MP3)
+            if (!tagsRead) {
+                TAG_ID3* id3 = (TAG_ID3*)BASS_ChannelGetTags(s, BASS_TAG_ID3);
+                if (id3) {
+                    wchar_t w[256] = {};
+                    MultiByteToWideChar(CP_ACP, 0, id3->title, sizeof(id3->title), w, 256); SetWindowText(hTitle, w);
+                    MultiByteToWideChar(CP_ACP, 0, id3->artist, sizeof(id3->artist), w, 256); SetWindowText(hArtist, w);
+                    MultiByteToWideChar(CP_ACP, 0, id3->album, sizeof(id3->album), w, 256); SetWindowText(hAlbum, w);
+                    MultiByteToWideChar(CP_ACP, 0, id3->year, sizeof(id3->year), w, 256); SetWindowText(hYear, w);
+                }
+            }
+            // Load artwork at 220x220 — try BASS ID3v2 first, then our multi-format loader
             hArt = LoadEmbeddedArtworkSized(s, 220);
             BASS_StreamFree(s);
+            if (!hArt) {
+                // Fallback: LoadThumbFromFile handles FLAC PICTURE, WAV id3 chunks, etc.
+                hArt = LoadThumbFromFile(s_filePath, 220);
+            }
         }
 
+        // Discogs lookup button
+        int dcgY = 460;
+        HWND hDiscogs = CreateWindow(L"BUTTON", L"\u2B07 Tag Database (Discogs)",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            rx, dcgY, rw, 26, hwnd, (HMENU)ID_INFO_DISCOGS, hInst, NULL);
+        SendMessage(hDiscogs, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+
         // Save Tags + Close buttons at bottom
-        int bby = 490;
+        int bby = 492;
         HWND hSaveTags = CreateWindow(L"BUTTON", L"Save Tags",
             WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
             rx, bby, rw / 2 - 4, 26, hwnd, (HMENU)ID_INFO_SAVE_TAGS, hInst, NULL);
@@ -3769,12 +6581,7 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             rx + rw / 2 + 4, bby, rw / 2 - 4, 26, hwnd, (HMENU)ID_INFO_CLOSE, hInst, NULL);
         SendMessage(hClose, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
 
-        // Also close buttons row below artwork (mirrored)
-        HWND hClose2 = CreateWindow(L"BUTTON", L"Close",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            lx, artH + 64, artW, 26, hwnd, (HMENU)ID_INFO_CLOSE, hInst, NULL);
-        SendMessage(hClose2, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-        (void)hClose2;
+        // (close button below artwork removed)
 
         break;
     }
@@ -3839,7 +6646,11 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case ID_INFO_CLOSE:
+        case IDCANCEL:
             DestroyWindow(hwnd);
+            break;
+        case ID_INFO_DISCOGS:
+            OpenDiscogsDialog(hwnd, s_filePath);
             break;
         case ID_INFO_SAVE_ART: {
             // Save artwork via file dialog
@@ -3889,24 +6700,68 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             GetDlgItemText(hwnd, ID_INFO_TRACK,  track,  16);
             GetDlgItemText(hwnd, ID_INFO_GENRE,  genre,  128);
             const wchar_t* ext = wcsrchr(s_filePath, L'.');
+            bool wasPlaying = (s_trackIdx >= 0 && g_currentIndex == s_trackIdx && currentStream != 0);
+            if (wasPlaying) StopAudio();
+            bool ok = false;
             if (ext && _wcsicmp(ext, L".mp3") == 0) {
-                // Stop playback if this file is currently open (can't write while open)
-                bool wasPlaying = (s_trackIdx >= 0 && g_currentIndex == s_trackIdx && currentStream != 0);
-                if (wasPlaying) StopAudio();
-                if (WriteID3v2ToMP3(s_filePath, title, artist, album, year, track, genre)) {
-                    MessageBox(hwnd, L"Tags saved successfully.", L"Save Tags", MB_ICONINFORMATION);
-                    if (wasPlaying) PlayIndex(s_trackIdx);
-                } else {
-                    MessageBox(hwnd, L"Failed to write tags.\nMake sure the file is not read-only.", L"Save Tags", MB_ICONERROR);
-                    if (wasPlaying) PlayIndex(s_trackIdx);
-                }
+                ok = WriteID3v2ToMP3(s_filePath, title, artist, album, year, track, genre);
+            } else if (ext && _wcsicmp(ext, L".flac") == 0) {
+                ok = WriteTagsToFLAC(s_filePath, title, artist, album, year, track, genre);
+            } else if (ext && _wcsicmp(ext, L".wav") == 0) {
+                ok = WriteID3v2ToWAV(s_filePath, title, artist, album, year, track, genre);
             } else {
-                MessageBox(hwnd, L"Tag writing is supported for MP3 files only.\nFLAC/OGG require an external tool.", L"Save Tags", MB_ICONWARNING);
+                MessageBox(hwnd, L"Tag writing is supported for MP3, FLAC, and WAV files.\nOGG/M4A require an external tool.", L"Save Tags", MB_ICONWARNING);
+                if (wasPlaying) PlayIndex(s_trackIdx);
+                break;
             }
+            if (ok) {
+                // Artwork: keep current hArt (already correct from Discogs preview or original).
+                // Only reload if hArt is NULL (no artwork was showing before save).
+                if (!hArt) {
+                    hArt = LoadThumbFromFile(s_filePath, 220);
+                    if (!hArt) {
+                        HSTREAM rs = BASS_StreamCreateFile(FALSE, s_filePath, 0, 0,
+                            BASS_UNICODE | BASS_STREAM_DECODE);
+                        if (rs) {
+                            hArt = LoadEmbeddedArtworkSized(rs, 220);
+                            BASS_StreamFree(rs);
+                        }
+                    }
+                }
+                HWND hArtCtl = GetDlgItem(hwnd, ID_INFO_ARTWORK);
+                if (hArtCtl) InvalidateRect(hArtCtl, NULL, TRUE);
+                // Clear thumbnail cache for this file so playlist view refreshes
+                {
+                    std::wstring cacheKey(s_filePath);
+                    auto it = g_thumbCache.find(cacheKey);
+                    if (it != g_thumbCache.end()) {
+                        if (it->second && it->second != (HBITMAP)1) DeleteObject(it->second);
+                        g_thumbCache.erase(it);
+                    }
+                }
+                // Refresh playlist listbox
+                if (hListBox) InvalidateRect(hListBox, NULL, FALSE);
+                MessageBox(hwnd, L"Tags saved successfully.", L"Save Tags", MB_ICONINFORMATION);
+            } else {
+                MessageBox(hwnd, L"Failed to write tags.\nMake sure the file is not read-only.", L"Save Tags", MB_ICONERROR);
+            }
+            if (wasPlaying) PlayIndex(s_trackIdx);
             break;
         }
         }
         break;
+
+    case WM_APP + 10: {
+        // Discogs artwork preview update: wParam = new HBITMAP at 220px
+        HBITMAP hNewArt = (HBITMAP)wParam;
+        if (hNewArt) {
+            if (hArt) DeleteObject(hArt);
+            hArt = hNewArt;
+            HWND hArtCtl = GetDlgItem(hwnd, ID_INFO_ARTWORK);
+            if (hArtCtl) InvalidateRect(hArtCtl, NULL, TRUE);
+        }
+        return 0;
+    }
 
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) DestroyWindow(hwnd);
@@ -4445,34 +7300,29 @@ static LRESULT CALLBACK ConvertWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             SetDlgItemText(hwnd, ID_CONV_STATUS, sb); break;
         }
         case ID_CONV_ADDFOLDER: {
-            BROWSEINFO bi = {}; bi.hwndOwner = hwnd; bi.lpszTitle = L"Select Folder to Add";
-            bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
-            LPITEMIDLIST pidl = SHBrowseForFolder(&bi);
-            if (pidl) {
-                wchar_t folder[MAX_PATH];
-                if (SHGetPathFromIDList(pidl, folder)) {
-                    wchar_t pat[MAX_PATH]; swprintf_s(pat, L"%s\\*.*", folder);
-                    WIN32_FIND_DATA fd; HANDLE h = FindFirstFile(pat, &fd); int added = 0;
-                    HWND hList = GetDlgItem(hwnd, ID_CONV_LIST);
-                    if (h != INVALID_HANDLE_VALUE) {
-                        do {
-                            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                                wchar_t full[MAX_PATH]; swprintf_s(full, L"%s\\%s", folder, fd.cFileName);
-                                if (IsAudio(full)) {
-                                    bool dup = false;
-                                    for (auto& ci : g_convItems) if (_wcsicmp(ci.path, full) == 0) { dup = true; break; }
-                                    if (!dup) {
-                                        ConvItem ci; wcsncpy_s(ci.path, full, _TRUNCATE);
-                                        wcsncpy_s(ci.display, Filename(full), _TRUNCATE);
-                                        g_convItems.push_back(ci); SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)ci.display); added++;
-                                    }
+            wchar_t folder[MAX_PATH] = {};
+            if (PickFolder(hwnd, L"Select Folder to Add", folder, MAX_PATH)) {
+                wchar_t pat[MAX_PATH]; swprintf_s(pat, L"%s\\*.*", folder);
+                WIN32_FIND_DATA fd; HANDLE h = FindFirstFile(pat, &fd); int added = 0;
+                HWND hList = GetDlgItem(hwnd, ID_CONV_LIST);
+                if (h != INVALID_HANDLE_VALUE) {
+                    do {
+                        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                            wchar_t full[MAX_PATH]; swprintf_s(full, L"%s\\%s", folder, fd.cFileName);
+                            if (IsAudio(full)) {
+                                bool dup = false;
+                                for (auto& ci : g_convItems) if (_wcsicmp(ci.path, full) == 0) { dup = true; break; }
+                                if (!dup) {
+                                    ConvItem ci; wcsncpy_s(ci.path, full, _TRUNCATE);
+                                    wcsncpy_s(ci.display, Filename(full), _TRUNCATE);
+                                    g_convItems.push_back(ci); SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)ci.display); added++;
                                 }
                             }
-                        } while (FindNextFile(h, &fd)); FindClose(h);
-                    }
-                    wchar_t sb[128]; swprintf_s(sb, L"Added %d files from folder. Total: %d.", added, (int)g_convItems.size());
-                    SetDlgItemText(hwnd, ID_CONV_STATUS, sb);
-                } CoTaskMemFree(pidl);
+                        }
+                    } while (FindNextFile(h, &fd)); FindClose(h);
+                }
+                wchar_t sb[128]; swprintf_s(sb, L"Added %d files from folder. Total: %d.", added, (int)g_convItems.size());
+                SetDlgItemText(hwnd, ID_CONV_STATUS, sb);
             }
             break;
         }
@@ -4492,13 +7342,10 @@ static LRESULT CALLBACK ConvertWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case ID_CONV_SELECTALL:
             SendMessage(GetDlgItem(hwnd, ID_CONV_LIST), LB_SETSEL, TRUE, (LPARAM)-1); break;
         case ID_CONV_BROWSE: {
-            BROWSEINFO bi = {}; bi.hwndOwner = hwnd; bi.lpszTitle = L"Select Output Folder";
-            bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
-            LPITEMIDLIST pidl = SHBrowseForFolder(&bi);
-            if (pidl) {
-                if (SHGetPathFromIDList(pidl, g_convOutDir))
-                    SetDlgItemText(hwnd, ID_CONV_OUTDIR, g_convOutDir);
-                CoTaskMemFree(pidl);
+            wchar_t outDir[MAX_PATH] = {};
+            if (PickFolder(hwnd, L"Select Output Folder", outDir, MAX_PATH)) {
+                wcsncpy_s(g_convOutDir, outDir, _TRUNCATE);
+                SetDlgItemText(hwnd, ID_CONV_OUTDIR, g_convOutDir);
             }
             break;
         }
@@ -4596,6 +7443,7 @@ static LRESULT CALLBACK ConvertWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             break;
         }
         case ID_CONV_CLOSE:
+        case IDCANCEL:
             if (g_convRunning) {
                 if (MessageBox(hwnd, L"A conversion is in progress. Abort and close?",
                                L"Convert", MB_YESNO | MB_ICONWARNING) != IDYES) break;
@@ -4707,7 +7555,7 @@ static void RegisterFileAssoc(const wchar_t* ext)
     // Friendly name
     if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Classes\\BillyPro.audio",
             0, NULL, 0, KEY_SET_VALUE, NULL, &hk, NULL) == ERROR_SUCCESS) {
-        const wchar_t* desc = L"Billy Pro Audio File";
+        const wchar_t* desc = L"BillyPro Audio File";
         RegSetValueExW(hk, NULL, 0, REG_SZ, (BYTE*)desc, (DWORD)((wcslen(desc)+1)*sizeof(wchar_t)));
         RegCloseKey(hk);
     }
@@ -4755,7 +7603,7 @@ static LRESULT CALLBACK AssocDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         int cw = rc.right;
 
         HWND hLbl = CreateWindow(L"STATIC",
-            L"Select file types to always open with Billy Pro:",
+            L"Select file types to always open with BillyPro:",
             WS_CHILD | WS_VISIBLE, 8, 8, cw - 16, 18, hwnd, (HMENU)IDC_STATIC, hInst, NULL);
         SendMessage(hLbl, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
 
@@ -4841,7 +7689,7 @@ static LRESULT CALLBACK AssocDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             }
             // Notify Explorer
             SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
-            MessageBox(hwnd, L"File associations updated.\n\nAudio files will now open with Billy Pro when double-clicked.",
+            MessageBox(hwnd, L"File associations updated.\n\nAudio files will now open with BillyPro when double-clicked.",
                 L"File Associations", MB_ICONINFORMATION);
             break;
         }
@@ -4869,7 +7717,7 @@ void OpenFileAssocDialog()
     RECT cr = { 0, 0, 340, 294 }; AdjustWindowRect(&cr, style, FALSE);
     int dw = cr.right - cr.left, dh = cr.bottom - cr.top;
     g_hwndAssoc = CreateWindowEx(WS_EX_APPWINDOW, ASSOC_CLASS,
-        L"Billy Pro \u2014 File Associations", style, 0, 0, dw, dh, NULL, NULL, hInst, NULL);
+        L"BillyPro \u2014 File Associations", style, 0, 0, dw, dh, NULL, NULL, hInst, NULL);
     RECT pr; GetWindowRect(g_hwnd, &pr);
     SetWindowPos(g_hwndAssoc, NULL,
         pr.left + (pr.right - pr.left - dw) / 2,
@@ -4949,6 +7797,188 @@ void UpdateThumbButtons()
 }
 
 // ============================================================
+//  SMTC  (System Media Transport Controls — lock screen / overlay)
+// ============================================================
+static void SmtcInit(HWND hwnd)
+{
+    try {
+        // Initialize WinRT as MTA to avoid STA blocking assertions in debug mode
+        // (SMTC ButtonPressed events fire on background threads)
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        auto interop = winrt::get_activation_factory<
+            winrt::Windows::Media::SystemMediaTransportControls,
+            ISystemMediaTransportControlsInterop>();
+        if (!interop) return;
+
+        winrt::Windows::Media::SystemMediaTransportControls smtc{ nullptr };
+        HRESULT hr = interop->GetForWindow(
+            hwnd,
+            winrt::guid_of<winrt::Windows::Media::SystemMediaTransportControls>(),
+            winrt::put_abi(smtc));
+        if (FAILED(hr) || !smtc) return;
+
+        smtc.IsEnabled(true);
+        smtc.IsPlayEnabled(true);
+        smtc.IsPauseEnabled(true);
+        smtc.IsNextEnabled(true);
+        smtc.IsPreviousEnabled(true);
+        smtc.IsStopEnabled(true);
+        smtc.PlaybackStatus(winrt::Windows::Media::MediaPlaybackStatus::Closed);
+
+        // Handle button presses from Windows
+        g_smtcToken = smtc.ButtonPressed([](
+            winrt::Windows::Media::SystemMediaTransportControls const&,
+            winrt::Windows::Media::SystemMediaTransportControlsButtonPressedEventArgs const& args) {
+            switch (args.Button()) {
+            case winrt::Windows::Media::SystemMediaTransportControlsButton::Play:
+            case winrt::Windows::Media::SystemMediaTransportControlsButton::Pause:
+                PostMessage(g_hwnd, WM_COMMAND, IDM_PLAY_PLAYPAUSE, 0);
+                break;
+            case winrt::Windows::Media::SystemMediaTransportControlsButton::Next:
+                PostMessage(g_hwnd, WM_COMMAND, IDM_PLAY_NEXT, 0);
+                break;
+            case winrt::Windows::Media::SystemMediaTransportControlsButton::Previous:
+                PostMessage(g_hwnd, WM_COMMAND, IDM_PLAY_PREV, 0);
+                break;
+            case winrt::Windows::Media::SystemMediaTransportControlsButton::Stop:
+                PostMessage(g_hwnd, WM_COMMAND, IDM_PLAY_STOP, 0);
+                break;
+            default: break;
+            }
+        });
+
+        g_smtc = smtc;
+    }
+    catch (...) {
+        // SMTC not available on this Windows version — silently ignore
+    }
+}
+
+static void SmtcUpdatePlaybackStatus()
+{
+    if (!g_smtc) return;
+    try {
+        if (!currentStream)
+            g_smtc.PlaybackStatus(winrt::Windows::Media::MediaPlaybackStatus::Stopped);
+        else if (BASS_ChannelIsActive(currentStream) == BASS_ACTIVE_PLAYING)
+            g_smtc.PlaybackStatus(winrt::Windows::Media::MediaPlaybackStatus::Playing);
+        else if (BASS_ChannelIsActive(currentStream) == BASS_ACTIVE_PAUSED)
+            g_smtc.PlaybackStatus(winrt::Windows::Media::MediaPlaybackStatus::Paused);
+        else
+            g_smtc.PlaybackStatus(winrt::Windows::Media::MediaPlaybackStatus::Stopped);
+    } catch (...) {}
+}
+
+static void SmtcUpdateMetadata()
+{
+    if (!g_smtc) return;
+    try {
+        auto updater = g_smtc.DisplayUpdater();
+        updater.Type(winrt::Windows::Media::MediaPlaybackType::Music);
+        auto props = updater.MusicProperties();
+
+        if (g_currentIndex >= 0 && g_currentIndex < (int)g_playlist.size()) {
+            // Parse display name: try "Artist - Title" format
+            const wchar_t* display = g_playlist[g_currentIndex].display;
+            const wchar_t* sep = wcsstr(display, L" - ");
+            if (sep) {
+                std::wstring artist(display, sep);
+                std::wstring title(sep + 3);
+                // Strip file extension from title
+                size_t dot = title.rfind(L'.');
+                if (dot != std::wstring::npos) title = title.substr(0, dot);
+                props.Artist(artist);
+                props.Title(title);
+            } else {
+                // Just filename, strip extension
+                std::wstring title(display);
+                size_t dot = title.rfind(L'.');
+                if (dot != std::wstring::npos) title = title.substr(0, dot);
+                props.Title(title);
+                props.Artist(L"");
+            }
+
+            // Try to load album artwork from embedded ID3
+            // Open a temporary BASS stream just for tag reading
+            HSTREAM tagStream = BASS_StreamCreateFile(FALSE,
+                g_playlist[g_currentIndex].path, 0, 0,
+                BASS_UNICODE | BASS_STREAM_DECODE);
+            if (tagStream) {
+                const void* id3v2 = BASS_ChannelGetTags(tagStream, BASS_TAG_ID3V2);
+                if (id3v2) {
+                    // Find APIC frame and extract image data
+                    const BYTE* data = (const BYTE*)id3v2;
+                    if (memcmp(data, "ID3", 3) == 0) {
+                        DWORD tagSize = ((data[6] & 0x7F) << 21) | ((data[7] & 0x7F) << 14) |
+                            ((data[8] & 0x7F) << 7) | (data[9] & 0x7F);
+                        BYTE ver = data[3];
+                        const BYTE* p = data + 10;
+                        const BYTE* end = data + 10 + tagSize;
+                        while (p + 10 < end) {
+                            char fid[5] = {}; memcpy(fid, p, 4);
+                            DWORD fsize;
+                            if (ver >= 4) fsize = ((p[4] & 0x7F) << 21) | ((p[5] & 0x7F) << 14) | ((p[6] & 0x7F) << 7) | (p[7] & 0x7F);
+                            else          fsize = (p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7];
+                            p += 10;
+                            if (p + fsize > end) break;
+                            if (strcmp(fid, "APIC") == 0 && fsize > 4) {
+                                const BYTE* fp = p;
+                                fp++; // text encoding
+                                const char* mimeStart = (const char*)fp;
+                                while (fp < p + fsize && *fp) fp++;
+                                if (fp < p + fsize) fp++; // skip null after mime
+                                if (fp < p + fsize) fp++; // picture type
+                                while (fp < p + fsize && *fp) fp++;
+                                if (fp < p + fsize) fp++; // skip null after description
+                                DWORD imgSize = (DWORD)(p + fsize - fp);
+                                if (imgSize > 0) {
+                                    // Determine content type
+                                    winrt::hstring contentType = L"image/jpeg";
+                                    if (strstr(mimeStart, "png")) contentType = L"image/png";
+
+                                    // Create IRandomAccessStream from raw bytes
+                                    auto ref = winrt::Windows::Storage::Streams::RandomAccessStreamReference::CreateFromUri(
+                                        winrt::Windows::Foundation::Uri(L"ms-appx:///dummy"));
+                                    // Use InMemoryRandomAccessStream instead
+                                    winrt::Windows::Storage::Streams::InMemoryRandomAccessStream memStream;
+                                    winrt::Windows::Storage::Streams::DataWriter writer(memStream);
+                                    writer.WriteBytes(winrt::array_view<const uint8_t>(fp, fp + imgSize));
+                                    writer.StoreAsync().get();
+                                    writer.DetachStream();
+                                    memStream.Seek(0);
+
+                                    updater.Thumbnail(
+                                        winrt::Windows::Storage::Streams::RandomAccessStreamReference::CreateFromStream(memStream));
+                                }
+                                break; // found artwork
+                            }
+                            p += fsize;
+                        }
+                    }
+                }
+                BASS_StreamFree(tagStream);
+            }
+        } else {
+            props.Title(L"BillyPro");
+            props.Artist(L"");
+        }
+
+        updater.Update();
+    } catch (...) {}
+}
+
+static void SmtcCleanup()
+{
+    if (g_smtc) {
+        try {
+            g_smtc.ButtonPressed(g_smtcToken);
+            g_smtc.IsEnabled(false);
+        } catch (...) {}
+        g_smtc = nullptr;
+    }
+}
+
+// ============================================================
 //  Options dialog  (replaces the old ugly DLGTEMPLATE version)
 //  Contains: Bass Boost settings, Multi-instance, Drop mode,
 //  File Associations button, Dark Mode toggle
@@ -4986,6 +8016,9 @@ void UpdateThumbButtons()
 #define ID_OPT_RESET         632
 #define ID_OPT_PITCH_SLIDER  636
 #define ID_OPT_SEEK_STEP     637
+#define ID_OPT_MODERN_SIZE   639
+#define ID_OPT_REC_PATH      653
+#define ID_OPT_REC_BROWSE    654
 #define ID_OPT_REVERB        640
 #define ID_OPT_SATURATE      641
 #define ID_OPT_VINYL         642
@@ -5135,17 +8168,17 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             s_optPanels[0] = p;
             int w = PNL_W - 4;
 
-            grp(p, 0, 0, w, 108, L"Open Billy Pro with these file types");
+            grp(p, 0, 0, w, 108, L"Open BillyPro with these file types");
             chk(p, 10, 20, 80, 20, ID_OPT_FT_WAV,  L"WAV",  false);
             chk(p, 95, 20, 80, 20, ID_OPT_FT_MP3,  L"MP3",  false);
             chk(p, 180, 20, 80, 20, ID_OPT_FT_OGG,  L"OGG",  false);
             chk(p, 10, 42, 80, 20, ID_OPT_FT_FLAC, L"FLAC", false);
             chk(p, 95, 42, 80, 20, ID_OPT_FT_M3U,  L"M3U",  false);
-            btn(p, 10, 68, w - 20, 26, ID_OPT_FILEASSOC, L"Associate selected types with Billy Pro");
+            btn(p, 10, 68, w - 20, 26, ID_OPT_FILEASSOC, L"Associate selected types with BillyPro");
 
             grp(p, 0, 118, w, 82, L"General");
             chk(p, 10, 136, w - 20, 20, ID_OPT_MULTIINST,
-                L"Allow multiple instances of Billy Pro", g_multiInst);
+                L"Allow multiple instances of BillyPro", g_multiInst);
             lbl(p, 10, 162, 160, 16, L"Arrow key seek (seconds):");
             {
                 wchar_t sbuf[16]; swprintf_s(sbuf, L"%.0f", g_seekStep);
@@ -5166,6 +8199,20 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             int w = PNL_W - 4;
             grp(p, 0, 0, w, 52, L"Theme");
             chk(p, 10, 18, w - 20, 24, ID_OPT_DARKMODE, L"Dark Mode", g_darkMode);
+
+            grp(p, 0, 60, w, 74, L"Modern Style (Artwork View)");
+            lbl(p, 10, 80, 130, 16, L"Thumbnail size:");
+            {
+                HWND hSzCombo = CreateWindow(L"COMBOBOX", NULL,
+                    WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_TABSTOP,
+                    144, 78, 150, 100, p, (HMENU)(UINT_PTR)ID_OPT_MODERN_SIZE, hInst, NULL);
+                SendMessage(hSzCombo, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+                SendMessage(hSzCombo, CB_ADDSTRING, 0, (LPARAM)L"Small (32px)");
+                SendMessage(hSzCombo, CB_ADDSTRING, 0, (LPARAM)L"Medium (48px)");
+                SendMessage(hSzCombo, CB_ADDSTRING, 0, (LPARAM)L"Large (64px)");
+                SendMessage(hSzCombo, CB_SETCURSEL, g_modernSize, 0);
+            }
+            lbl(p, 10, 106, w - 20, 14, L"Enable Modern Style from View menu to show artwork.");
         }
 
         // ── Page 2: Audio ─────────────────────────────────────────────────
@@ -5260,6 +8307,13 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             swprintf_s(detail, L"BASS v%d.%d.%d  |  Buffer: 3000 ms",
                 HIBYTE(HIWORD(bassVer)), LOBYTE(HIWORD(bassVer)), HIBYTE(LOWORD(bassVer)));
             lbl(p, 10, 144, w - 20, 16, detail);
+
+            // Recording settings
+            grp(p, 0, 170, w, 96, L"Recording");
+            lbl(p, 10, 192, 70, 16, L"Save path:");
+            edt(p, 82, 190, w - 126, 22, ID_OPT_REC_PATH, g_recSaveDir);
+            btn(p, w - 40, 190, 36, 22, ID_OPT_REC_BROWSE, L"...");
+            lbl(p, 10, 218, w - 20, 32, L"Records as FLAC (lossless, no quality loss).\r\nLeave empty to ask each time.");
         }
 
         // ── Page 4: Media ─────────────────────────────────────────────────
@@ -5337,27 +8391,20 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             break;
 
         case ID_OPT_MEDIA_ADD: {
-            BROWSEINFO bi = {}; bi.hwndOwner = hwnd; bi.lpszTitle = L"Select Media Folder";
-            bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
-            LPITEMIDLIST pidl = SHBrowseForFolder(&bi);
-            if (pidl) {
-                wchar_t folder[MAX_PATH] = {};
-                if (SHGetPathFromIDList(pidl, folder) && folder[0]) {
-                    // Avoid duplicates
-                    bool dup = false;
-                    for (auto& f : g_mediaFolders) if (_wcsicmp(f.c_str(), folder) == 0) { dup = true; break; }
-                    if (!dup) {
-                        g_mediaFolders.push_back(folder);
-                        // Keep g_mediaFolder = first entry
-                        wcsncpy_s(g_mediaFolder, g_mediaFolders[0].c_str(), _TRUNCATE);
-                        if (s_optPanels[4]) {
-                            HWND hList = GetDlgItem(s_optPanels[4], ID_OPT_MEDIA_LIST);
-                            SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)folder);
-                        }
-                        LayoutControls(g_hwnd);
+            wchar_t folder[MAX_PATH] = {};
+            if (PickFolder(hwnd, L"Select Media Folder", folder, MAX_PATH)) {
+                // Avoid duplicates
+                bool dup = false;
+                for (auto& f : g_mediaFolders) if (_wcsicmp(f.c_str(), folder) == 0) { dup = true; break; }
+                if (!dup) {
+                    g_mediaFolders.push_back(folder);
+                    wcsncpy_s(g_mediaFolder, g_mediaFolders[0].c_str(), _TRUNCATE);
+                    if (s_optPanels[4]) {
+                        HWND hList = GetDlgItem(s_optPanels[4], ID_OPT_MEDIA_LIST);
+                        SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)folder);
                     }
+                    LayoutControls(g_hwnd);
                 }
-                CoTaskMemFree(pidl);
             }
             break;
         }
@@ -5415,26 +8462,47 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 count++;
             }
             SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
-            if (count > 0) MessageBox(hwnd, L"File associations updated.", L"Billy Pro", MB_OK|MB_ICONINFORMATION);
-            else MessageBox(hwnd, L"Select at least one file type first.", L"Billy Pro", MB_OK|MB_ICONWARNING);
+            if (count > 0) MessageBox(hwnd, L"File associations updated.", L"BillyPro", MB_OK|MB_ICONINFORMATION);
+            else MessageBox(hwnd, L"Select at least one file type first.", L"BillyPro", MB_OK|MB_ICONWARNING);
             break;
         }
 
+        case ID_OPT_REC_BROWSE: {
+            wchar_t folder[MAX_PATH] = {};
+            if (PickFolder(hwnd, L"Select Recording Save Folder", folder, MAX_PATH)) {
+                SetDlgItemText(s_optPanels[3], ID_OPT_REC_PATH, folder);
+            }
+            break;
+        }
         case ID_OPT_DEVICE_RESET: {
             if (!s_optPanels[3]) break;
             HWND hCombo = GetDlgItem(s_optPanels[3], ID_OPT_DEVICE_COMBO);
             int sel = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
             if (sel == CB_ERR) break;
             int devIdx = (int)SendMessage(hCombo, CB_GETITEMDATA, sel, 0);
-            if ((DWORD)devIdx == BASS_GetDevice()) break;
-            if (currentStream) {
-                BASS_ChannelStop(currentStream);
-                BASS_StreamFree(currentStream);
-                currentStream = 0;
-            }
+            // Save playback state before switching
+            int savedIdx = g_currentIndex;
+            double savedPos = GetPlayPos();
+            bool wasPlaying = currentStream && BASS_ChannelIsActive(currentStream) == BASS_ACTIVE_PLAYING;
+            // Stop everything cleanly
+            StopAudio();
+            // Switch device
             BASS_Free();
-            BASS_Init(devIdx, 44100, 0, g_hwnd, NULL);
-            ApplyDSP();
+            if (!BASS_Init(devIdx, 44100, 0, g_hwnd, NULL)) {
+                // Fallback to default device
+                BASS_Init(-1, 44100, 0, g_hwnd, NULL);
+                MessageBox(hwnd, L"Failed to switch device. Using default.", L"Device", MB_ICONWARNING);
+            }
+            // Restart playback at saved position
+            if (savedIdx >= 0 && savedIdx < (int)g_playlist.size()) {
+                PlayIndex(savedIdx);
+                if (savedPos > 1.0) SeekToSeconds(savedPos);
+                if (!wasPlaying && currentStream) {
+                    BASS_ChannelPause(currentStream);
+                    KillTimer(g_hwnd, IDT_PLAYBACK);
+                    UpdatePlayBtn();
+                }
+            }
             UpdateStatusBar();
             break;
         }
@@ -5468,6 +8536,19 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             // Display page
             bool wasDark = g_darkMode;
             g_darkMode   = (SendMessage(GetDlgItem(s_optPanels[1], ID_OPT_DARKMODE),  BM_GETCHECK,0,0)==BST_CHECKED);
+            {
+                int newSize = (int)SendMessage(GetDlgItem(s_optPanels[1], ID_OPT_MODERN_SIZE), CB_GETCURSEL, 0, 0);
+                if (newSize >= 0 && newSize <= 2 && newSize != g_modernSize) {
+                    g_modernSize = newSize;
+                    // Clear cached thumbnails so they regenerate at new size
+                    ClearThumbCache();
+                    if (g_thumbPlaceholder) { DeleteObject(g_thumbPlaceholder); g_thumbPlaceholder = NULL; }
+                    if (g_modernStyle) {
+                        g_thumbPlaceholder = CreatePlaceholderBitmap();
+                        RecreateListbox();
+                    }
+                }
+            }
             // Setup page
             g_multiInst  = (SendMessage(GetDlgItem(s_optPanels[0], ID_OPT_MULTIINST),    BM_GETCHECK,0,0)==BST_CHECKED);
             g_dropAppend = (SendMessage(GetDlgItem(s_optPanels[0], ID_OPT_DROP_APPEND),  BM_GETCHECK,0,0)==BST_CHECKED);
@@ -5476,6 +8557,9 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             // Device page
             if (s_optPanels[3])
                 g_rememberVolume = (SendMessage(GetDlgItem(s_optPanels[3], ID_OPT_REMEMBER_VOL), BM_GETCHECK,0,0)==BST_CHECKED);
+            // Recording save path
+            if (s_optPanels[3])
+                GetDlgItemText(s_optPanels[3], ID_OPT_REC_PATH, g_recSaveDir, MAX_PATH);
             ApplyDSP();
             if (g_hwnd) LayoutControls(g_hwnd);
             // Timestretch page
@@ -5488,11 +8572,38 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 if (wasPitch != g_pitchEnabled || wasAmt != g_pitchSemitones) ApplyPitch();
             }
             if (g_darkMode != wasDark) ApplyTheme();
+            // Auto-switch audio device if changed
+            if (s_optPanels[3]) {
+                HWND hCombo = GetDlgItem(s_optPanels[3], ID_OPT_DEVICE_COMBO);
+                int sel = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
+                if (sel != CB_ERR) {
+                    int devIdx = (int)SendMessage(hCombo, CB_GETITEMDATA, sel, 0);
+                    if ((DWORD)devIdx != BASS_GetDevice()) {
+                        int savedIdx = g_currentIndex;
+                        double savedPos = GetPlayPos();
+                        bool wasPlaying = currentStream && BASS_ChannelIsActive(currentStream) == BASS_ACTIVE_PLAYING;
+                        StopAudio();
+                        BASS_Free();
+                        if (!BASS_Init(devIdx, 44100, 0, g_hwnd, NULL))
+                            BASS_Init(-1, 44100, 0, g_hwnd, NULL);
+                        if (savedIdx >= 0 && savedIdx < (int)g_playlist.size()) {
+                            PlayIndex(savedIdx);
+                            if (savedPos > 1.0) SeekToSeconds(savedPos);
+                            if (!wasPlaying && currentStream) {
+                                BASS_ChannelPause(currentStream);
+                                KillTimer(g_hwnd, IDT_PLAYBACK);
+                                UpdatePlayBtn();
+                            }
+                        }
+                    }
+                }
+            }
             SaveSettings();
             DestroyWindow(hwnd);
             break;
         }
         case ID_OPT_CANCEL:
+        case IDCANCEL:
             DestroyWindow(hwnd);
             break;
         case ID_OPT_RESET:
@@ -5720,8 +8831,12 @@ LRESULT CALLBACK SearchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         case ID_SEARCH_LIST:
             if (HIWORD(wParam) == LBN_DBLCLK) SearchPlaySelected();
             break;
-        case ID_SEARCH_OK:     SearchPlaySelected(); break;
-        case ID_SEARCH_CANCEL: DestroyWindow(hwnd);  break;
+        case ID_SEARCH_OK:
+        case IDOK:
+            SearchPlaySelected(); break;
+        case ID_SEARCH_CANCEL:
+        case IDCANCEL:
+            DestroyWindow(hwnd); break;
         }
         break;
     case WM_SIZE: {
@@ -5940,28 +9055,39 @@ void LayoutControls(HWND hwnd)
     MoveWindow(hStopBtn, m + 2 * (bw + bs), y, bw, bh, TRUE);
     MoveWindow(hPrevBtn, m + 3 * (bw + bs), y, bw, bh, TRUE);
     MoveWindow(hNextBtn, m + 4 * (bw + bs), y, bw, bh, TRUE);
-    int sbx = m + 5 * (bw + bs) + 6;
+    // Record button (red circle) right after transport, before Shuffle
+    if (hRecordBtn) MoveWindow(hRecordBtn, m + 5 * (bw + bs), y, bw, bh, TRUE);
+    int sbx = m + 5 * (bw + bs) + bw + 6;
     MoveWindow(hShuffleBtn, sbx, y, 46, bh, TRUE);
-    MoveWindow(hRepeatBtn, sbx + 50, y, 40, bh, TRUE);
-    MoveWindow(hMonoBtn, sbx + 94, y, 36, bh, TRUE);
-    MoveWindow(hNormalizeBtn, sbx + 134, y, 36, bh, TRUE);
-    MoveWindow(hBassBoostBtn, sbx + 174, y, 58, bh, TRUE);
+    MoveWindow(hRepeatBtn, sbx + 50, y, 46, bh, TRUE);
+    MoveWindow(hMonoBtn, sbx + 100, y, 36, bh, TRUE);
+    MoveWindow(hNormalizeBtn, sbx + 140, y, 36, bh, TRUE);
+    MoveWindow(hBassBoostBtn, sbx + 180, y, 58, bh, TRUE);
     // FX (DSP) button: right of BassBoost, visible only when any extra effect is enabled
     if (hDspBtn) {
         bool showDsp = g_dspReverb || g_dspSaturate || g_dspVinyl || g_dspHifi;
-        MoveWindow(hDspBtn, sbx + 236, y, 30, bh, TRUE);
+        MoveWindow(hDspBtn, sbx + 242, y, 30, bh, TRUE);
         ShowWindow(hDspBtn, showDsp ? SW_SHOW : SW_HIDE);
     }
     // Row 2: seek bar
     int vw = 12;  // vol bar width
 
-    // Star (media) button: far right, next to vol bar — only visible when media folders are set
+    // Library button: far right, next to vol bar — only visible when media folders are set
+    // Back button: to the left of Library, only when browser is active
     if (hMediaBtn) {
         if (!g_mediaFolders.empty()) {
-            MoveWindow(hMediaBtn, rc.right - vw - 4 - 22, y, 22, bh, TRUE);
+            int libX = rc.right - vw - 4 - 42;
+            if (hBackBtn && (g_browserActive || g_browserReturn)) {
+                MoveWindow(hBackBtn, libX - 20, y, 18, bh, TRUE);
+                ShowWindow(hBackBtn, SW_SHOW);
+            } else if (hBackBtn) {
+                ShowWindow(hBackBtn, SW_HIDE);
+            }
+            MoveWindow(hMediaBtn, libX, y, 42, bh, TRUE);
             ShowWindow(hMediaBtn, SW_SHOW);
         } else {
             ShowWindow(hMediaBtn, SW_HIDE);
+            if (hBackBtn) ShowWindow(hBackBtn, SW_HIDE);
         }
     }
     int sh = 14;
@@ -5989,7 +9115,7 @@ void LayoutControls(HWND hwnd)
 
         int curW = max(baseW, 44);
         int totW = max(baseW + 18, 58);  // "/ " prefix
-        int remW = max(baseW + 10, 58);  // "-"  prefix
+        int remW = g_recording ? 130 : max(baseW + 10, 58);  // fixed wide when recording to fit "⏺ 999.9 MB"
         MoveWindow(hTimeCur,    m,                          ty, curW, th, TRUE);
         MoveWindow(hTimeTot,    m + curW + 2,               ty, totW, th, TRUE);
         MoveWindow(hTimeRemain, m + curW + 2 + totW + 2,   ty, remW, th, TRUE);
@@ -6087,9 +9213,9 @@ bool HandleGlobalKey(WPARAM vk)
             MF_BYCOMMAND | (g_shuffle ? MF_CHECKED : MF_UNCHECKED));
         InvalidateRect(hShuffleBtn, NULL, TRUE); return true;
     case 'R':
-        g_repeat = !g_repeat;
+        g_repeatMode = (g_repeatMode + 1) % 3; // cycle: off -> track -> playlist -> off
         CheckMenuItem(GetMenu(g_hwnd), IDM_PLAY_REPEAT,
-            MF_BYCOMMAND | (g_repeat ? MF_CHECKED : MF_UNCHECKED));
+            MF_BYCOMMAND | (g_repeatMode ? MF_CHECKED : MF_UNCHECKED));
         InvalidateRect(hRepeatBtn, NULL, TRUE);  return true;
     case VK_UP:
         if (!(GetKeyState(VK_CONTROL) & 0x8000)) return false; // only Ctrl+Up for volume
@@ -6245,6 +9371,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             MessageBox(hwnd,
                 L"BASS init failed.\nMake sure bass.dll is in the same folder.",
                 L"Error", MB_ICONERROR);
+        // Set user agent for internet streams (required for many HTTPS radio stations)
+        BASS_SetConfigPtr(BASS_CONFIG_NET_AGENT, "BillyPro/0.5");
         // Keep default 500ms playback buffer for smooth playback
 
         DWORD OD = WS_CHILD | WS_VISIBLE | BS_OWNERDRAW;
@@ -6261,7 +9389,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         hNormalizeBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_NORMALIZE, hInst, NULL);
         hBassBoostBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_BASSBOOST, hInst, NULL);
         hDspBtn       = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_DSP,       hInst, NULL);
+        hRecordBtn    = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_RECORD,    hInst, NULL);
         hMediaBtn     = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_MEDIA,     hInst, NULL);
+        hBackBtn      = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_BACK,      hInst, NULL);
 
         // Volume custom bar
         hVolumeCanvas = CreateWindow(VOL_CLASS, NULL,
@@ -6308,6 +9438,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         SetWindowLongPtr(hNormalizeBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
         SetWindowLongPtr(hBassBoostBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
         SetWindowLongPtr(hDspBtn,       GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
+        SetWindowLongPtr(hRecordBtn,    GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
+        SetWindowLongPtr(hBackBtn,      GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
 
         hStatus = CreateWindowEx(0, STATUSCLASSNAME, NULL,
             WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
@@ -6342,6 +9474,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         CoCreateInstance(CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER,
             IID_ITaskbarList3, (void**)&g_pTaskbar);
         if (g_pTaskbar) g_pTaskbar->HrInit();
+
+        // Initialize SMTC (System Media Transport Controls — lock screen / media overlay)
+        SmtcInit(hwnd);
         break;
     }
 
@@ -6390,7 +9525,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_MEASUREITEM: {
         MEASUREITEMSTRUCT* ms = (MEASUREITEMSTRUCT*)lParam;
         if (ms->CtlType == ODT_LISTBOX && ms->CtlID == ID_LISTBOX) {
-            ms->itemHeight = 20;
+            ms->itemHeight = THUMB_SZ + 4;
             return TRUE;
         }
         if (ms->CtlType == ODT_MENU) {
@@ -6474,43 +9609,78 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             SelectObject(dis->hDC, fntOld);
             return TRUE;
         }
-        // Owner-draw listbox — highlight favorites with subtle tint
+        // Owner-draw listbox — favorites highlight + Modern Style artwork
         if (dis->CtlType == ODT_LISTBOX && dis->CtlID == ID_LISTBOX) {
             int idx = (int)dis->itemID;
-            if (idx < 0 || idx >= (int)g_playlist.size()) return TRUE;
+            int lbCount = (int)SendMessage(dis->hwndItem, LB_GETCOUNT, 0, 0);
+            if (idx < 0 || idx >= lbCount) {
+                HBRUSH bgBr = CreateSolidBrush(g_theme.bgList);
+                FillRect(dis->hDC, &dis->rcItem, bgBr); DeleteObject(bgBr);
+                return TRUE;
+            }
+            HDC dc = dis->hDC;
+            RECT rc = dis->rcItem;
             bool selected = (dis->itemState & ODS_SELECTED) != 0;
-            bool isCurrent = (idx == g_currentIndex);
-            // Don't highlight favorites when in favorites view (all are favorites)
-            bool isFav = !g_favActive && IsFavorite(g_playlist[idx].path);
 
-            // Background
+            wchar_t text[MAX_PATH + 4] = L"";
+            SendMessage(dis->hwndItem, LB_GETTEXT, idx, (LPARAM)text);
+
+            // Resolve file path for artwork + favorite check
+            const wchar_t* trackPath = NULL;
+            if (g_browserActive && idx < (int)g_browserItems.size() && !g_browserItems[idx].isDir)
+                trackPath = g_browserItems[idx].path;
+            else if (!g_browserActive && idx < (int)g_playlist.size())
+                trackPath = g_playlist[idx].path;
+            bool isFav = !g_favActive && trackPath && IsFavorite(trackPath);
+
+            // Colors with favorite tint
             COLORREF bgCol, txCol;
             if (g_darkMode) {
-                bgCol = selected ? RGB(30, 80, 160) : (isFav ? RGB(38, 55, 60) : g_theme.bg);
+                bgCol = selected ? RGB(30, 80, 160) : (isFav ? RGB(38, 55, 60) : g_theme.bgList);
                 txCol = selected ? RGB(255, 255, 255) : (isFav ? RGB(140, 200, 220) : g_theme.text);
             } else {
                 bgCol = selected ? GetSysColor(COLOR_HIGHLIGHT) : (isFav ? RGB(220, 235, 250) : GetSysColor(COLOR_WINDOW));
                 txCol = selected ? GetSysColor(COLOR_HIGHLIGHTTEXT) : (isFav ? RGB(30, 80, 140) : GetSysColor(COLOR_WINDOWTEXT));
             }
+
             HBRUSH br = CreateSolidBrush(bgCol);
-            FillRect(dis->hDC, &dis->rcItem, br);
-            DeleteObject(br);
+            FillRect(dc, &rc, br); DeleteObject(br);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, txCol);
+            HFONT oldFont = (HFONT)SelectObject(dc, g_fontUI);
 
-            // Text
-            SetTextColor(dis->hDC, txCol);
-            SetBkMode(dis->hDC, TRANSPARENT);
-            HFONT oldFont = (HFONT)SelectObject(dis->hDC, g_fontUI);
-            wchar_t text[MAX_PATH + 4];
-            SendMessage(hListBox, LB_GETTEXT, idx, (LPARAM)text);
-            RECT rc = dis->rcItem; rc.left += 4;
-            DrawText(dis->hDC, text, -1, &rc, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
-            SelectObject(dis->hDC, oldFont);
+            int textLeft = rc.left + 4;
 
-            // Focus rect
-            if (dis->itemState & ODS_FOCUS)
-                DrawFocusRect(dis->hDC, &dis->rcItem);
+            // Modern Style: draw artwork thumbnail on the left
+            if (g_modernStyle) {
+                int thumbX = rc.left + 2;
+                int thumbY = rc.top + (rc.bottom - rc.top - THUMB_SZ) / 2;
+                HBITMAP thumb = trackPath ? GetThumbForPath(trackPath) : g_thumbPlaceholder;
+                if (!thumb) thumb = g_thumbPlaceholder;
+                if (thumb) {
+                    HDC mdc = CreateCompatibleDC(dc);
+                    HBITMAP ob = (HBITMAP)SelectObject(mdc, thumb);
+                    BitBlt(dc, thumbX, thumbY, THUMB_SZ, THUMB_SZ, mdc, 0, 0, SRCCOPY);
+                    HPEN tp = CreatePen(PS_SOLID, 1, g_darkMode ? 0x555555 : 0xBBBBBB);
+                    HPEN top2 = (HPEN)SelectObject(dc, tp);
+                    SelectObject(dc, GetStockObject(NULL_BRUSH));
+                    Rectangle(dc, thumbX, thumbY, thumbX + THUMB_SZ, thumbY + THUMB_SZ);
+                    SelectObject(dc, top2); DeleteObject(tp);
+                    SelectObject(mdc, ob); DeleteDC(mdc);
+                }
+                textLeft = thumbX + THUMB_SZ + 6;
+            }
+
+            // Draw text
+            RECT textRc = rc;
+            textRc.left = textLeft;
+            DrawText(dc, text, -1, &textRc,
+                DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+            SelectObject(dc, oldFont);
+            if (dis->itemState & ODS_FOCUS) DrawFocusRect(dc, &rc);
             return TRUE;
         }
+
         switch (dis->CtlID) {
         case ID_BTN_PREV:      DrawBtn(dis, BTN_PREV);    return TRUE;
         case ID_BTN_PLAYPAUSE: DrawBtn(dis, BTN_PLAY);    return TRUE;
@@ -6524,6 +9694,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case ID_BTN_REPEAT:     DrawBtn(dis, BTN_REPEAT);     return TRUE;
         case ID_BTN_MEDIA:      DrawBtn(dis, BTN_MEDIA);      return TRUE;
         case ID_BTN_DSP:        DrawBtn(dis, BTN_DSP);        return TRUE;
+        case ID_BTN_RECORD:    DrawBtn(dis, BTN_RECORD);    return TRUE;
+        case ID_BTN_BACK:       DrawBtn(dis, BTN_BACK);       return TRUE;
         }
         break;
     }
@@ -6623,6 +9795,49 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             InvalidateRect(hVolumeCanvas, NULL, FALSE);
         }
+        if (wParam == IDT_RADIO_META && g_radioPlaying && currentStream) {
+            // Poll ICY metadata for current track info
+            const char* meta = BASS_ChannelGetTags(currentStream, BASS_TAG_META);
+            if (meta) {
+                // Format: "StreamTitle='Artist - Track';StreamUrl='...'"
+                const char* st = strstr(meta, "StreamTitle='");
+                if (st) {
+                    st += 13;
+                    const char* end = strchr(st, '\'');
+                    if (end && end > st) {
+                        std::string title8(st, end - st);
+                        wchar_t newMeta[512] = {};
+                        MultiByteToWideChar(CP_UTF8, 0, title8.c_str(), -1, newMeta, 511);
+                        if (wcscmp(newMeta, g_radioNowPlaying) != 0) {
+                            wcsncpy_s(g_radioNowPlaying, newMeta, _TRUNCATE);
+                            // Update title bar
+                            wchar_t wtitle[512];
+                            if (g_radioNowPlaying[0])
+                                _snwprintf_s(wtitle, _countof(wtitle), _TRUNCATE,
+                                    L"%s - %s - BillyPro", g_radioNowPlaying, g_radioStationName);
+                            else
+                                _snwprintf_s(wtitle, _countof(wtitle), _TRUNCATE,
+                                    L"%s - BillyPro", g_radioStationName);
+                            SetWindowText(g_hwnd, wtitle);
+                            UpdateStatusBar();
+                            // Update radio dialog status
+                            if (g_hwndRadio) {
+                                wchar_t rstatus[512];
+                                _snwprintf_s(rstatus, _countof(rstatus), _TRUNCATE,
+                                    L"\u25B6 %s\n%s", g_radioStationName, g_radioNowPlaying);
+                                SetDlgItemText(g_hwndRadio, ID_RADIO_STATUS, rstatus);
+                            }
+                        }
+                    }
+                }
+            }
+            // Also check ICY headers for station info
+            if (!g_radioNowPlaying[0]) {
+                const char* icy = BASS_ChannelGetTags(currentStream, BASS_TAG_ICY);
+                if (!icy) icy = BASS_ChannelGetTags(currentStream, BASS_TAG_HTTP);
+                // These are null-separated key:value pairs
+            }
+        }
         if (wParam == IDT_SEEK_REPEAT && g_seekKeyHeld) {
             g_seekRepeatCount++;
             if (g_seekRepeatCount == 3) {
@@ -6684,7 +9899,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             bool childActive = (g_hwndSearch && IsWindow(g_hwndSearch)) ||
                                (g_hwndInfo && IsWindow(g_hwndInfo)) ||
                                (g_hwndOptions && IsWindow(g_hwndOptions)) ||
-                               (g_hwndConvert && IsWindow(g_hwndConvert));
+                               (g_hwndConvert && IsWindow(g_hwndConvert)) ||
+                               (g_hwndDiscogs && IsWindow(g_hwndDiscogs)) ||
+                               (g_hwndRadio && IsWindow(g_hwndRadio));
             if (!childActive) SetFocus(hListBox);
         }
         break;
@@ -6735,10 +9952,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 MF_BYCOMMAND | (g_shuffle ? MF_CHECKED : MF_UNCHECKED));
             InvalidateRect(hShuffleBtn, NULL, TRUE); break;
         case ID_BTN_REPEAT:
-            g_repeat = !g_repeat;
+            g_repeatMode = (g_repeatMode + 1) % 3;
             CheckMenuItem(GetMenu(g_hwnd), IDM_PLAY_REPEAT,
-                MF_BYCOMMAND | (g_repeat ? MF_CHECKED : MF_UNCHECKED));
+                MF_BYCOMMAND | (g_repeatMode ? MF_CHECKED : MF_UNCHECKED));
             InvalidateRect(hRepeatBtn, NULL, TRUE); break;
+        case ID_BTN_BACK: {
+            if (g_browserActive && !g_browserItems.empty() && g_browserItems[0].isDir
+                && wcsstr(g_browserItems[0].display, L"[..]") != NULL) {
+                // Navigate back one level in the browser
+                BrowserNavigate(0);
+            } else if (g_browserReturn) {
+                // Return to the browser folder we came from
+                g_browserReturn = false;
+                g_browserActive = true;
+                FillBrowser(g_browserReturnPath);
+                LayoutControls(hwnd);
+            }
+            break;
+        }
         case ID_BTN_MONO:
             g_mono = !g_mono; ApplyDSP(); InvalidateRect(hMonoBtn, NULL, TRUE); break;
         case ID_BTN_NORMALIZE:
@@ -6749,6 +9980,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             g_dspBypass = !g_dspBypass;
             ApplyDSP();
             if (hDspBtn) InvalidateRect(hDspBtn, NULL, TRUE);
+            break;
+        case ID_BTN_RECORD:
+            if (g_recording) StopRecording();
+            else StartRecording();
             break;
         case ID_BTN_MEDIA: {
             if (g_mediaFolders.empty()) break;
@@ -6766,6 +10001,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 // Deactivate: restore old playlist view — keep audio playing
                 g_mediaActive = false;
                 g_browserActive = false;
+                g_browserReturn = false;
                 g_browserItems.clear();
                 // Restore saved playlist to listbox without stopping playback
                 g_playlist = g_savedPlaylist;
@@ -6778,6 +10014,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 RebuildShuffleOrder();
             }
             InvalidateRect(hMediaBtn, NULL, TRUE);
+            LayoutControls(hwnd); // update back button visibility
             UpdateStatusBar();
             break;
         }
@@ -6869,6 +10106,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case IDM_LIB_FAVORITES:
             LoadFavoritesIntoPlaylist();
             break;
+        case IDM_LIB_RADIO:
+            OpenRadioDialog();
+            break;
         case IDM_LIB_PL_MANAGE: {
             // Open playlists folder in Explorer
             GetLibDir();
@@ -6877,15 +10117,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
             // Menu
         case IDM_FILE_OPENFOLDER: {
-            BROWSEINFO bi = {}; bi.hwndOwner = hwnd;
-            bi.lpszTitle = L"Select Music Folder";
-            bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
-            LPITEMIDLIST pidl = SHBrowseForFolder(&bi);
-            if (pidl) {
-                wchar_t p[MAX_PATH];
-                if (SHGetPathFromIDList(pidl, p)) LoadFolder(p);
-                CoTaskMemFree(pidl);
-            }
+            wchar_t p[MAX_PATH] = {};
+            if (PickFolder(hwnd, L"Select Music Folder", p, MAX_PATH))
+                LoadFolder(p);
             break;
         }
         case ID_TRAY_RESTORE:
@@ -6907,6 +10141,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             ApplyTheme();
             SaveSettings();
             break;
+        case IDM_VIEW_MODERN:
+            ToggleModernStyle();
+            SaveSettings();
+            break;
 
         case IDM_OPTIONS_FILEASSOC: OpenFileAssocDialog(); break;
 
@@ -6919,8 +10157,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             CheckMenuItem(GetMenu(hwnd), IDM_PLAY_SHUFFLE, g_shuffle ? MF_CHECKED : MF_UNCHECKED);
             InvalidateRect(hShuffleBtn, NULL, TRUE); break;
         case IDM_PLAY_REPEAT:
-            g_repeat = !g_repeat;
-            CheckMenuItem(GetMenu(hwnd), IDM_PLAY_REPEAT, g_repeat ? MF_CHECKED : MF_UNCHECKED);
+            g_repeatMode = (g_repeatMode + 1) % 3;
+            CheckMenuItem(GetMenu(hwnd), IDM_PLAY_REPEAT, g_repeatMode ? MF_CHECKED : MF_UNCHECKED);
             InvalidateRect(hRepeatBtn, NULL, TRUE); break;
 
         case IDM_HELP_UPDATE: {
@@ -6980,10 +10218,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         case IDM_HELP_ABOUT:
             MessageBox(hwnd,
-                L"Billy Pro V0.6\n\n"
+                L"BillyPro V0.7\n\n"
                 L"Lightweight Music Player\n\n"
                 L"Created by MRJN/CLD.",
-                L"About Billy Pro", MB_ICONINFORMATION);
+                L"About BillyPro", MB_ICONINFORMATION);
             break;
         case IDM_HELP_CONTROLS:
             MessageBox(hwnd,
@@ -7062,12 +10300,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 swprintf_s(tot, L"/ %s", buf);
                 SetWindowText(hTimeTot, tot);
             }
-            if (!g_browserActive) {
-                SendMessage(hListBox, LB_SETSEL, FALSE, (LPARAM)-1);
-                SendMessage(hListBox, LB_SETSEL, TRUE, (LPARAM)g_currentIndex);
-                SendMessage(hListBox, LB_SETCURSEL, g_currentIndex, 0);
-                SendMessage(hListBox, LB_SETTOPINDEX, max(0, g_currentIndex - 3), 0);
-            }
+            SelectPlayingTrack(g_currentIndex);
             UpdatePlayBtn();
             UpdateStatusBar();
             UpdateWindowTitle();
@@ -7133,13 +10366,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     SetTimer(g_hwnd, IDT_PLAYBACK, 16, NULL);
                 }
                 if (g_hwnd) LayoutControls(g_hwnd);
-                if (!g_browserActive) {
-                    SendMessage(hListBox, LB_SETSEL, FALSE, (LPARAM)-1);
-                    SendMessage(hListBox, LB_SETSEL, TRUE, (LPARAM)g_currentIndex);
-                    SendMessage(hListBox, LB_SETCURSEL, g_currentIndex, 0);
-                    SendMessage(hListBox, LB_SETTOPINDEX, max(0, g_currentIndex - 3), 0);
-                }
+                SelectPlayingTrack(g_currentIndex);
                 UpdatePlayBtn(); UpdateStatusBar(); UpdateWindowTitle(); UpdateTimeDisplays();
+                SmtcUpdateMetadata(); SmtcUpdatePlaybackStatus();
                 if (hSeekCanvas) InvalidateRect(hSeekCanvas, NULL, FALSE);
                 if (hVolumeCanvas) InvalidateRect(hVolumeCanvas, NULL, FALSE);
                 PreloadNext();
@@ -7151,13 +10380,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             SetWindowText(hTimeCur, L"0:00");
             SetWindowText(hTimeRemain, L"");
             InvalidateRect(hSeekCanvas, NULL, FALSE);
-            if (g_repeat && g_currentIndex >= 0) PlayIndex(g_currentIndex);
+            if (g_repeatMode == 1 && g_currentIndex >= 0) PlayIndex(g_currentIndex);
             else PlayNext();
         }
         UpdateThumbButtons();
         break;
 
     case WM_DESTROY:
+        if (g_recording) StopRecording();   // finalize FLAC so file is seekable
+        ClearThumbCache();
+        if (g_thumbPlaceholder) { DeleteObject(g_thumbPlaceholder); g_thumbPlaceholder = NULL; }
         SaveSettings();
         RemoveTrayIcon();
         KillTimer(g_hwnd, IDT_PLAYBACK);
@@ -7177,6 +10409,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         UnregisterHotKey(hwnd, ID_HOTKEY_NEXT);
         UnregisterHotKey(hwnd, ID_HOTKEY_PREV);
         UnregisterHotKey(hwnd, ID_HOTKEY_STOP);
+        // Release SMTC
+        SmtcCleanup();
         // Release taskbar thumbnail
         if (g_pTaskbar) { g_pTaskbar->Release(); g_pTaskbar = NULL; }
         for (int i = 0; i < 4; i++) if (g_thumbIcons[i]) { DestroyIcon(g_thumbIcons[i]); g_thumbIcons[i] = NULL; }
@@ -7268,7 +10502,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
 
     INITCOMMONCONTROLSEX icex = { sizeof(icex),ICC_BAR_CLASSES | ICC_WIN95_CLASSES };
     InitCommonControlsEx(&icex);
-    CoInitialize(NULL);
+    winrt::init_apartment(winrt::apartment_type::single_threaded);
 
     RegisterCustomClasses(hInst);
 
@@ -7281,8 +10515,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
     if (!wc.hIcon) wc.hIcon = LoadIcon(NULL, IDI_APPLICATION); // fallback
     RegisterClass(&wc);
 
-    HWND hwnd = CreateWindowEx(WS_EX_ACCEPTFILES, CLASS_NAME, APP_TITLE,
-        WS_OVERLAPPEDWINDOW,
+    HWND hwnd = CreateWindowEx(WS_EX_ACCEPTFILES | WS_EX_COMPOSITED, CLASS_NAME, APP_TITLE,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 820, 560,
         NULL, NULL, hInst, NULL);
     if (!hwnd) { CoUninitialize(); return 0; }
@@ -7318,6 +10552,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
     AppendMenu(hPlay, MF_STRING, IDM_PLAY_REPEAT,    L"Repeat\tR");
 
     AppendMenu(hView, MF_STRING, IDM_VIEW_DARKMODE,  L"Dark Mode");
+    AppendMenu(hView, MF_STRING, IDM_VIEW_MODERN,   L"Modern Style");
 
     AppendMenu(hOpts, MF_STRING, IDM_OPTIONS, L"Options...");
 
@@ -7330,6 +10565,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
     HMENU hLib = CreatePopupMenu();
     g_hLibMenu = hLib;
     AppendMenu(hLib, MF_STRING, IDM_LIB_FAVORITES, L"Favorites");
+    AppendMenu(hLib, MF_STRING, IDM_LIB_RADIO, L"Internet Radio");
     AppendMenu(hLib, MF_SEPARATOR, 0, NULL);
     // Playlists as cascading submenu (rebuilt dynamically in WM_INITMENUPOPUP)
     g_hPlSubMenu = CreatePopupMenu();
@@ -7350,9 +10586,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
     SetMenu(hwnd, hMenu);
 
     // Now that the menu exists, apply persisted checkmarks
-    if (g_darkMode)  CheckMenuItem(hMenu, IDM_VIEW_DARKMODE,  MF_BYCOMMAND | MF_CHECKED);
-    if (g_shuffle)   CheckMenuItem(hMenu, IDM_PLAY_SHUFFLE,   MF_BYCOMMAND | MF_CHECKED);
-    if (g_repeat)    CheckMenuItem(hMenu, IDM_PLAY_REPEAT,    MF_BYCOMMAND | MF_CHECKED);
+    if (g_darkMode)   CheckMenuItem(hMenu, IDM_VIEW_DARKMODE, MF_BYCOMMAND | MF_CHECKED);
+    if (g_modernStyle) {
+        CheckMenuItem(hMenu, IDM_VIEW_MODERN, MF_BYCOMMAND | MF_CHECKED);
+        g_thumbPlaceholder = CreatePlaceholderBitmap();
+        RecreateListbox();
+    }
+    if (g_shuffle)    CheckMenuItem(hMenu, IDM_PLAY_SHUFFLE,  MF_BYCOMMAND | MF_CHECKED);
+    if (g_repeatMode) CheckMenuItem(hMenu, IDM_PLAY_REPEAT,   MF_BYCOMMAND | MF_CHECKED);
     ApplyTheme();  // re-run so dark mode title bar / controls are applied with menu present
 
     if (cmdLine && *cmdLine) {
@@ -7433,9 +10674,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
             bool dialogFocused =
                 (g_hwndInfo    && IsWindow(g_hwndInfo)    && (focusWnd == g_hwndInfo    || IsChild(g_hwndInfo,    focusWnd))) ||
                 (g_hwndOptions && IsWindow(g_hwndOptions) && (focusWnd == g_hwndOptions || IsChild(g_hwndOptions, focusWnd))) ||
-                (g_hwndConvert && IsWindow(g_hwndConvert) && (focusWnd == g_hwndConvert || IsChild(g_hwndConvert, focusWnd)));
+                (g_hwndConvert && IsWindow(g_hwndConvert) && (focusWnd == g_hwndConvert || IsChild(g_hwndConvert, focusWnd))) ||
+                (g_hwndDiscogs && IsWindow(g_hwndDiscogs) && (focusWnd == g_hwndDiscogs || IsChild(g_hwndDiscogs, focusWnd))) ||
+                (g_hwndRadio   && IsWindow(g_hwndRadio)   && (focusWnd == g_hwndRadio   || IsChild(g_hwndRadio,   focusWnd)));
             if (!searchFocused && !dialogFocused) {
                 WPARAM vk = msg.wParam;
+                // Ctrl+O opens folder
+                if (vk == 'O' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                    SendMessage(g_hwnd, WM_COMMAND, IDM_FILE_OPENFOLDER, 0);
+                    continue;
+                }
                 // Ctrl+F opens search
                 if (vk == 'F' && (GetKeyState(VK_CONTROL) & 0x8000)) {
                     OpenSearchDialog();
@@ -7502,6 +10750,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
         }
         if (g_hwndInfo    && IsWindow(g_hwndInfo)    && IsDialogMessage(g_hwndInfo,    &msg)) continue;
         if (g_hwndOptions && IsWindow(g_hwndOptions) && IsDialogMessage(g_hwndOptions, &msg)) continue;
+        if (g_hwndConvert && IsWindow(g_hwndConvert) && IsDialogMessage(g_hwndConvert, &msg)) continue;
+        if (g_hwndDiscogs && IsWindow(g_hwndDiscogs) && IsDialogMessage(g_hwndDiscogs, &msg)) continue;
+        if (g_hwndRadio   && IsWindow(g_hwndRadio)   && IsDialogMessage(g_hwndRadio,   &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
