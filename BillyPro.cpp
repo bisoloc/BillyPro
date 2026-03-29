@@ -1,4 +1,4 @@
-// BillyPro.cpp  -  Win32 + BASS audio player  v0.7
+// BillyPro.cpp  -  Win32 + BASS audio player  v0.8
 // Compile:
 //   cl BillyPro.cpp /W3 /O2 /link bass.lib User32.lib Gdi32.lib
 //          Comctl32.lib Shell32.lib Ole32.lib Winmm.lib Uxtheme.lib
@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <random>
 #include <map>
 #include "bass.h"
 #include "Resource.h"
@@ -255,7 +256,7 @@ static const wchar_t CLASS_NAME[] = L"BillyProWnd";
 static const wchar_t SEEK_CLASS[] = L"BillySeekBar";
 static const wchar_t VOL_CLASS[] = L"BillyVolBar";
 static const wchar_t APP_TITLE[] = L"BillyPro";
-static const wchar_t APP_VERSION[] = L"0.6";
+static const wchar_t APP_VERSION[] = L"0.8";
 
 HWND g_hwnd = NULL;
 HWND hListBox = NULL;
@@ -291,6 +292,8 @@ bool    g_mono = false;
 bool    g_normalize = false;
 wchar_t g_iniPath[MAX_PATH] = L"";
 bool    g_bassBoost = false;
+// Remember session: 0=off, 1=playlist+track only, 2=playlist+track+seek position
+int     g_rememberSession = 0;
 wchar_t g_mediaFolder[MAX_PATH] = L"";   // first folder (kept in sync with g_mediaFolders[0])
 std::vector<std::wstring> g_mediaFolders; // all configured media root folders
 bool    g_mediaActive = false;
@@ -434,6 +437,7 @@ static wchar_t g_radioStationName[256] = L"";
 static wchar_t g_radioNowPlaying[512] = L"";
 bool   g_multiInst    = false;   // allow multiple instances (default: replace session)
 bool   g_dropAppend   = true;    // drag & drop appends to playlist (false = replace)
+bool   g_dropLoadDir  = false;   // when dropping a file, load its entire parent folder
 HWND   g_hwndAssoc    = NULL;    // file associations dialog
 HWND   g_hwndOptions  = NULL;    // options dialog
 
@@ -504,6 +508,7 @@ void PlayPrev();
 void SeekToSeconds(double sec);
 void UpdateVolume();
 void LayoutControls(HWND hwnd);
+static double GetPlayPos();
 void PreloadNext();
 void SaveSettings();
 
@@ -786,12 +791,16 @@ void AddTrack(const wchar_t* path)
     }
 }
 
+static std::mt19937 g_rng(std::random_device{}());
+
 void RebuildShuffleOrder()
 {
     g_shuffleOrder.resize(g_playlist.size());
     for (size_t i = 0; i < g_shuffleOrder.size(); ++i) g_shuffleOrder[i] = (int)i;
-    for (size_t i = g_shuffleOrder.size(); i > 1; --i)
-        std::swap(g_shuffleOrder[i - 1], g_shuffleOrder[rand() % i]);
+    for (size_t i = g_shuffleOrder.size(); i > 1; --i) {
+        std::uniform_int_distribution<size_t> dist(0, i - 1);
+        std::swap(g_shuffleOrder[i - 1], g_shuffleOrder[dist(g_rng)]);
+    }
 }
 
 void LoadFolder(const wchar_t* folder)
@@ -818,13 +827,20 @@ void LoadFolder(const wchar_t* folder)
 // ============================================================
 void CALLBACK DSP_Mono(HDSP handle, DWORD channel, void* buffer, DWORD length, void* user)
 {
-    // BASS DSP buffers are always float interleaved L,R,L,R...
+    // Get actual channel count from the stream
+    BASS_CHANNELINFO ci = {};
+    BASS_ChannelGetInfo(channel, &ci);
+    int nch = ci.chans;
+    if (nch < 2) return; // already mono, nothing to do
+
     float* buf = (float*)buffer;
     DWORD floats = length / sizeof(float);
-    // Mix stereo pairs to mono
-    for (DWORD i = 0; i + 1 < floats; i += 2) {
-        float m = (buf[i] + buf[i + 1]) * 0.5f;
-        buf[i] = buf[i + 1] = m;
+    // Mix all channels to mono, write back to all channels
+    for (DWORD i = 0; i + (DWORD)nch <= floats; i += nch) {
+        float m = 0;
+        for (int c = 0; c < nch; c++) m += buf[i + c];
+        m /= nch;
+        for (int c = 0; c < nch; c++) buf[i + c] = m;
     }
 }
 
@@ -838,41 +854,37 @@ void CALLBACK DSP_BassBoost(HDSP handle, DWORD channel, void* buffer, DWORD leng
 {
     float* buf = (float*)buffer;
     DWORD floats = length / sizeof(float);
-    // Low-shelf: cutoff ~120Hz, alpha = exp(-2*pi*120/44100)
-    const float alpha = 0.9830f;
-    // How much extra bass gain to ADD (linear)
+    BASS_CHANNELINFO ci = {}; BASS_ChannelGetInfo(channel, &ci);
+    float sr = ci.freq > 0 ? (float)ci.freq : 44100.0f;
+    int nch = ci.chans > 0 ? ci.chans : 2;
+    float alpha = expf(-6.28318f * 120.0f / sr);
     float bassGain = powf(10.0f, g_bbGainDB / 20.0f) - 1.0f;
-    // Limiter constants: fast attack, slow release
-    const float limAttack = 0.001f;   // per sample attack
-    const float limRelease = 0.00001f; // per sample release
-    const float limThresh = 0.95f;    // ceiling
+    const float limAttack = 0.001f;
+    const float limRelease = 0.00001f;
+    const float limThresh = 0.95f;
 
-    for (DWORD i = 0; i + 1 < floats; i += 2) {
-        // 1. Extract bass via low-pass
+    for (DWORD i = 0; i + (DWORD)nch <= floats; i += nch) {
+        // Process L (ch0) and R (ch1 if present), pass through extra channels
         s_lpL = alpha * s_lpL + (1.0f - alpha) * buf[i];
-        s_lpR = alpha * s_lpR + (1.0f - alpha) * buf[i + 1];
-
-        // 2. Add boosted bass to original
         float outL = buf[i] + s_lpL * bassGain;
-        float outR = buf[i + 1] + s_lpR * bassGain;
-
-        // 3. True peak limiter - gain reduction based on peak of both channels
-        float peak = max(fabsf(outL), fabsf(outR));
+        float outR = outL;
+        if (nch >= 2) {
+            s_lpR = alpha * s_lpR + (1.0f - alpha) * buf[i + 1];
+            outR = buf[i + 1] + s_lpR * bassGain;
+        }
+        float peak = max(fabsf(outL), nch >= 2 ? fabsf(outR) : 0.0f);
         if (peak * s_limGain > limThresh && peak > 0.0f) {
-            // Gain reduction needed - attack
             float targetGain = limThresh / peak;
             s_limGain += (targetGain - s_limGain) * limAttack;
-            if (s_limGain > targetGain) s_limGain = targetGain; // never exceed target
-        }
-        else {
-            // Release - slowly return gain to 1.0
+            if (s_limGain > targetGain) s_limGain = targetGain;
+        } else {
             s_limGain += (1.0f - s_limGain) * limRelease;
             if (s_limGain > 1.0f) s_limGain = 1.0f;
         }
-
-        // 4. Apply gain reduction to both channels equally (keeps stereo image)
         buf[i] = outL * s_limGain;
-        buf[i + 1] = outR * s_limGain;
+        if (nch >= 2) buf[i + 1] = outR * s_limGain;
+        // Extra channels (surround) get limiter gain only
+        for (int c = 2; c < nch; c++) buf[i + c] *= s_limGain;
     }
 }
 
@@ -881,13 +893,14 @@ void CALLBACK DSP_BassBoost(HDSP handle, DWORD channel, void* buffer, DWORD leng
 // ============================================================
 
 // --- Reverb (4 comb + 2 all-pass per channel, Freeverb stereo) ---
-// R channel uses +23-sample delay offsets so L and R tails diverge even on mono input
-static const int REV_COMB_L[4] = { 1557, 1617, 1491, 1422 };
-static const int REV_COMB_R[4] = { 1580, 1640, 1514, 1445 }; // +23 Freeverb offset
-static const int REV_AP_L[2]   = { 225, 341 };
-static const int REV_AP_R[2]   = { 236, 352 };                // +11 offset
-static float g_revCombBufL[4][1700]={}, g_revCombBufR[4][1700]={};
-static float g_revApBufL[2][400]={},    g_revApBufR[2][400]={};
+// Base delay lengths at 44100 Hz — scaled at runtime for other sample rates
+static const int REV_COMB_BASE_L[4] = { 1557, 1617, 1491, 1422 };
+static const int REV_COMB_BASE_R[4] = { 1580, 1640, 1514, 1445 }; // +23 Freeverb offset
+static const int REV_AP_BASE_L[2]   = { 225, 341 };
+static const int REV_AP_BASE_R[2]   = { 236, 352 };                // +11 offset
+// Buffers sized for up to 192 kHz (max scale ~4.35x of base lengths)
+static float g_revCombBufL[4][7200]={}, g_revCombBufR[4][7200]={};
+static float g_revApBufL[2][1600]={},   g_revApBufR[2][1600]={};
 static int   g_revCombPosL[4]={}, g_revCombPosR[4]={};
 static int   g_revApPosL[2]={},   g_revApPosR[2]={};
 
@@ -895,20 +908,35 @@ void CALLBACK DSP_Reverb(HDSP handle, DWORD channel, void* buffer, DWORD length,
 {
     float* buf  = (float*)buffer;
     DWORD  n    = length / sizeof(float);
+    BASS_CHANNELINFO ci = {}; BASS_ChannelGetInfo(channel, &ci);
+    float srScale = ci.freq > 0 ? (float)ci.freq / 44100.0f : 1.0f;
+    int nch = ci.chans > 0 ? ci.chans : 2;
+
+    // Scale delay lengths by sample rate, clamped to buffer sizes
+    int combL[4], combR[4], apL[2], apR[2];
+    for (int c = 0; c < 4; c++) {
+        combL[c] = min((int)(REV_COMB_BASE_L[c] * srScale), 7199);
+        combR[c] = min((int)(REV_COMB_BASE_R[c] * srScale), 7199);
+    }
+    for (int a = 0; a < 2; a++) {
+        apL[a] = min((int)(REV_AP_BASE_L[a] * srScale), 1599);
+        apR[a] = min((int)(REV_AP_BASE_R[a] * srScale), 1599);
+    }
+
     float wet    = g_revMix   / 100.0f;
-    float fb     = 0.50f + (g_revRoom  / 100.0f) * 0.46f;  // 0.50-0.96
-    float wscale = g_revWidth / 200.0f;   // 0-0.5 for width matrix
+    float fb     = 0.50f + (g_revRoom  / 100.0f) * 0.46f;
+    float wscale = g_revWidth / 200.0f;
     float dry    = 1.0f - wet;
-    for (DWORD i = 0; i + 1 < n; i += 2) {
-        float inL = buf[i], inR = buf[i + 1];
+    for (DWORD i = 0; i + (DWORD)nch <= n; i += nch) {
+        float inL = buf[i], inR = (nch >= 2) ? buf[i + 1] : buf[i];
         float outL = 0, outR = 0;
         for (int c = 0; c < 4; c++) {
             float dL = g_revCombBufL[c][g_revCombPosL[c]];
             float dR = g_revCombBufR[c][g_revCombPosR[c]];
             g_revCombBufL[c][g_revCombPosL[c]] = inL + dL * fb;
             g_revCombBufR[c][g_revCombPosR[c]] = inR + dR * fb;
-            if (++g_revCombPosL[c] >= REV_COMB_L[c]) g_revCombPosL[c] = 0;
-            if (++g_revCombPosR[c] >= REV_COMB_R[c]) g_revCombPosR[c] = 0;
+            if (++g_revCombPosL[c] >= combL[c]) g_revCombPosL[c] = 0;
+            if (++g_revCombPosR[c] >= combR[c]) g_revCombPosR[c] = 0;
             outL += dL; outR += dR;
         }
         outL *= 0.25f; outR *= 0.25f;
@@ -917,16 +945,16 @@ void CALLBACK DSP_Reverb(HDSP handle, DWORD channel, void* buffer, DWORD length,
             float dR = g_revApBufR[a][g_revApPosR[a]];
             g_revApBufL[a][g_revApPosL[a]] = outL + dL * 0.5f;
             g_revApBufR[a][g_revApPosR[a]] = outR + dR * 0.5f;
-            if (++g_revApPosL[a] >= REV_AP_L[a]) g_revApPosL[a] = 0;
-            if (++g_revApPosR[a] >= REV_AP_R[a]) g_revApPosR[a] = 0;
+            if (++g_revApPosL[a] >= apL[a]) g_revApPosL[a] = 0;
+            if (++g_revApPosR[a] >= apR[a]) g_revApPosR[a] = 0;
             outL = dL - outL * 0.5f;
             outR = dR - outR * 0.5f;
         }
-        // Width matrix: 0=mono reverb, 100=full L/R separation (great for mono→stereo)
         float wL = outL * (0.5f + wscale) + outR * (0.5f - wscale);
         float wR = outR * (0.5f + wscale) + outL * (0.5f - wscale);
-        buf[i]     = dry * inL + wet * wL;
-        buf[i + 1] = dry * inR + wet * wR;
+        buf[i] = dry * inL + wet * wL;
+        if (nch >= 2) buf[i + 1] = dry * inR + wet * wR;
+        // Extra channels pass through unchanged
     }
 }
 
@@ -939,25 +967,28 @@ void CALLBACK DSP_Saturate(HDSP handle, DWORD channel, void* buffer, DWORD lengt
     float* buf  = (float*)buffer;
     DWORD  n    = length / sizeof(float);
     float drive = g_satDrive;
-    float wet   = (g_satLevel / 100.0f) * 0.35f;  // full wet for highs
+    float wet   = (g_satLevel / 100.0f) * 0.35f;
     float dry   = 1.0f - wet;
-    // 1-pole LP at 200 Hz — splits bass from mids/highs
-    const float lpA = expf(-6.28318f * 200.0f / 44100.0f);  // ~0.972
-    for (DWORD i = 0; i + 1 < n; i += 2) {
-        float inL = buf[i], inR = buf[i + 1];
-        // Low band (under 200 Hz)
+    BASS_CHANNELINFO ci = {}; BASS_ChannelGetInfo(channel, &ci);
+    float sr = ci.freq > 0 ? (float)ci.freq : 44100.0f;
+    int nch = ci.chans > 0 ? ci.chans : 2;
+    const float lpA = expf(-6.28318f * 200.0f / sr);
+    for (DWORD i = 0; i + (DWORD)nch <= n; i += nch) {
+        float inL = buf[i], inR = (nch >= 2) ? buf[i + 1] : buf[i];
         g_satLpL = lpA * g_satLpL + (1.0f - lpA) * inL;
-        g_satLpR = lpA * g_satLpR + (1.0f - lpA) * inR;
-        float loL = g_satLpL, loR = g_satLpR;
-        // High band (200 Hz and up)
-        float hiL = inL - loL, hiR = inR - loR;
-        // Saturate high band normally, low band at only 5%
+        float loL = g_satLpL;
+        float hiL = inL - loL;
         float satHiL = hiL * drive; satHiL = satHiL / (1.0f + fabsf(satHiL));
-        float satHiR = hiR * drive; satHiR = satHiR / (1.0f + fabsf(satHiR));
         float satLoL = loL * drive; satLoL = satLoL / (1.0f + fabsf(satLoL));
-        float satLoR = loR * drive; satLoR = satLoR / (1.0f + fabsf(satLoR));
-        buf[i]     = (hiL * dry + satHiL * wet) + (loL * 0.95f + satLoL * 0.05f);
-        buf[i + 1] = (hiR * dry + satHiR * wet) + (loR * 0.95f + satLoR * 0.05f);
+        buf[i] = (hiL * dry + satHiL * wet) + (loL * 0.95f + satLoL * 0.05f);
+        if (nch >= 2) {
+            g_satLpR = lpA * g_satLpR + (1.0f - lpA) * inR;
+            float loR = g_satLpR, hiR = inR - loR;
+            float satHiR = hiR * drive; satHiR = satHiR / (1.0f + fabsf(satHiR));
+            float satLoR = loR * drive; satLoR = satLoR / (1.0f + fabsf(satLoR));
+            buf[i + 1] = (hiR * dry + satHiR * wet) + (loR * 0.95f + satLoR * 0.05f);
+        }
+        // Extra channels pass through unchanged
     }
 }
 
@@ -981,24 +1012,36 @@ void CALLBACK DSP_Vinyl(HDSP handle, DWORD channel, void* buffer, DWORD length, 
     float* buf = (float*)buffer;
     DWORD  n   = length / sizeof(float);
 
+    BASS_CHANNELINFO ci = {}; BASS_ChannelGetInfo(channel, &ci);
+    float sr = ci.freq > 0 ? (float)ci.freq : 44100.0f;
+
     float freq       = max(500.0f, min(20000.0f, g_vinLpFreq));
-    float alpha      = expf(-6.28318f * freq / 44100.0f);
+    float alpha      = expf(-6.28318f * freq / sr);
     float crackScale = g_vinCrackle / 100.0f;
     // Surface hiss amplitude: subtle baseline + crackle-scaled component
     float hissAmp    = 0.0003f + crackScale * 0.0018f;
     // Hiss LP alpha: ~5 kHz rolloff for warm surface noise character
-    const float hA   = expf(-6.28318f * 5000.0f / 44100.0f);
+    const float hA   = expf(-6.28318f * 5000.0f / sr);
 
-    for (DWORD i = 0; i + 1 < n; i += 2) {
+    int nch = ci.chans > 0 ? ci.chans : 2;
+    for (DWORD i = 0; i + (DWORD)nch <= n; i += nch) {
         // HF roll-off on signal
         g_vinLpL = alpha * g_vinLpL + (1.0f - alpha) * buf[i];
-        g_vinLpR = alpha * g_vinLpR + (1.0f - alpha) * buf[i + 1];
-        buf[i]     = g_vinLpL;
-        buf[i + 1] = g_vinLpR;
+        buf[i] = g_vinLpL;
+        if (nch >= 2) {
+            g_vinLpR = alpha * g_vinLpR + (1.0f - alpha) * buf[i + 1];
+            buf[i + 1] = g_vinLpR;
+        }
 
-        // ── M-S stereo field ──────────────────────────────────────────────
-        float mid  = (buf[i] + buf[i + 1]) * 0.5f;
-        float side = (buf[i] - buf[i + 1]) * 0.5f;
+        // ── M-S stereo field (stereo only; mono skips side processing) ───
+        float mid, side;
+        if (nch >= 2) {
+            mid  = (buf[i] + buf[i + 1]) * 0.5f;
+            side = (buf[i] - buf[i + 1]) * 0.5f;
+        } else {
+            mid = buf[i];
+            side = 0;
+        }
 
         // Gentle saturation on mid (warm mono core, like a slightly overdriven tube)
         mid = mid / (1.0f + fabsf(mid) * 0.5f) * 1.08f;
@@ -1006,7 +1049,7 @@ void CALLBACK DSP_Vinyl(HDSP handle, DWORD channel, void* buffer, DWORD length, 
         // Barely noticeable pitch wobble on mid — slow warble like an old turntable
         g_vinMidBuf[g_vinMidPos] = mid;
         float midLfo = sinf(g_vinMidLFO * 6.28318f);
-        g_vinMidLFO += 0.6f / 44100.0f;    // 0.6 Hz — slow wow, more noticeable
+        g_vinMidLFO += 0.6f / sr;    // 0.6 Hz — slow wow, more noticeable
         if (g_vinMidLFO >= 1.0f) g_vinMidLFO -= 1.0f;
         float midDelay = 20.0f + midLfo * 18.0f;  // wider sweep, more pitch movement
         int   md0  = (int)midDelay;
@@ -1019,7 +1062,7 @@ void CALLBACK DSP_Vinyl(HDSP handle, DWORD channel, void* buffer, DWORD length, 
         // Subtle chorus on side channel only (~2% depth, barely noticeable)
         g_vinChorusBuf[g_vinChorusPos] = side;
         float lfo = sinf(g_vinChorusLFO * 6.28318f);
-        g_vinChorusLFO += 0.35f / 44100.0f;   // 0.35 Hz LFO rate
+        g_vinChorusLFO += 0.35f / sr;   // 0.35 Hz LFO rate
         if (g_vinChorusLFO >= 1.0f) g_vinChorusLFO -= 1.0f;
         float delaySmp = 485.0f + lfo * 88.0f;  // ~11ms base ± 2ms depth
         int   d0   = (int)delaySmp;
@@ -1030,18 +1073,20 @@ void CALLBACK DSP_Vinyl(HDSP handle, DWORD channel, void* buffer, DWORD length, 
         g_vinChorusPos = (g_vinChorusPos + 1) & 1023;
         side = side * 0.90f + chorSide * 0.10f;  // 10% wet
 
-        // Reconstruct L/R
-        buf[i]     = mid + side;
-        buf[i + 1] = mid - side;
+        // Reconstruct L/R (or write mono)
+        buf[i] = mid + side;
+        if (nch >= 2) buf[i + 1] = mid - side;
 
         if (crackScale > 0.0f) {
             // Surface hiss: independent L/R noise through warm LP
             float nL = ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
-            float nR = ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
             g_vinHissL = hA * g_vinHissL + (1.0f - hA) * nL;
-            g_vinHissR = hA * g_vinHissR + (1.0f - hA) * nR;
-            buf[i]     += g_vinHissL * hissAmp;
-            buf[i + 1] += g_vinHissR * hissAmp;
+            buf[i] += g_vinHissL * hissAmp;
+            if (nch >= 2) {
+                float nR = ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+                g_vinHissR = hA * g_vinHissR + (1.0f - hA) * nR;
+                buf[i + 1] += g_vinHissR * hissAmp;
+            }
 
             // Crackle/pop envelope decay
             g_vinCrackEnvL *= g_vinCrackDecay;
@@ -1049,20 +1094,20 @@ void CALLBACK DSP_Vinyl(HDSP handle, DWORD channel, void* buffer, DWORD length, 
 
             // Apply crackle with warm soft-clip (removes harsh transient edge)
             float cL = g_vinCrackEnvL, cR = g_vinCrackEnvR;
-            buf[i]     += cL / (1.0f + fabsf(cL) * 6.0f);
-            buf[i + 1] += cR / (1.0f + fabsf(cR) * 6.0f);
+            buf[i] += cL / (1.0f + fabsf(cL) * 6.0f);
+            if (nch >= 2) buf[i + 1] += cR / (1.0f + fabsf(cR) * 6.0f);
 
             // Schedule next crackle event
             if (g_vinCrackTimer == 0) {
                 // Interval: sparse at low crackle, denser at high — with wide randomness
-                DWORD baseInt = (DWORD)(44100.0f * 1.8f / max(0.01f, crackScale));
+                DWORD baseInt = (DWORD)(sr * 1.8f / max(0.01f, crackScale));
                 g_vinCrackTimer = baseInt / 3 + (DWORD)(rand() % (baseInt * 2 + 1));
 
                 // Amplitude varies per pop
                 float amp = crackScale * (0.03f + (rand() % 90) * 0.001f);
 
                 // Decay time: 20-100ms so crackles fade naturally, not click
-                int decaySmp = 880 + rand() % 3530;  // 20ms to 100ms @ 44100
+                int decaySmp = (int)(sr * 0.02f) + rand() % (int)(sr * 0.08f + 1);  // 20ms to 100ms
                 g_vinCrackDecay = expf(-1.0f / (float)decaySmp);
 
                 // Side pop: one channel dominant, other gets warm bleed
@@ -1088,47 +1133,57 @@ void CALLBACK DSP_Hifi(HDSP handle, DWORD channel, void* buffer, DWORD length, v
 {
     float* buf = (float*)buffer;
     DWORD  n   = length / sizeof(float);
-    const float alpha   = 0.9888f;   // 1-pole LP ~80 Hz @ 44100 Hz (fixed shelf freq)
-    float bassAdd = (powf(10.0f, g_hfiBassDb / 20.0f) - 1.0f);  // linear gain to add
-    float warmth  = (g_hfiWarmth / 100.0f) * 0.8f;               // 0-0.8 soft-clip coeff
-    for (DWORD i = 0; i + 1 < n; i += 2) {
-        float inL = buf[i], inR = buf[i + 1];
+    BASS_CHANNELINFO ci = {}; BASS_ChannelGetInfo(channel, &ci);
+    float sr = ci.freq > 0 ? (float)ci.freq : 44100.0f;
+    float alpha = expf(-6.28318f * 80.0f / sr);   // 1-pole LP ~80 Hz shelf
+    int nch = ci.chans > 0 ? ci.chans : 2;
+    float bassAdd = (powf(10.0f, g_hfiBassDb / 20.0f) - 1.0f);
+    float warmth  = (g_hfiWarmth / 100.0f) * 0.8f;
+    for (DWORD i = 0; i + (DWORD)nch <= n; i += nch) {
+        float inL = buf[i];
         g_hfiBssL = alpha * g_hfiBssL + (1.0f - alpha) * inL;
-        g_hfiBssR = alpha * g_hfiBssR + (1.0f - alpha) * inR;
         float outL = inL + g_hfiBssL * bassAdd;
-        float outR = inR + g_hfiBssR * bassAdd;
-        if (warmth > 0.0f) {
-            buf[i]     = outL / (1.0f + fabsf(outL) * warmth);
-            buf[i + 1] = outR / (1.0f + fabsf(outR) * warmth);
-        } else {
-            buf[i]     = outL;
-            buf[i + 1] = outR;
+        buf[i] = warmth > 0.0f ? outL / (1.0f + fabsf(outL) * warmth) : outL;
+        if (nch >= 2) {
+            float inR = buf[i + 1];
+            g_hfiBssR = alpha * g_hfiBssR + (1.0f - alpha) * inR;
+            float outR = inR + g_hfiBssR * bassAdd;
+            buf[i + 1] = warmth > 0.0f ? outR / (1.0f + fabsf(outR) * warmth) : outR;
         }
+        // Extra channels pass through unchanged
     }
 }
 
 // --- Recording: real-time FLAC encoding via libFLAC stream encoder ---
 static FLAC__StreamEncoder* g_recEncoder = NULL;
+// Pre-allocated conversion buffer — avoids heap allocation on every DSP callback
+static FLAC__int32* g_recPcmBuf = NULL;
+static DWORD        g_recPcmCap = 0;  // capacity in FLAC__int32 elements
 
 void CALLBACK DSP_Record(HDSP handle, DWORD channel, void* buffer, DWORD length, void* user)
 {
     if (!g_recording || !g_recEncoder || length == 0) return;
     float* buf = (float*)buffer;
     DWORD floats = length / sizeof(float);
-    // Get channel count from encoder
     BASS_CHANNELINFO ci = {};
     BASS_ChannelGetInfo(channel, &ci);
     int nch = ci.chans > 0 ? ci.chans : 2;
     DWORD frames = floats / nch;
+    // Grow pre-allocated buffer if needed (rare — typically once on first callback)
+    if (floats > g_recPcmCap) {
+        free(g_recPcmBuf);
+        g_recPcmCap = floats + 1024;  // slight over-alloc to avoid repeated resizes
+        g_recPcmBuf = (FLAC__int32*)malloc(g_recPcmCap * sizeof(FLAC__int32));
+        if (!g_recPcmBuf) { g_recPcmCap = 0; return; }
+    }
     // Convert float [-1,1] to 32-bit int for FLAC (using 16-bit depth, stored in int32)
-    std::vector<FLAC__int32> pcm(floats);
     for (DWORD i = 0; i < floats; i++) {
         float s = buf[i];
         if (s > 1.0f) s = 1.0f; if (s < -1.0f) s = -1.0f;
-        pcm[i] = (FLAC__int32)(s * 32767.0f);
+        g_recPcmBuf[i] = (FLAC__int32)(s * 32767.0f);
     }
-    FLAC__stream_encoder_process_interleaved(g_recEncoder, pcm.data(), frames);
-    g_recBytesIn += (ULONGLONG)frames * nch * 2; // 16-bit PCM bytes fed
+    FLAC__stream_encoder_process_interleaved(g_recEncoder, g_recPcmBuf, frames);
+    g_recBytesIn += (ULONGLONG)frames * nch * 2;
 }
 
 static void StartRecording()
@@ -1186,11 +1241,11 @@ static void StartRecording()
 
     // Convert path to UTF-8 for libFLAC
     int uLen = WideCharToMultiByte(CP_UTF8, 0, savePath, -1, NULL, 0, NULL, NULL);
-    std::string u8path(uLen, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, savePath, -1, &u8path[0], uLen, NULL, NULL);
+    std::vector<char> u8buf(uLen > 0 ? uLen : 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, savePath, -1, u8buf.data(), uLen, NULL, NULL);
 
     FLAC__StreamEncoderInitStatus initStatus = FLAC__stream_encoder_init_file(
-        g_recEncoder, u8path.c_str(), NULL, NULL);
+        g_recEncoder, u8buf.data(), NULL, NULL);
     if (initStatus != FLAC__STREAM_ENCODER_INIT_STATUS_OK) {
         FLAC__stream_encoder_delete(g_recEncoder); g_recEncoder = NULL;
         MessageBox(g_hwnd, L"Failed to init FLAC encoder.", L"Record", MB_ICONERROR);
@@ -1217,6 +1272,8 @@ static void StopRecording()
         FLAC__stream_encoder_delete(g_recEncoder);
         g_recEncoder = NULL;
     }
+    // Free pre-allocated conversion buffer
+    if (g_recPcmBuf) { free(g_recPcmBuf); g_recPcmBuf = NULL; g_recPcmCap = 0; }
     if (hRecordBtn) InvalidateRect(hRecordBtn, NULL, TRUE);
     if (hTimeRemain) SetWindowText(hTimeRemain, L"");
     // Restore normal label width
@@ -1664,6 +1721,7 @@ void SaveSettings()
     swprintf_s(buf, L"%d", g_modernSize);      WritePrivateProfileString(L"UI", L"ModernSize",    buf, g_iniPath);
     swprintf_s(buf, L"%d", (int)g_multiInst);  WritePrivateProfileString(L"UI", L"MultiInstance", buf, g_iniPath);
     swprintf_s(buf, L"%d", (int)g_dropAppend); WritePrivateProfileString(L"UI", L"DropAppend",    buf, g_iniPath);
+    swprintf_s(buf, L"%d", (int)g_dropLoadDir); WritePrivateProfileString(L"UI", L"DropLoadDir",  buf, g_iniPath);
     swprintf_s(buf, L"%d", (int)g_shuffle);    WritePrivateProfileString(L"UI", L"Shuffle",       buf, g_iniPath);
     swprintf_s(buf, L"%d", g_repeatMode);       WritePrivateProfileString(L"UI", L"RepeatMode",    buf, g_iniPath);
     swprintf_s(buf, L"%.1f", g_seekStep);      WritePrivateProfileString(L"UI", L"SeekStep",      buf, g_iniPath);
@@ -1682,6 +1740,7 @@ void SaveSettings()
         swprintf_s(buf, L"%.3f", currentVolume);
         WritePrivateProfileString(L"UI", L"Volume", buf, g_iniPath);
     }
+    swprintf_s(buf, L"%d", g_rememberSession); WritePrivateProfileString(L"UI", L"RememberSession", buf, g_iniPath);
 }
 
 void LoadSettings()
@@ -1718,6 +1777,7 @@ void LoadSettings()
     g_modernSize = max(0, min(2, GETI(L"UI", L"ModernSize", 0)));
     g_multiInst  = GETI(L"UI", L"MultiInstance", 0) != 0;
     g_dropAppend = GETI(L"UI", L"DropAppend",    1) != 0;
+    g_dropLoadDir = GETI(L"UI", L"DropLoadDir", 0) != 0;
     g_shuffle    = GETI(L"UI", L"Shuffle",       0) != 0;
     g_repeatMode = GETI(L"UI", L"RepeatMode",    0);
     if (g_repeatMode < 0 || g_repeatMode > 2) g_repeatMode = 0;
@@ -1755,10 +1815,128 @@ void LoadSettings()
         float vol = GETF(L"UI", L"Volume", 0.8f);
         currentVolume = max(0.0f, min(1.0f, vol));
     }
+    g_rememberSession = GETI(L"UI", L"RememberSession", 0);
+    if (g_rememberSession < 0 || g_rememberSession > 2) g_rememberSession = 0;
 #undef GETI
 #undef GETF
 }
 
+// ============================================================
+//  Session save / restore (remember playlist on exit)
+//  Writes a simple text file: line 1 = track index, line 2 = seek seconds,
+//  remaining lines = file paths.  Stored next to the INI.
+// ============================================================
+static void GetSessionPath(wchar_t* out, size_t n)
+{
+    GetIniPath();
+    wcsncpy_s(out, n, g_iniPath, _TRUNCATE);
+    wchar_t* dot = wcsrchr(out, L'.');
+    if (dot) wcscpy_s(dot, n - (dot - out), L".session");
+    else     wcscat_s(out, n, L".session");
+}
+
+static void SaveSession()
+{
+    if (g_rememberSession == 0) return;
+    wchar_t sessPath[MAX_PATH];
+    GetSessionPath(sessPath, MAX_PATH);
+    FILE* f = _wfopen(sessPath, L"w,ccs=UTF-8");
+    if (!f) return;
+    // Line 1: current track index
+    fwprintf(f, L"%d\n", g_currentIndex);
+    // Line 2: seek position in seconds (0 if mode 1)
+    double pos = (g_rememberSession >= 2 && currentStream) ? GetPlayPos() : 0.0;
+    fwprintf(f, L"%.3f\n", pos);
+    // Remaining lines: path<TAB>display per track (TAB separates path from display name)
+    for (auto& t : g_playlist)
+        fwprintf(f, L"%s\t%s\n", t.path, t.display);
+    fclose(f);
+}
+
+static bool RestoreSession()
+{
+    if (g_rememberSession == 0) return false;
+    wchar_t sessPath[MAX_PATH];
+    GetSessionPath(sessPath, MAX_PATH);
+    FILE* f = _wfopen(sessPath, L"r,ccs=UTF-8");
+    if (!f) return false;
+    wchar_t line[MAX_PATH * 2];
+    // Line 1: track index
+    if (!fgetws(line, _countof(line), f)) { fclose(f); return false; }
+    int savedIdx = _wtoi(line);
+    // Line 2: seek position
+    if (!fgetws(line, _countof(line), f)) { fclose(f); return false; }
+    double savedPos = _wtof(line);
+    // Remaining lines: path<TAB>display per track
+    struct SessEntry { std::wstring path, display; };
+    std::vector<SessEntry> entries;
+    while (fgetws(line, _countof(line), f)) {
+        int len = (int)wcslen(line);
+        while (len > 0 && (line[len-1] == L'\n' || line[len-1] == L'\r')) line[--len] = 0;
+        if (len == 0) continue;
+        // Split on first TAB — if no tab, treat entire line as path (backward compat)
+        wchar_t* tab = wcschr(line, L'\t');
+        SessEntry e;
+        if (tab) {
+            *tab = 0;
+            e.path = line;
+            e.display = tab + 1;
+        } else {
+            e.path = line;
+        }
+        entries.push_back(e);
+    }
+    fclose(f);
+    if (entries.empty()) return false;
+    // Rebuild playlist — accept both local files and URLs (radio streams)
+    ClearPlaylist();
+    for (auto& e : entries) {
+        bool isUrl = (_wcsnicmp(e.path.c_str(), L"http://", 7) == 0 || _wcsnicmp(e.path.c_str(), L"https://", 8) == 0);
+        if (isUrl || GetFileAttributesW(e.path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            Track t = {};
+            wcsncpy_s(t.path, e.path.c_str(), _TRUNCATE);
+            // Use saved display name if available, otherwise derive from path
+            if (!e.display.empty())
+                wcsncpy_s(t.display, e.display.c_str(), _TRUNCATE);
+            else
+                wcsncpy_s(t.display, Filename(t.path), _TRUNCATE);
+            g_playlist.push_back(t);
+            if (hListBox)
+                SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)t.display);
+        }
+    }
+    RebuildShuffleOrder();
+    if (g_playlist.empty()) return false;
+    // Clamp saved index
+    if (savedIdx < 0) savedIdx = 0;
+    if (savedIdx >= (int)g_playlist.size()) savedIdx = (int)g_playlist.size() - 1;
+    g_currentIndex = savedIdx;
+    SendMessage(hListBox, LB_SETSEL, FALSE, (LPARAM)-1);
+    SendMessage(hListBox, LB_SETSEL, TRUE, savedIdx);
+    SendMessage(hListBox, LB_SETCURSEL, savedIdx, 0);
+    SendMessage(hListBox, LB_SETTOPINDEX, max(0, savedIdx - 3), 0);
+    // Check if the selected track is a URL (radio) — don't auto-play or seek URLs
+    bool selectedIsUrl = (_wcsnicmp(g_playlist[savedIdx].path, L"http://", 7) == 0 ||
+                          _wcsnicmp(g_playlist[savedIdx].path, L"https://", 8) == 0);
+    if (!selectedIsUrl) {
+        // Open the track paused (never auto-play)
+        PlayIndex(savedIdx);
+        if (currentStream) {
+            BASS_ChannelPause(currentStream);
+            KillTimer(g_hwnd, IDT_PLAYBACK);
+            // Seek to saved position if mode 2
+            if (g_rememberSession >= 2 && savedPos > 0.5)
+                SeekToSeconds(savedPos);
+            UpdatePlayBtn();
+            UpdateStatusBar();
+        }
+    }
+    // For URLs: just show the playlist, user can double-click to play
+    RefreshListboxStars();
+    UpdateStatusBar();
+    UpdateWindowTitle();
+    return true;
+}
 
 // ============================================================
 //  M3U Playlist save / load
@@ -1802,13 +1980,37 @@ static void LoadM3UFromPath(const wchar_t* path, bool append = false)
     FILE* f = nullptr; _wfopen_s(&f, path, L"r,ccs=UTF-8");
     if (!f) return;
     if (!append) ClearPlaylist();
+    // Extract M3U directory for resolving relative paths
+    wchar_t m3uDir[MAX_PATH] = {};
+    wcsncpy_s(m3uDir, path, _TRUNCATE);
+    wchar_t* sep = wcsrchr(m3uDir, L'\\');
+    if (!sep) sep = wcsrchr(m3uDir, L'/');
+    if (sep) sep[1] = 0; else m3uDir[0] = 0;
+
     wchar_t line[MAX_PATH * 2];
     while (fgetws(line, _countof(line), f)) {
         int len = (int)wcslen(line);
         while (len > 0 && (line[len-1] == L'\r' || line[len-1] == L'\n')) line[--len] = 0;
         if (len == 0 || line[0] == L'#') continue;
-        if (GetFileAttributesW(line) != INVALID_FILE_ATTRIBUTES && IsAudio(line))
+        // URLs (http/https) — add directly
+        if (_wcsnicmp(line, L"http://", 7) == 0 || _wcsnicmp(line, L"https://", 8) == 0) {
             AddTrack(line);
+            continue;
+        }
+        // Try as absolute path first
+        if (GetFileAttributesW(line) != INVALID_FILE_ATTRIBUTES && IsAudio(line)) {
+            AddTrack(line);
+            continue;
+        }
+        // Try as relative path resolved against the M3U directory
+        if (m3uDir[0] && line[0] != L'\\' && !(len >= 2 && line[1] == L':')) {
+            wchar_t resolved[MAX_PATH];
+            _snwprintf_s(resolved, MAX_PATH, _TRUNCATE, L"%s%s", m3uDir, line);
+            if (GetFileAttributesW(resolved) != INVALID_FILE_ATTRIBUTES && IsAudio(resolved)) {
+                AddTrack(resolved);
+                continue;
+            }
+        }
     }
     fclose(f);
     RebuildShuffleOrder();
@@ -1832,8 +2034,15 @@ static void LoadPlaylistM3U(HWND hwndParent)
 }
 
 // Scan peak for normalization on any file path (returns peak level)
+// Caches the last result to avoid rescanning the same file repeatedly
+static wchar_t s_peakCachePath[MAX_PATH] = {};
+static float   s_peakCacheVal = 0.001f;
+
 static float ScanPeak(const wchar_t* path)
 {
+    if (s_peakCachePath[0] && _wcsicmp(path, s_peakCachePath) == 0)
+        return s_peakCacheVal;
+
     float peak = 0.001f;
     HSTREAM scan = BASS_StreamCreateFile(FALSE, path, 0, 0,
         BASS_UNICODE | BASS_STREAM_DECODE | BASS_SAMPLE_FLOAT);
@@ -1850,6 +2059,8 @@ static float ScanPeak(const wchar_t* path)
         }
         BASS_StreamFree(scan);
     }
+    wcsncpy_s(s_peakCachePath, path, _TRUNCATE);
+    s_peakCacheVal = peak;
     return peak;
 }
 
@@ -1880,6 +2091,9 @@ void ApplyDSP()
         float normScale = 1.0f / peak;
         if (normScale > 4.0f) normScale = 4.0f;
         BASS_ChannelSetAttribute(g_decStream, BASS_ATTRIB_VOL, normScale);
+    } else if (g_decStream) {
+        // Reset decode stream volume when normalize is off
+        BASS_ChannelSetAttribute(g_decStream, BASS_ATTRIB_VOL, 1.0f);
     }
     BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_VOL, currentVolume);
 }
@@ -1889,16 +2103,14 @@ void ApplyDSP()
 // ============================================================
 void ApplyPitch()
 {
-    if (!currentStream) return;
+    if (!currentStream || g_masterFreq == 0) return;
     if (g_pitchEnabled && g_pitchSemitones != 0.0f) {
-        BASS_CHANNELINFO ci = {};
-        BASS_ChannelGetInfo(currentStream, &ci);
-        float origFreq = (float)ci.freq;
-        float newFreq  = origFreq * (float)pow(2.0, g_pitchSemitones / 12.0);
+        // Always calculate from the stored base frequency, never from the
+        // current (possibly already pitched) stream frequency
+        float newFreq = (float)g_masterFreq * (float)pow(2.0, g_pitchSemitones / 12.0);
         BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_FREQ, newFreq);
     } else {
-        // Reset to default (0 = original freq)
-        BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_FREQ, 0);
+        BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_FREQ, (float)g_masterFreq);
     }
 }
 
@@ -1941,7 +2153,8 @@ void StopAudio()
         g_radioStationName[0] = L'\0';
         g_radioNowPlaying[0] = L'\0';
     }
-    // Free decode streams first (before master, since GaplessProc reads them)
+    // Lock the master stream so GaplessProc can't read decode streams while we free them
+    if (currentStream) BASS_ChannelLock(currentStream, TRUE);
     g_dcaDec = nullptr;
     g_dcaDecNext = nullptr;
     g_lastDcaDec = nullptr;
@@ -1959,6 +2172,7 @@ void StopAudio()
     g_decNextIdx = -1;
     if (g_decStream) { BASS_StreamFree(g_decStream); g_decStream = 0; }
     if (currentStream) {
+        BASS_ChannelLock(currentStream, FALSE);
         BASS_ChannelStop(currentStream);
         BASS_StreamFree(currentStream);
         currentStream = 0;
@@ -2367,8 +2581,16 @@ void DcaSeek(double sec)
     if (frac < 0) frac = 0; if (frac > 1) frac = 1;
     int64_t byteOff = (int64_t)(frac * d->dataSize);
 
-    // Seek to that position and scan for next sync word
+    // Seek to that position
     _fseeki64(d->fp, d->dataOffset + byteOff, SEEK_SET);
+
+    // Scan forward to find the next valid DTS sync word so we don't
+    // land in the middle of a frame (which would produce noise/errors)
+    int64_t remaining = d->dataSize - byteOff;
+    if (remaining > 0 && !DcaScanSync(d->fp, min(remaining, (int64_t)65536))) {
+        // If no sync found, rewind to start of data as fallback
+        _fseeki64(d->fp, d->dataOffset, SEEK_SET);
+    }
 
     // Reset decoder state
     dcadec_context_clear(d->ctx);
@@ -6446,10 +6668,10 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 const wchar_t* fext = wcsrchr(s_filePath, L'.');
                 if (fext && _wcsicmp(fext, L".flac") == 0) {
                     int uLen = WideCharToMultiByte(CP_UTF8, 0, s_filePath, -1, NULL, 0, NULL, NULL);
-                    std::string u8path(uLen, '\0');
-                    WideCharToMultiByte(CP_UTF8, 0, s_filePath, -1, &u8path[0], uLen, NULL, NULL);
+                    std::vector<char> u8buf(uLen > 0 ? uLen : 1, '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, s_filePath, -1, u8buf.data(), uLen, NULL, NULL);
                     FLAC__Metadata_Chain* fc = FLAC__metadata_chain_new();
-                    if (fc && FLAC__metadata_chain_read(fc, u8path.c_str())) {
+                    if (fc && FLAC__metadata_chain_read(fc, u8buf.data())) {
                         FLAC__Metadata_Iterator* fi = FLAC__metadata_iterator_new();
                         if (fi) {
                             FLAC__metadata_iterator_init(fi, fc);
@@ -8032,6 +8254,10 @@ static void SmtcCleanup()
 #define ID_OPT_VIN_CRACK     649
 #define ID_OPT_HFI_BASS      650
 #define ID_OPT_HFI_WARM      651
+#define ID_OPT_SESSION_OFF    655
+#define ID_OPT_SESSION_TRACK  656
+#define ID_OPT_SESSION_SEEK   657
+#define ID_OPT_DROP_LOADDIR   658
 
 static HWND s_optPanels[6] = {};
 static int  s_optPage = 0;
@@ -8185,11 +8411,23 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 edt(p, 174, 160, 50, 20, ID_OPT_SEEK_STEP, sbuf);
             }
 
-            grp(p, 0, 190, w, 68, L"Drag && Drop");
-            rad(p, 10, 208, w - 20, 20, ID_OPT_DROP_APPEND,
+            grp(p, 0, 190, w, 90, L"Drag && Drop");
+            { HWND h = rad(p, 10, 208, w - 20, 20, ID_OPT_DROP_APPEND,
                 L"Add dropped files to current playlist", g_dropAppend);
+              SetWindowLongPtr(h, GWL_STYLE, GetWindowLongPtr(h, GWL_STYLE) | WS_GROUP); }
             rad(p, 10, 228, w - 20, 20, ID_OPT_DROP_REPLACE,
                 L"Replace playlist with dropped files", !g_dropAppend);
+            chk(p, 10, 250, w - 20, 20, ID_OPT_DROP_LOADDIR,
+                L"Load entire folder when dropping a file", g_dropLoadDir);
+
+            grp(p, 0, 290, w, 92, L"Remember Session");
+            { HWND h = rad(p, 10, 308, w - 20, 20, ID_OPT_SESSION_OFF,
+                L"Don't remember (default)", g_rememberSession == 0);
+              SetWindowLongPtr(h, GWL_STYLE, GetWindowLongPtr(h, GWL_STYLE) | WS_GROUP); }
+            rad(p, 10, 328, w - 20, 20, ID_OPT_SESSION_TRACK,
+                L"Remember playlist and track", g_rememberSession == 1);
+            rad(p, 10, 348, w - 20, 20, ID_OPT_SESSION_SEEK,
+                L"Remember playlist, track and seek position", g_rememberSession == 2);
         }
 
         // ── Page 1: Display ───────────────────────────────────────────────
@@ -8552,8 +8790,16 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             // Setup page
             g_multiInst  = (SendMessage(GetDlgItem(s_optPanels[0], ID_OPT_MULTIINST),    BM_GETCHECK,0,0)==BST_CHECKED);
             g_dropAppend = (SendMessage(GetDlgItem(s_optPanels[0], ID_OPT_DROP_APPEND),  BM_GETCHECK,0,0)==BST_CHECKED);
+            g_dropLoadDir = (SendMessage(GetDlgItem(s_optPanels[0], ID_OPT_DROP_LOADDIR), BM_GETCHECK,0,0)==BST_CHECKED);
             { wchar_t sb[16]; GetDlgItemText(s_optPanels[0], ID_OPT_SEEK_STEP, sb, 16);
               float sv = (float)_wtof(sb); if (sv >= 1.0f) g_seekStep = sv; }
+            // Remember session
+            if (SendMessage(GetDlgItem(s_optPanels[0], ID_OPT_SESSION_SEEK), BM_GETCHECK,0,0)==BST_CHECKED)
+                g_rememberSession = 2;
+            else if (SendMessage(GetDlgItem(s_optPanels[0], ID_OPT_SESSION_TRACK), BM_GETCHECK,0,0)==BST_CHECKED)
+                g_rememberSession = 1;
+            else
+                g_rememberSession = 0;
             // Device page
             if (s_optPanels[3])
                 g_rememberVolume = (SendMessage(GetDlgItem(s_optPanels[3], ID_OPT_REMEMBER_VOL), BM_GETCHECK,0,0)==BST_CHECKED);
@@ -9158,8 +9404,18 @@ void HandleDrop(HDROP hd)
             UpdateStatusBar();
             return;
         }
-        else if (IsAudio(p))
-            AddTrack(p);
+        else if (IsAudio(p)) {
+            if (g_dropLoadDir) {
+                // Load entire parent folder instead of just this file
+                wchar_t folder[MAX_PATH]; wcsncpy_s(folder, p, _TRUNCATE);
+                wchar_t* sep = wcsrchr(folder, L'\\');
+                if (!sep) sep = wcsrchr(folder, L'/');
+                if (sep) *sep = 0;
+                AddFolder(folder);
+            } else {
+                AddTrack(p);
+            }
+        }
     }
     RebuildShuffleOrder();
     if (!g_playlist.empty() && g_currentIndex < 0) {
@@ -10218,7 +10474,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         case IDM_HELP_ABOUT:
             MessageBox(hwnd,
-                L"BillyPro V0.7\n\n"
+                L"BillyPro V0.8\n\n"
                 L"Lightweight Music Player\n\n"
                 L"Created by MRJN/CLD.",
                 L"About BillyPro", MB_ICONINFORMATION);
@@ -10353,12 +10609,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 g_masterFreq  = ci.freq;
                 g_masterChans = ci.chans;
                 if (currentStream) {
-                    if (g_normalize) {
-                        float peak = ScanPeak(g_playlist[nextIdx].path);
-                        float normScale = 1.0f / peak;
-                        if (normScale > 4.0f) normScale = 4.0f;
-                        BASS_ChannelSetAttribute(dec, BASS_ATTRIB_VOL, normScale);
-                    }
                     ApplyDSP();
                     ApplyPitch();
                     UpdateVolume();
@@ -10388,6 +10638,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     case WM_DESTROY:
         if (g_recording) StopRecording();   // finalize FLAC so file is seekable
+        SaveSession();  // save playlist/track/position before stopping audio
         ClearThumbCache();
         if (g_thumbPlaceholder) { DeleteObject(g_thumbPlaceholder); g_thumbPlaceholder = NULL; }
         SaveSettings();
@@ -10643,15 +10894,19 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
         }
     }
     else {
-        // No arguments: if media folder is configured, auto-load it; otherwise load from exe folder
-        if (!g_mediaFolders.empty() && GetFileAttributes(g_mediaFolders[0].c_str()) != INVALID_FILE_ATTRIBUTES) {
-            LoadFolder(g_mediaFolders[0].c_str());
-        } else {
-            wchar_t exePath[MAX_PATH] = {};
-            GetModuleFileName(hInst, exePath, MAX_PATH);
-            wchar_t* lastSep = wcsrchr(exePath, L'\\');
-            if (lastSep) *lastSep = L'\0';
-            if (exePath[0]) LoadFolder(exePath);
+        // No arguments: try restoring previous session first
+        bool restored = RestoreSession();
+        if (!restored) {
+            // No session to restore: load media folder or exe folder
+            if (!g_mediaFolders.empty() && GetFileAttributes(g_mediaFolders[0].c_str()) != INVALID_FILE_ATTRIBUTES) {
+                LoadFolder(g_mediaFolders[0].c_str());
+            } else {
+                wchar_t exePath[MAX_PATH] = {};
+                GetModuleFileName(hInst, exePath, MAX_PATH);
+                wchar_t* lastSep = wcsrchr(exePath, L'\\');
+                if (lastSep) *lastSep = L'\0';
+                if (exePath[0]) LoadFolder(exePath);
+            }
         }
     }
 
