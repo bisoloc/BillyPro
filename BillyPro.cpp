@@ -1,4 +1,4 @@
-// BillyPro.cpp  -  Win32 + BASS audio player  v0.8
+// BillyPro.cpp  -  Win32 + BASS audio player  v0.9
 // Compile:
 //   cl BillyPro.cpp /W3 /O2 /link bass.lib User32.lib Gdi32.lib
 //          Comctl32.lib Shell32.lib Ole32.lib Winmm.lib Uxtheme.lib
@@ -118,6 +118,7 @@ extern "C" {
 #define ID_SEARCH_LIST      202
 #define ID_SEARCH_OK        203
 #define ID_SEARCH_CANCEL    204
+#define ID_SEARCH_SAVEPL    205
 
 // Audio info dialog
 #define ID_INFO_ARTWORK     401
@@ -199,6 +200,8 @@ extern "C" {
 #define IDM_HELP_ABOUT      2301
 #define IDM_HELP_UPDATE     2303
 // View menu
+#define IDM_VIEW_COLUMNS        2203
+#define ID_COLUMNVIEW           131
 #define IDM_VIEW_DARKMODE       2201
 #define IDM_VIEW_MODERN         2202
 // M3U playlist
@@ -256,10 +259,13 @@ static const wchar_t CLASS_NAME[] = L"BillyProWnd";
 static const wchar_t SEEK_CLASS[] = L"BillySeekBar";
 static const wchar_t VOL_CLASS[] = L"BillyVolBar";
 static const wchar_t APP_TITLE[] = L"BillyPro";
-static const wchar_t APP_VERSION[] = L"0.8";
+static const wchar_t APP_VERSION[] = L"0.9";
 
 HWND g_hwnd = NULL;
 HWND hListBox = NULL;
+HWND hColumnHeader = NULL; // column header bar for column view
+bool g_columnView = false; // column view enabled
+bool g_rememberColumns = true; // persist column layout across sessions
 HWND hPrevBtn = NULL;
 HWND hPlayBtn = NULL;
 HWND hPauseBtn = NULL;
@@ -286,7 +292,7 @@ float   currentVolume = 0.8f;
 bool    g_rememberVolume = false;
 wchar_t g_discogsToken[128] = L"";  // Discogs personal access token
 bool    g_shuffle = false;
-// Repeat mode: 0=off, 1=repeat track, 2=repeat playlist
+// Repeat mode: 0=off, 1=repeat track, 2=repeat playlist, 3=play once (stop after current)
 int     g_repeatMode = 0;
 bool    g_mono = false;
 bool    g_normalize = false;
@@ -509,6 +515,32 @@ void SeekToSeconds(double sec);
 void UpdateVolume();
 void LayoutControls(HWND hwnd);
 static double GetPlayPos();
+static void SyncColumnView();
+static void RebuildColumnHeader();
+static void SaveColumnOrderFromHeader();
+// Column View definitions (used by SaveSettings/LoadSettings)
+enum ColID {
+    COL_NAME, COL_EXT, COL_DURATION, COL_PATH, COL_SIZE,
+    COL_ARTIST, COL_TITLE, COL_ALBUM, COL_TRACK, COL_YEAR,
+    COL_GENRE, COL_BITRATE, COL_SAMPLERATE, COL_CHANNELS,
+    COL_COUNT
+};
+static bool g_colVisible[COL_COUNT] = {
+    true, true, true, false, false,       // name, ext, dur, path, size
+    false, false, false, false, false,    // artist, title, album, track#, year
+    false, false, false, false            // genre, bitrate, samplerate, channels
+};
+static int  g_colOrder[COL_COUNT];  // initialized in code
+static int  g_colWidth[COL_COUNT] = {
+    300, 60, 65, 200, 80,
+    150, 200, 150, 45, 45,
+    80, 65, 65, 55
+};
+static void InitColOrder() { for (int i = 0; i < COL_COUNT; i++) g_colOrder[i] = i; }
+static int  g_sortCol = -1;
+static bool g_sortAsc = true;
+static int  g_hdrHotItem = -1;
+static std::vector<Track> g_unsortedPlaylist;
 void PreloadNext();
 void SaveSettings();
 
@@ -572,6 +604,7 @@ static bool IsAudio(const wchar_t* p)
 void ClearPlaylist()
 {
     g_playlist.clear(); g_shuffleOrder.clear(); g_currentIndex = -1;
+    g_unsortedPlaylist.clear(); g_sortCol = -1; g_sortAsc = true;
     if (hListBox) SendMessage(hListBox, LB_RESETCONTENT, 0, 0);
 }
 
@@ -819,6 +852,7 @@ void LoadFolder(const wchar_t* folder)
     }
     RebuildShuffleOrder();
     if (!g_playlist.empty()) { SendMessage(hListBox, LB_SETCURSEL, 0, 0); g_currentIndex = 0; }
+    if (g_columnView) SyncColumnView();
     UpdateStatusBar();
 }
 
@@ -1414,6 +1448,7 @@ static void RefreshListboxStars()
         SendMessage(hListBox, LB_SETCURSEL, sel, 0);
     SendMessage(hListBox, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(hListBox, NULL, FALSE);
+    if (g_columnView) SyncColumnView();
 }
 
 static void AddFavorite(const wchar_t* path)
@@ -1718,6 +1753,23 @@ void SaveSettings()
     // UI prefs
     swprintf_s(buf, L"%d", (int)g_darkMode);   WritePrivateProfileString(L"UI", L"DarkMode",      buf, g_iniPath);
     swprintf_s(buf, L"%d", (int)g_modernStyle);WritePrivateProfileString(L"UI", L"ModernStyle",   buf, g_iniPath);
+    swprintf_s(buf, L"%d", (int)g_columnView); WritePrivateProfileString(L"UI", L"ColumnView",    buf, g_iniPath);
+    // Always save column layout globally
+    {
+        if (hColumnHeader && Header_GetItemCount(hColumnHeader) > 0)
+            SaveColumnOrderFromHeader();
+        wchar_t vis[64] = L"", widths[128] = L"", ord[128] = L"";
+        for (int i = 0; i < COL_COUNT; i++) {
+            if (i > 0) { wcscat_s(vis, L","); wcscat_s(widths, L","); wcscat_s(ord, L","); }
+            wchar_t tmp[16];
+            swprintf_s(tmp, L"%d", g_colVisible[i] ? 1 : 0); wcscat_s(vis, tmp);
+            swprintf_s(tmp, L"%d", g_colWidth[i]); wcscat_s(widths, tmp);
+            swprintf_s(tmp, L"%d", g_colOrder[i]); wcscat_s(ord, tmp);
+        }
+        WritePrivateProfileString(L"UI", L"ColVisible", vis, g_iniPath);
+        WritePrivateProfileString(L"UI", L"ColWidths", widths, g_iniPath);
+        WritePrivateProfileString(L"UI", L"ColOrder", ord, g_iniPath);
+    }
     swprintf_s(buf, L"%d", g_modernSize);      WritePrivateProfileString(L"UI", L"ModernSize",    buf, g_iniPath);
     swprintf_s(buf, L"%d", (int)g_multiInst);  WritePrivateProfileString(L"UI", L"MultiInstance", buf, g_iniPath);
     swprintf_s(buf, L"%d", (int)g_dropAppend); WritePrivateProfileString(L"UI", L"DropAppend",    buf, g_iniPath);
@@ -1774,13 +1826,41 @@ void LoadSettings()
     GetPrivateProfileString(L"Discogs", L"Token", L"", g_discogsToken, _countof(g_discogsToken), g_iniPath);
     g_darkMode   = GETI(L"UI", L"DarkMode",      0) != 0;
     g_modernStyle= GETI(L"UI", L"ModernStyle",   0) != 0;
+    g_columnView = GETI(L"UI", L"ColumnView",   0) != 0;
+    // Always load column layout globally
+    {
+        wchar_t vis[64] = {}, widths[128] = {}, ord[128] = {};
+        GetPrivateProfileString(L"UI", L"ColVisible", L"", vis, 64, g_iniPath);
+        GetPrivateProfileString(L"UI", L"ColWidths", L"", widths, 128, g_iniPath);
+        GetPrivateProfileString(L"UI", L"ColOrder", L"", ord, 128, g_iniPath);
+        if (ord[0]) {
+            wchar_t* ctx2 = nullptr; int j = 0;
+            for (wchar_t* tok = wcstok_s(ord, L",", &ctx2); tok && j < COL_COUNT; tok = wcstok_s(nullptr, L",", &ctx2), j++) {
+                int v = _wtoi(tok);
+                if (v >= 0 && v < COL_COUNT) g_colOrder[j] = v;
+            }
+        }
+        if (vis[0]) {
+            wchar_t* ctx = nullptr; int i = 0;
+            for (wchar_t* tok = wcstok_s(vis, L",", &ctx); tok && i < COL_COUNT; tok = wcstok_s(nullptr, L",", &ctx), i++)
+                g_colVisible[i] = (_wtoi(tok) != 0);
+            g_colVisible[COL_NAME] = true;
+        }
+        if (widths[0]) {
+            wchar_t* ctx = nullptr; int i = 0;
+            for (wchar_t* tok = wcstok_s(widths, L",", &ctx); tok && i < COL_COUNT; tok = wcstok_s(nullptr, L",", &ctx), i++) {
+                int w = _wtoi(tok);
+                if (w > 10 && w < 2000) g_colWidth[i] = w;
+            }
+        }
+    }
     g_modernSize = max(0, min(2, GETI(L"UI", L"ModernSize", 0)));
     g_multiInst  = GETI(L"UI", L"MultiInstance", 0) != 0;
     g_dropAppend = GETI(L"UI", L"DropAppend",    1) != 0;
     g_dropLoadDir = GETI(L"UI", L"DropLoadDir", 0) != 0;
     g_shuffle    = GETI(L"UI", L"Shuffle",       0) != 0;
     g_repeatMode = GETI(L"UI", L"RepeatMode",    0);
-    if (g_repeatMode < 0 || g_repeatMode > 2) g_repeatMode = 0;
+    if (g_repeatMode < 0 || g_repeatMode > 3) g_repeatMode = 0;
     g_seekStep   = GETF(L"UI", L"SeekStep",      5.0);
     if (g_seekStep < 1.0f) g_seekStep = 1.0f;
     // Load media folders — try new pipe-separated key first, fall back to legacy single key
@@ -2189,6 +2269,7 @@ void StopAudio()
     UpdateStatusBar();
     UpdateThumbButtons();
     SmtcUpdatePlaybackStatus();
+    if (hListBox) InvalidateRect(hListBox, NULL, FALSE); // clear now-playing highlight
     SetWindowText(g_hwnd, APP_TITLE);
 }
 
@@ -3071,6 +3152,9 @@ void PlayIndex(int idx)
 
     // Pre-load next track as decode stream
     PreloadNext();
+
+    // Repaint listbox to update current-track highlight
+    if (hListBox) InvalidateRect(hListBox, NULL, FALSE);
 }
 
 void TogglePlayPause()
@@ -3097,6 +3181,8 @@ void TogglePlayPause()
 void PlayNext()
 {
     if (g_playlist.empty()) return;
+    // Play Once: stop after current track finishes
+    if (g_repeatMode == 3) { StopAudio(); return; }
     // Repeat Track: replay current
     if (g_repeatMode == 1) { PlayIndex(g_currentIndex); return; }
     int next;
@@ -3137,6 +3223,7 @@ void PlayPrev()
 static int ComputeNextIndex()
 {
     if (g_playlist.empty() || g_currentIndex < 0) return -1;
+    if (g_repeatMode == 3) return -1; // play once: no next track
     if (g_repeatMode == 1) return g_currentIndex; // repeat track
     if (g_shuffle && !g_shuffleOrder.empty()) {
         int p = 0;
@@ -3749,7 +3836,7 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
         const wchar_t* lbl = L"";
         switch (type) {
         case BTN_SHUFFLE:    lbl = L"Shuffle"; break;
-        case BTN_REPEAT:     lbl = (g_repeatMode == 1) ? L"Rep.1" : (g_repeatMode == 2) ? L"Rep.All" : L"Repeat"; break;
+        case BTN_REPEAT:     lbl = (g_repeatMode == 1) ? L"Rep.1" : (g_repeatMode == 2) ? L"Rep.All" : (g_repeatMode == 3) ? L"Once" : L"Repeat"; break;
         case BTN_MONO:       lbl = L"Mono";    break;
         case BTN_NORMALIZE:  lbl = L"Norm";    break;
         case BTN_BASSBOOST:  lbl = L"BassBoost"; break;
@@ -3789,14 +3876,16 @@ LRESULT CALLBACK BtnHotProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         AppendMenu(hm, MF_STRING | (g_repeatMode == 0 ? MF_CHECKED : 0), 1, L"Repeat Off");
         AppendMenu(hm, MF_STRING | (g_repeatMode == 1 ? MF_CHECKED : 0), 2, L"Repeat Track");
         AppendMenu(hm, MF_STRING | (g_repeatMode == 2 ? MF_CHECKED : 0), 3, L"Repeat Playlist");
+        AppendMenu(hm, MF_STRING | (g_repeatMode == 3 ? MF_CHECKED : 0), 4, L"Play Once");
         POINT pt; GetCursorPos(&pt);
         int cmd = TrackPopupMenu(hm, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwnd, NULL);
         DestroyMenu(hm);
-        if (cmd >= 1 && cmd <= 3) {
+        if (cmd >= 1 && cmd <= 4) {
             g_repeatMode = cmd - 1;
             CheckMenuItem(GetMenu(g_hwnd), IDM_PLAY_REPEAT,
                 MF_BYCOMMAND | (g_repeatMode ? MF_CHECKED : MF_UNCHECKED));
             InvalidateRect(hRepeatBtn, NULL, TRUE);
+            PreloadNext();
         }
         return 0;
     }
@@ -4583,7 +4672,7 @@ static void RecreateListbox()
 
     // Create new with or without owner-draw
     DWORD style = WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_EXTENDEDSEL;
-    if (g_modernStyle) style |= LBS_OWNERDRAWFIXED | LBS_HASSTRINGS;
+    style |= LBS_OWNERDRAWFIXED | LBS_HASSTRINGS; // always owner-draw for now-playing highlight
 
     hListBox = CreateWindowEx(0, L"LISTBOX", NULL, style,
         0, 0, 0, 0, g_hwnd, (HMENU)ID_LISTBOX, hInst, NULL);
@@ -4628,7 +4717,7 @@ static void RecreateListbox()
     SetFocus(hListBox);
 }
 
-static void ToggleModernStyle()
+void ToggleModernStyle()
 {
     g_modernStyle = !g_modernStyle;
     if (g_modernStyle && !g_thumbPlaceholder)
@@ -5884,6 +5973,7 @@ static HWND g_hwndRadio = NULL;
 // Saved radio favorites
 struct RadioFav { std::wstring name; std::wstring url; std::wstring uuid; };
 static std::vector<RadioFav> g_radioFavs;
+static bool g_radioShowingFavs = false;
 
 static void GetRadioFavPath(wchar_t* out, int maxLen)
 {
@@ -6157,6 +6247,45 @@ static void RadioPlayStation(int idx)
     }
 }
 
+static WNDPROC g_OldRadioEditProc = NULL;
+static LRESULT CALLBACK RadioEditSubProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (msg == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000)) {
+        if (wParam == 'A') {
+            SendMessage(hwnd, EM_SETSEL, 0, -1);
+            return 0;
+        }
+        if (wParam == VK_BACK || wParam == VK_DELETE) {
+            wchar_t txt[512]; GetWindowText(hwnd, txt, 512);
+            DWORD selStart = 0, selEnd = 0;
+            SendMessage(hwnd, EM_GETSEL, (WPARAM)&selStart, (LPARAM)&selEnd);
+            int len = (int)wcslen(txt);
+            int pos = (int)selStart;
+            if (wParam == VK_DELETE) {
+                int e = pos;
+                while (e < len && txt[e] == L' ') e++;
+                while (e < len && txt[e] != L' ') e++;
+                SendMessage(hwnd, EM_SETSEL, pos, e);
+                SendMessage(hwnd, EM_REPLACESEL, TRUE, (LPARAM)L"");
+            } else {
+                int s = pos;
+                while (s > 0 && txt[s-1] == L' ') s--;
+                while (s > 0 && txt[s-1] != L' ') s--;
+                SendMessage(hwnd, EM_SETSEL, s, pos);
+                SendMessage(hwnd, EM_REPLACESEL, TRUE, (LPARAM)L"");
+            }
+            return 0;
+        }
+    }
+    if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
+        SendMessage(GetParent(hwnd), WM_COMMAND, ID_RADIO_SEARCH, 0);
+        return 0;
+    }
+    // Suppress the 0x7F character that Ctrl+Backspace generates
+    if (msg == WM_CHAR && wParam == 0x7F) return 0;
+    return CallWindowProc(g_OldRadioEditProc, hwnd, msg, wParam, lParam);
+}
+
 static LRESULT CALLBACK RadioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
@@ -6180,6 +6309,9 @@ static LRESULT CALLBACK RadioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
             308, y, 160, 22, hwnd, (HMENU)ID_RADIO_GENRE, hInst, NULL);
         SendMessage(hGenre, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        // Subclass both edit fields for Ctrl+A, Ctrl+Backspace, Ctrl+Delete, Enter
+        g_OldRadioEditProc = (WNDPROC)SetWindowLongPtr(hQuery, GWLP_WNDPROC, (LONG_PTR)RadioEditSubProc);
+        SetWindowLongPtr(hGenre, GWLP_WNDPROC, (LONG_PTR)RadioEditSubProc);
         HWND hSrch = CreateWindow(L"BUTTON", L"Search",
             WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
             cw - 76, y, 68, 24, hwnd, (HMENU)ID_RADIO_SEARCH, hInst, NULL);
@@ -6252,6 +6384,7 @@ static LRESULT CALLBACK RadioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
 
         // Load and show saved radio favorites
+        g_radioShowingFavs = true;
         LoadRadioFavs();
         if (!g_radioFavs.empty()) {
             HWND hListInit = GetDlgItem(hwnd, ID_RADIO_LIST);
@@ -6305,6 +6438,7 @@ static LRESULT CALLBACK RadioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 int pi = cmd - IDC_RADIO_PRESET_BASE;
                 if (pi == 0) {
                     // Favorites
+                    g_radioShowingFavs = true;
                     LoadRadioFavs();
                     g_radioResults.clear();
                     HWND hList = GetDlgItem(hwnd, ID_RADIO_LIST);
@@ -6321,10 +6455,12 @@ static LRESULT CALLBACK RadioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     SetDlgItemText(hwnd, ID_RADIO_STATUS, L"Showing saved favorites.");
                 } else if (pi == 1) {
                     // Top stations
+                    g_radioShowingFavs = false;
                     SetDlgItemText(hwnd, ID_RADIO_QUERY, L"");
                     SetDlgItemText(hwnd, ID_RADIO_GENRE, L"");
                     SendMessage(hwnd, WM_COMMAND, ID_RADIO_SEARCH, 0);
                 } else if (pi < 18) {
+                    g_radioShowingFavs = false;
                     SetDlgItemText(hwnd, ID_RADIO_QUERY, L"");
                     SetDlgItemText(hwnd, ID_RADIO_GENRE, presetTags[pi]);
                     SendMessage(hwnd, WM_COMMAND, ID_RADIO_SEARCH, 0);
@@ -6334,6 +6470,7 @@ static LRESULT CALLBACK RadioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
         switch (LOWORD(wParam)) {
         case ID_RADIO_SEARCH: {
+            g_radioShowingFavs = false;
             wchar_t query[256] = {}, genre[128] = {};
             GetDlgItemText(hwnd, ID_RADIO_QUERY, query, 256);
             GetDlgItemText(hwnd, ID_RADIO_GENRE, genre, 128);
@@ -6396,12 +6533,20 @@ static LRESULT CALLBACK RadioWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 for (auto it = g_radioFavs.begin(); it != g_radioFavs.end(); ++it) {
                     if (it->url == rs.url) { g_radioFavs.erase(it); SaveRadioFavs(); break; }
                 }
-                // Update display to remove star
-                _snwprintf_s(rs.display, _countof(rs.display), _TRUNCATE,
-                    L"%s  |  %s  %dkbps  [%s]", rs.name, rs.codec, rs.bitrate, rs.country);
-                SendMessage(hList, LB_DELETESTRING, sel, 0);
-                SendMessage(hList, LB_INSERTSTRING, sel, (LPARAM)rs.display);
-                SendMessage(hList, LB_SETCURSEL, sel, 0);
+                if (g_radioShowingFavs) {
+                    // In favorites view: remove entry entirely
+                    SendMessage(hList, LB_DELETESTRING, sel, 0);
+                    g_radioResults.erase(g_radioResults.begin() + sel);
+                    int count = (int)g_radioResults.size();
+                    if (count > 0) SendMessage(hList, LB_SETCURSEL, min(sel, count - 1), 0);
+                } else {
+                    // In search view: just remove star from display
+                    _snwprintf_s(rs.display, _countof(rs.display), _TRUNCATE,
+                        L"%s  |  %s  %dkbps  [%s]", rs.name, rs.codec, rs.bitrate, rs.country);
+                    SendMessage(hList, LB_DELETESTRING, sel, 0);
+                    SendMessage(hList, LB_INSERTSTRING, sel, (LPARAM)rs.display);
+                    SendMessage(hList, LB_SETCURSEL, sel, 0);
+                }
                 SetDlgItemText(hwnd, ID_RADIO_STATUS, L"Removed from favorites.");
             }
             break;
@@ -9080,6 +9225,46 @@ LRESULT CALLBACK SearchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         case ID_SEARCH_OK:
         case IDOK:
             SearchPlaySelected(); break;
+        case ID_SEARCH_SAVEPL: {
+            if (g_searchResults.empty()) {
+                MessageBox(hwnd, L"No search results to save.", L"Save as Playlist", MB_ICONWARNING);
+                break;
+            }
+            GetLibDir();
+            // Use search query as default filename
+            wchar_t defName[MAX_PATH];
+            wchar_t query[128] = L"Search Results";
+            if (hSearchEdit) GetWindowText(hSearchEdit, query, 128);
+            // Sanitize query for filename
+            for (wchar_t* p = query; *p; p++)
+                if (*p==L'\\'||*p==L'/'||*p==L':'||*p==L'*'||*p==L'?'||*p==L'"'||*p==L'<'||*p==L'>'||*p==L'|') *p=L'_';
+            swprintf_s(defName, L"%s\\%s.bpp", g_plDir, query);
+            OPENFILENAME ofn = {};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrFilter = L"Billy Pro Playlist (*.bpp)\0*.bpp\0";
+            ofn.lpstrFile = defName;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.lpstrInitialDir = g_plDir;
+            ofn.lpstrTitle = L"Save Search Results as Playlist";
+            ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+            ofn.lpstrDefExt = L"bpp";
+            if (GetSaveFileName(&ofn)) {
+                FILE* f = _wfopen(defName, L"w,ccs=UTF-8");
+                if (f) {
+                    for (int idx : g_searchResults) {
+                        if (idx >= 0 && idx < (int)g_playlist.size())
+                            fwprintf(f, L"%s\n", g_playlist[idx].path);
+                    }
+                    fclose(f);
+                    ScanPlaylists();
+                    wchar_t msg[128];
+                    swprintf_s(msg, L"Saved %d track(s) to playlist.", (int)g_searchResults.size());
+                    MessageBox(hwnd, msg, L"Save as Playlist", MB_ICONINFORMATION);
+                }
+            }
+            break;
+        }
         case ID_SEARCH_CANCEL:
         case IDCANCEL:
             DestroyWindow(hwnd); break;
@@ -9090,11 +9275,15 @@ LRESULT CALLBACK SearchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         int cw = rc.right, ch = rc.bottom;
         if (hSearchEdit) MoveWindow(hSearchEdit, 8, 8, cw - 16, 26, TRUE);
         if (hSearchList) MoveWindow(hSearchList, 8, 42, cw - 16, ch - 42 - 46, TRUE);
-        HWND hOK  = GetDlgItem(hwnd, ID_SEARCH_OK);
-        HWND hCan = GetDlgItem(hwnd, ID_SEARCH_CANCEL);
-        int bw = 88, bh = 28, by = ch - 38;
-        if (hOK)  MoveWindow(hOK,  cw / 2 - bw - 4, by, bw, bh, TRUE);
-        if (hCan) MoveWindow(hCan, cw / 2 + 4,       by, bw, bh, TRUE);
+        HWND hOK   = GetDlgItem(hwnd, ID_SEARCH_OK);
+        HWND hSave = GetDlgItem(hwnd, ID_SEARCH_SAVEPL);
+        HWND hCan  = GetDlgItem(hwnd, ID_SEARCH_CANCEL);
+        int bh = 28, by = ch - 38;
+        int totalW = 88 + 120 + 88 + 16; // 3 buttons + gaps
+        int bx = (cw - totalW) / 2;
+        if (hOK)   MoveWindow(hOK,   bx, by, 88, bh, TRUE); bx += 92;
+        if (hSave) MoveWindow(hSave, bx, by, 120, bh, TRUE); bx += 124;
+        if (hCan)  MoveWindow(hCan,  bx, by, 88, bh, TRUE);
         break;
     }
     case WM_KEYDOWN:
@@ -9102,6 +9291,55 @@ LRESULT CALLBACK SearchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         if (wParam == VK_RETURN) { SearchPlaySelected(); return 0; }
         if (wParam == VK_DELETE) { SearchDeleteSelected(); return 0; }
         break;
+    case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT* ms = (MEASUREITEMSTRUCT*)lParam;
+        if (ms->CtlID == ID_SEARCH_LIST) { ms->itemHeight = 20; return TRUE; }
+        break;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lParam;
+        if (dis->CtlID == ID_SEARCH_LIST) {
+            int idx = (int)dis->itemID;
+            int count = (int)SendMessage(dis->hwndItem, LB_GETCOUNT, 0, 0);
+            HDC dc = dis->hDC;
+            RECT rc = dis->rcItem;
+            if (idx < 0 || idx >= count) {
+                HBRUSH bg = CreateSolidBrush(g_theme.bgList);
+                FillRect(dc, &rc, bg); DeleteObject(bg);
+                return TRUE;
+            }
+            bool selected = (dis->itemState & ODS_SELECTED) != 0;
+            bool isPlaying = (idx < (int)g_searchResults.size() && g_currentIndex >= 0
+                && g_searchResults[idx] == g_currentIndex);
+            COLORREF bgCol, txCol;
+            if (g_darkMode) {
+                bgCol = selected ? RGB(30, 80, 160) : (isPlaying ? RGB(35, 50, 45) : g_theme.bgList);
+                txCol = selected ? RGB(255, 255, 255) : (isPlaying ? g_theme.accent : g_theme.text);
+            } else {
+                bgCol = selected ? GetSysColor(COLOR_HIGHLIGHT) : (isPlaying ? RGB(215, 235, 250) : GetSysColor(COLOR_WINDOW));
+                txCol = selected ? GetSysColor(COLOR_HIGHLIGHTTEXT) : (isPlaying ? RGB(20, 80, 160) : GetSysColor(COLOR_WINDOWTEXT));
+            }
+            HBRUSH br = CreateSolidBrush(bgCol);
+            FillRect(dc, &rc, br); DeleteObject(br);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, txCol);
+            HFONT oldF = (HFONT)SelectObject(dc, isPlaying ? g_fontBold : g_fontUI);
+            wchar_t text[MAX_PATH] = L"";
+            SendMessage(dis->hwndItem, LB_GETTEXT, idx, (LPARAM)text);
+            RECT tr = rc; tr.left += 4;
+            if (isPlaying) {
+                wchar_t buf[MAX_PATH + 4];
+                swprintf_s(buf, L"\u25B6 %s", text);
+                DrawText(dc, buf, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+            } else {
+                DrawText(dc, text, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+            }
+            SelectObject(dc, oldF);
+            if (dis->itemState & ODS_FOCUS) DrawFocusRect(dc, &rc);
+            return TRUE;
+        }
+        break;
+    }
     case WM_ERASEBKGND: {
         HDC dc = (HDC)wParam; RECT rc; GetClientRect(hwnd, &rc);
         FillRect(dc, &rc, g_brBg); return 1;
@@ -9185,19 +9423,28 @@ void OpenSearchDialog()
         (LONG_PTR)SearchEditSubProc);
 
     hSearchList = CreateWindowEx(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT
+        | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
         8, 42, 344, 330, hDlg, (HMENU)ID_SEARCH_LIST, hInst, NULL);
     SendMessage(hSearchList, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
     SendMessage(hSearchList, LB_SETITEMHEIGHT, 0, 20);
 
     HWND hOK = CreateWindow(L"BUTTON", L"Play",
         WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-        84, 380, 88, 28, hDlg, (HMENU)ID_SEARCH_OK, hInst, NULL);
+        0, 0, 88, 28, hDlg, (HMENU)ID_SEARCH_OK, hInst, NULL);
+    HWND hSavePl = CreateWindow(L"BUTTON", L"Save as Playlist...",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        0, 0, 120, 28, hDlg, (HMENU)ID_SEARCH_SAVEPL, hInst, NULL);
     HWND hCan = CreateWindow(L"BUTTON", L"Close",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        188, 380, 88, 28, hDlg, (HMENU)ID_SEARCH_CANCEL, hInst, NULL);
-    SendMessage(hOK,  WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-    SendMessage(hCan, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        0, 0, 88, 28, hDlg, (HMENU)ID_SEARCH_CANCEL, hInst, NULL);
+    SendMessage(hOK,     WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+    SendMessage(hSavePl, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+    SendMessage(hCan,    WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+
+    // Apply dark mode theme to search listbox
+    if (g_darkMode)
+        SetWindowTheme(hSearchList, L"DarkMode_Explorer", NULL);
 
     // Trigger layout via WM_SIZE
     RECT rcClient; GetClientRect(hDlg, &rcClient);
@@ -9230,6 +9477,10 @@ void ApplyTheme()
         // Listbox scrollbar style
         if (hListBox)
             SetWindowTheme(hListBox, g_darkMode ? L"DarkMode_Explorer" : L"Explorer", NULL);
+
+        // Column header repaint
+        if (hColumnHeader) InvalidateRect(hColumnHeader, NULL, TRUE);
+        if (g_columnView && hListBox) InvalidateRect(hListBox, NULL, FALSE);
 
         // Status bar: strip visual style so background + custom painting work
         if (hStatus) {
@@ -9274,6 +9525,596 @@ void CreateFonts()
     g_fontBold = CreateFont(-13, 0, 0, 0, FW_BOLD, 0, 0, 0,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+}
+
+// ============================================================
+//  Column View (playlist with sortable columns)
+// ============================================================
+//  Column View — header control + owner-draw listbox columns
+// ============================================================
+// ColID enum + g_colVisible + g_colWidth declared in forward section above
+// Short labels for the header bar, long labels for the right-click menu
+static const wchar_t* COL_HDR_LABELS[COL_COUNT] = {
+    L"File name", L"Extension", L"Duration", L"File path", L"File size",
+    L"Artist", L"Title", L"Album", L"#", L"Year",
+    L"Genre", L"Bitrate", L"Sample rate", L"Channels"
+};
+static const wchar_t* COL_MENU_LABELS[COL_COUNT] = {
+    L"File name", L"Extension", L"Duration", L"File path", L"File size",
+    L"Artist", L"Title", L"Album", L"Track #", L"Year",
+    L"Genre", L"Bitrate", L"Sample rate", L"Channels"
+};
+static const int COL_FMT[COL_COUNT] = {
+    HDF_LEFT, HDF_LEFT, HDF_RIGHT, HDF_LEFT, HDF_RIGHT,
+    HDF_LEFT, HDF_LEFT, HDF_LEFT, HDF_RIGHT, HDF_RIGHT,
+    HDF_LEFT, HDF_RIGHT, HDF_RIGHT, HDF_LEFT
+};
+
+// Duration + metadata cache
+static std::map<std::wstring, double> g_durCache;
+
+struct TagCache {
+    std::wstring artist, title, album, genre, year, track;
+    int bitrate; int sampleRate; int channels;
+    bool loaded;
+};
+static std::map<std::wstring, TagCache> g_tagCache;
+
+static TagCache& GetTagsForFile(const wchar_t* path)
+{
+    std::wstring key(path);
+    auto it = g_tagCache.find(key);
+    if (it != g_tagCache.end()) return it->second;
+
+    TagCache tc = {}; tc.loaded = true;
+    HSTREAM s = BASS_StreamCreateFile(FALSE, path, 0, 0,
+        BASS_UNICODE | BASS_STREAM_DECODE);
+    if (s) {
+        BASS_CHANNELINFO ci = {};
+        BASS_ChannelGetInfo(s, &ci);
+        tc.sampleRate = ci.freq;
+        tc.channels = ci.chans;
+        float br = 0; BASS_ChannelGetAttribute(s, BASS_ATTRIB_BITRATE, &br);
+        tc.bitrate = (int)br;
+
+        // Try OGG/FLAC vorbis comments first
+        const char* tags = BASS_ChannelGetTags(s, BASS_TAG_OGG);
+        if (tags) {
+            for (const char* t = tags; *t; t += strlen(t) + 1) {
+                wchar_t wval[256];
+                auto readTag = [&](const char* name, std::wstring& out) {
+                    int nl = (int)strlen(name);
+                    if (_strnicmp(t, name, nl) == 0 && t[nl] == '=') {
+                        MultiByteToWideChar(CP_UTF8, 0, t + nl + 1, -1, wval, 256);
+                        out = wval;
+                    }
+                };
+                readTag("ARTIST", tc.artist);
+                readTag("TITLE", tc.title);
+                readTag("ALBUM", tc.album);
+                readTag("GENRE", tc.genre);
+                readTag("DATE", tc.year);
+                readTag("TRACKNUMBER", tc.track);
+            }
+        }
+        // Try ID3v2 (MP3 — has track#, year, genre, etc.) if any field is still empty
+        if (tc.artist.empty() || tc.title.empty() || tc.album.empty() ||
+            tc.track.empty() || tc.year.empty() || tc.genre.empty()) {
+            const void* id3v2 = BASS_ChannelGetTags(s, BASS_TAG_ID3V2);
+            if (id3v2) {
+                const BYTE* d = (const BYTE*)id3v2;
+                if (memcmp(d, "ID3", 3) == 0) {
+                    BYTE ver = d[3];
+                    DWORD tagSz = ((d[6]&0x7F)<<21)|((d[7]&0x7F)<<14)|((d[8]&0x7F)<<7)|(d[9]&0x7F);
+                    const BYTE* p = d + 10;
+                    const BYTE* end = d + 10 + tagSz;
+                    while (p + 10 < end) {
+                        char fid[5] = {}; memcpy(fid, p, 4);
+                        DWORD fsz;
+                        if (ver >= 4) fsz = ((p[4]&0x7F)<<21)|((p[5]&0x7F)<<14)|((p[6]&0x7F)<<7)|(p[7]&0x7F);
+                        else          fsz = (p[4]<<24)|(p[5]<<16)|(p[6]<<8)|p[7];
+                        p += 10;
+                        if (fsz == 0 || p + fsz > end) break;
+                        // Read text frame: first byte = encoding, rest = string
+                        auto readFrame = [&](const char* id, std::wstring& out) {
+                            if (strcmp(fid, id) != 0 || !out.empty()) return;
+                            if (fsz < 2) return;
+                            BYTE enc = p[0];
+                            wchar_t wbuf[512] = {};
+                            if (enc == 0) // ISO-8859-1
+                                MultiByteToWideChar(28591, 0, (const char*)p+1, (int)fsz-1, wbuf, 511);
+                            else if (enc == 1 || enc == 2) { // UTF-16 LE/BE
+                                const BYTE* txt = p + 1;
+                                int txtLen = (int)fsz - 1;
+                                if (txtLen >= 2 && txt[0] == 0xFF && txt[1] == 0xFE) { txt += 2; txtLen -= 2; } // skip BOM
+                                else if (txtLen >= 2 && txt[0] == 0xFE && txt[1] == 0xFF) { txt += 2; txtLen -= 2; } // BE BOM
+                                int wchars = txtLen / 2;
+                                if (wchars > 511) wchars = 511;
+                                memcpy(wbuf, txt, wchars * 2);
+                                wbuf[wchars] = 0;
+                            }
+                            else if (enc == 3) // UTF-8
+                                MultiByteToWideChar(CP_UTF8, 0, (const char*)p+1, (int)fsz-1, wbuf, 511);
+                            // Trim trailing nulls/spaces
+                            int wl = (int)wcslen(wbuf);
+                            while (wl > 0 && (wbuf[wl-1] == 0 || wbuf[wl-1] == L' ')) wbuf[--wl] = 0;
+                            if (wbuf[0]) out = wbuf;
+                        };
+                        readFrame("TPE1", tc.artist);
+                        readFrame("TIT2", tc.title);
+                        readFrame("TALB", tc.album);
+                        readFrame("TRCK", tc.track);
+                        readFrame("TYER", tc.year);
+                        readFrame("TDRC", tc.year);  // ID3v2.4 date
+                        readFrame("TCON", tc.genre);
+                        p += fsz;
+                    }
+                }
+            }
+        }
+        // Fallback: ID3v1
+        if (tc.artist.empty()) {
+            TAG_ID3* id3 = (TAG_ID3*)BASS_ChannelGetTags(s, BASS_TAG_ID3);
+            if (id3) {
+                wchar_t w[256];
+                auto fromField = [&](const char* f, int len, std::wstring& out) {
+                    if (out.empty() && f[0]) {
+                        char tmp[64] = {}; memcpy(tmp, f, min(len, 63));
+                        int l = (int)strlen(tmp); while (l > 0 && tmp[l-1] == ' ') tmp[--l] = 0;
+                        if (tmp[0]) { MultiByteToWideChar(CP_ACP, 0, tmp, -1, w, 256); out = w; }
+                    }
+                };
+                fromField(id3->artist, 30, tc.artist);
+                fromField(id3->title, 30, tc.title);
+                fromField(id3->album, 30, tc.album);
+                fromField(id3->year, 4, tc.year);
+            }
+        }
+        BASS_StreamFree(s);
+    }
+    // FLAC fallback: read vorbis comments via libFLAC metadata chain
+    const wchar_t* fext = wcsrchr(path, L'.');
+    if (fext && _wcsicmp(fext, L".flac") == 0 &&
+        (tc.artist.empty() || tc.title.empty() || tc.album.empty())) {
+        int uLen = WideCharToMultiByte(CP_UTF8, 0, path, -1, NULL, 0, NULL, NULL);
+        std::vector<char> u8(uLen > 0 ? uLen : 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, path, -1, u8.data(), uLen, NULL, NULL);
+        FLAC__Metadata_Chain* fc = FLAC__metadata_chain_new();
+        if (fc && FLAC__metadata_chain_read(fc, u8.data())) {
+            FLAC__Metadata_Iterator* fi = FLAC__metadata_iterator_new();
+            if (fi) {
+                FLAC__metadata_iterator_init(fi, fc);
+                do {
+                    FLAC__StreamMetadata* blk = FLAC__metadata_iterator_get_block(fi);
+                    if (blk && blk->type == FLAC__METADATA_TYPE_VORBIS_COMMENT) {
+                        const FLAC__StreamMetadata_VorbisComment& vc = blk->data.vorbis_comment;
+                        for (FLAC__uint32 i = 0; i < vc.num_comments; i++) {
+                            const char* e = (const char*)vc.comments[i].entry;
+                            wchar_t wv[512] = {};
+                            auto readVC = [&](const char* name, std::wstring& out) {
+                                if (!out.empty()) return;
+                                int nl = (int)strlen(name);
+                                if (_strnicmp(e, name, nl) == 0 && e[nl] == '=') {
+                                    MultiByteToWideChar(CP_UTF8, 0, e + nl + 1, -1, wv, 511);
+                                    out = wv;
+                                }
+                            };
+                            readVC("ARTIST", tc.artist);
+                            readVC("TITLE", tc.title);
+                            readVC("ALBUM", tc.album);
+                            readVC("GENRE", tc.genre);
+                            readVC("DATE", tc.year);
+                            readVC("TRACKNUMBER", tc.track);
+                        }
+                    }
+                } while (FLAC__metadata_iterator_next(fi));
+                FLAC__metadata_iterator_delete(fi);
+            }
+        }
+        if (fc) FLAC__metadata_chain_delete(fc);
+    }
+    g_tagCache[key] = tc;
+    return g_tagCache[key];
+}
+
+static double QuickFileDuration(const wchar_t* path)
+{
+    if (_wcsnicmp(path, L"http://", 7) == 0 || _wcsnicmp(path, L"https://", 8) == 0)
+        return 0;
+    std::wstring key(path);
+    auto it = g_durCache.find(key);
+    if (it != g_durCache.end()) return it->second;
+    HSTREAM s = BASS_StreamCreateFile(FALSE, path, 0, 0, BASS_UNICODE | BASS_STREAM_DECODE);
+    double len = 0;
+    if (s) { len = BASS_ChannelBytes2Seconds(s, BASS_ChannelGetLength(s, BASS_POS_BYTE)); BASS_StreamFree(s); }
+    if (len < 0) len = 0;
+    g_durCache[key] = len;
+    return len;
+}
+
+static void SyncColumnView()
+{
+    if (g_columnView && hListBox) InvalidateRect(hListBox, NULL, FALSE);
+}
+
+// Rebuild the Win32 Header control items from g_colVisible/g_colOrder/g_colWidth
+// Save current header item order + widths back to g_colOrder/g_colWidth
+static void SaveColumnOrderFromHeader()
+{
+    if (!hColumnHeader) return;
+    int n = Header_GetItemCount(hColumnHeader);
+    // Build new order: visible columns in current header order, then hidden columns
+    int newOrder[COL_COUNT];
+    bool used[COL_COUNT] = {};
+    int pos = 0;
+    for (int i = 0; i < n && pos < COL_COUNT; i++) {
+        HDITEM hdi = {}; hdi.mask = HDI_LPARAM | HDI_WIDTH;
+        Header_GetItem(hColumnHeader, i, &hdi);
+        int cid = (int)hdi.lParam;
+        if (cid >= 0 && cid < COL_COUNT) {
+            newOrder[pos++] = cid;
+            used[cid] = true;
+            g_colWidth[cid] = hdi.cxy;
+        }
+    }
+    // Append hidden columns in their previous order
+    for (int i = 0; i < COL_COUNT; i++) {
+        int cid = g_colOrder[i];
+        if (!used[cid]) newOrder[pos++] = cid;
+    }
+    memcpy(g_colOrder, newOrder, sizeof(g_colOrder));
+}
+
+static void RebuildColumnHeader()
+{
+    if (!hColumnHeader) return;
+    // Save current arrangement before clearing
+    if (Header_GetItemCount(hColumnHeader) > 0)
+        SaveColumnOrderFromHeader();
+    // Clear
+    while (Header_GetItemCount(hColumnHeader) > 0)
+        Header_DeleteItem(hColumnHeader, 0);
+    // Insert visible columns in saved order
+    int pos = 0;
+    for (int i = 0; i < COL_COUNT; i++) {
+        int cid = g_colOrder[i];
+        if (!g_colVisible[cid]) continue;
+        HDITEM hdi = {};
+        hdi.mask = HDI_TEXT | HDI_WIDTH | HDI_FORMAT | HDI_LPARAM;
+        hdi.pszText = (LPWSTR)COL_HDR_LABELS[cid];
+        hdi.cxy = g_colWidth[cid];
+        hdi.fmt = COL_FMT[cid] | HDF_STRING;
+        hdi.lParam = cid;
+        Header_InsertItem(hColumnHeader, pos++, &hdi);
+    }
+}
+
+// Get column rects (in listbox-relative coordinates) for painting
+// Returns the number of visible columns, fills colRects[] and colIDs[]
+static int GetColumnRects(RECT listRc, RECT* colRects, int* colIDs, int maxCols)
+{
+    if (!hColumnHeader) return 0;
+    int n = Header_GetItemCount(hColumnHeader);
+    if (n > maxCols) n = maxCols;
+    int x = listRc.left;
+    for (int i = 0; i < n; i++) {
+        HDITEM hdi = {}; hdi.mask = HDI_WIDTH | HDI_LPARAM;
+        Header_GetItem(hColumnHeader, i, &hdi);
+        colRects[i] = listRc;
+        colRects[i].left = x;
+        colRects[i].right = x + hdi.cxy;
+        colIDs[i] = (int)hdi.lParam;
+        x += hdi.cxy;
+    }
+    return n;
+}
+
+// Get the text for a given column and track
+static void GetColumnText(int colId, int trackIdx, const wchar_t* trackPath,
+    const wchar_t* displayText, wchar_t* out, int maxLen)
+{
+    out[0] = 0;
+    const wchar_t* raw = displayText;
+    if (raw[0] == L'\u2605' && raw[1] == L' ') raw += 2;
+    if (raw[0] == L'\u25B6' && raw[1] == L' ') raw += 2;
+    bool isUrl = trackPath && (_wcsnicmp(trackPath, L"http", 4) == 0);
+
+    switch (colId) {
+    case COL_NAME: {
+        wcsncpy_s(out, maxLen, raw, _TRUNCATE);
+        // Only strip extension if the Extension column is visible
+        if (g_colVisible[COL_EXT]) {
+            wchar_t* dot = wcsrchr(out, L'.');
+            if (dot) *dot = 0;
+        }
+        break;
+    }
+    case COL_EXT: {
+        const wchar_t* dot = wcsrchr(raw, L'.');
+        if (dot) wcsncpy_s(out, maxLen, dot + 1, _TRUNCATE);
+        break;
+    }
+    case COL_DURATION: {
+        if (!trackPath) break;
+        if (isUrl) { wcsncpy_s(out, maxLen, L"?", _TRUNCATE); break; }
+        double d = QuickFileDuration(trackPath);
+        if (d > 0) FormatTime(d, out, maxLen);
+        break;
+    }
+    case COL_PATH:
+        if (trackPath) wcsncpy_s(out, maxLen, trackPath, _TRUNCATE);
+        break;
+    case COL_SIZE: {
+        if (!trackPath || isUrl) break;
+        WIN32_FILE_ATTRIBUTE_DATA fa = {};
+        if (GetFileAttributesEx(trackPath, GetFileExInfoStandard, &fa)) {
+            ULONGLONG sz = ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+            if (sz > 1024ULL * 1024) swprintf_s(out, maxLen, L"%.1f MB", sz / 1048576.0);
+            else swprintf_s(out, maxLen, L"%.0f KB", sz / 1024.0);
+        }
+        break;
+    }
+    case COL_ARTIST:
+    case COL_TITLE:
+    case COL_ALBUM:
+    case COL_TRACK:
+    case COL_YEAR:
+    case COL_GENRE:
+    case COL_BITRATE:
+    case COL_SAMPLERATE:
+    case COL_CHANNELS: {
+        if (!trackPath || isUrl) break;
+        TagCache& tc = GetTagsForFile(trackPath);
+        switch (colId) {
+        case COL_ARTIST:     wcsncpy_s(out, maxLen, tc.artist.c_str(), _TRUNCATE); break;
+        case COL_TITLE:      wcsncpy_s(out, maxLen, tc.title.c_str(), _TRUNCATE); break;
+        case COL_ALBUM:      wcsncpy_s(out, maxLen, tc.album.c_str(), _TRUNCATE); break;
+        case COL_TRACK:      wcsncpy_s(out, maxLen, tc.track.c_str(), _TRUNCATE); break;
+        case COL_YEAR:       wcsncpy_s(out, maxLen, tc.year.c_str(), _TRUNCATE); break;
+        case COL_GENRE:      wcsncpy_s(out, maxLen, tc.genre.c_str(), _TRUNCATE); break;
+        case COL_BITRATE:    if (tc.bitrate > 0) swprintf_s(out, maxLen, L"%d kbps", tc.bitrate); break;
+        case COL_SAMPLERATE: if (tc.sampleRate > 0) swprintf_s(out, maxLen, L"%d Hz", tc.sampleRate); break;
+        case COL_CHANNELS:   if (tc.channels == 1) wcsncpy_s(out, maxLen, L"Mono", _TRUNCATE);
+                             else if (tc.channels == 2) wcsncpy_s(out, maxLen, L"Stereo", _TRUNCATE);
+                             else if (tc.channels > 0) swprintf_s(out, maxLen, L"%d ch", tc.channels); break;
+        }
+        break;
+    }
+    }
+}
+
+// Show right-click column picker menu
+// Auto-fit a single header column to content width
+static void AutoFitColumn(int headerIdx)
+{
+    if (!hColumnHeader || !hListBox) return;
+    HDITEM hdi = {}; hdi.mask = HDI_LPARAM;
+    Header_GetItem(hColumnHeader, headerIdx, &hdi);
+    int cid = (int)hdi.lParam;
+
+    HDC dc = GetDC(hListBox);
+    HFONT oldF = (HFONT)SelectObject(dc, g_fontUI);
+
+    // Measure header text
+    SIZE hsz = {};
+    GetTextExtentPoint32(dc, COL_HDR_LABELS[cid], (int)wcslen(COL_HDR_LABELS[cid]), &hsz);
+    int maxW = hsz.cx + 16;
+
+    // Measure content
+    int count = min((int)g_playlist.size(), 200); // sample first 200
+    for (int i = 0; i < count; i++) {
+        wchar_t colText[MAX_PATH] = L"";
+        wchar_t dispText[MAX_PATH] = L"";
+        SendMessage(hListBox, LB_GETTEXT, i, (LPARAM)dispText);
+        GetColumnText(cid, i, i < (int)g_playlist.size() ? g_playlist[i].path : NULL,
+            dispText, colText, MAX_PATH);
+        SIZE sz = {};
+        GetTextExtentPoint32(dc, colText, (int)wcslen(colText), &sz);
+        int w = sz.cx + 12;
+        if (cid == COL_NAME && g_modernStyle) w += THUMB_SZ + 6;
+        if (w > maxW) maxW = w;
+    }
+    SelectObject(dc, oldF);
+    ReleaseDC(hListBox, dc);
+
+    if (maxW < 30) maxW = 30;
+    if (maxW > 600) maxW = 600;
+    hdi.mask = HDI_WIDTH; hdi.cxy = maxW;
+    Header_SetItem(hColumnHeader, headerIdx, &hdi);
+    g_colWidth[cid] = maxW;
+    InvalidateRect(hListBox, NULL, FALSE);
+}
+
+static void ShowColumnPickerMenu(HWND hwnd, POINT pt)
+{
+    HMENU hm = CreatePopupMenu();
+    // Size to fit options
+    AppendMenu(hm, MF_STRING, 10100, L"Size Column to Fit");
+    AppendMenu(hm, MF_STRING, 10101, L"Size All Columns to Fit");
+    AppendMenu(hm, MF_SEPARATOR, 0, NULL);
+    // Column visibility toggles
+    for (int i = 0; i < COL_COUNT; i++) {
+        UINT flags = MF_STRING | (g_colVisible[i] ? MF_CHECKED : MF_UNCHECKED);
+        if (i == COL_NAME) flags |= MF_GRAYED;
+        AppendMenu(hm, flags, 10000 + i, COL_MENU_LABELS[i]);
+    }
+    // Figure out which header column was right-clicked
+    POINT hdrPt = pt; ScreenToClient(hColumnHeader, &hdrPt);
+    HDHITTESTINFO hht = {}; hht.pt = hdrPt;
+    int clickedCol = (int)SendMessage(hColumnHeader, HDM_HITTEST, 0, (LPARAM)&hht);
+
+    int cmd = (int)TrackPopupMenu(hm, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(hm);
+    if (cmd == 10100 && clickedCol >= 0) {
+        AutoFitColumn(clickedCol);
+        SaveSettings();
+    } else if (cmd == 10101) {
+        int n = Header_GetItemCount(hColumnHeader);
+        for (int i = 0; i < n; i++) AutoFitColumn(i);
+        // Shrink columns proportionally if total exceeds listbox width
+        RECT lbRc; GetClientRect(hListBox, &lbRc);
+        int availW = lbRc.right - GetSystemMetrics(SM_CXVSCROLL);
+        int totalW = 0;
+        for (int i = 0; i < n; i++) {
+            HDITEM hdi = {}; hdi.mask = HDI_WIDTH;
+            Header_GetItem(hColumnHeader, i, &hdi);
+            totalW += hdi.cxy;
+        }
+        if (totalW > availW && totalW > 0) {
+            float scale = (float)availW / (float)totalW;
+            for (int i = 0; i < n; i++) {
+                HDITEM hdi = {}; hdi.mask = HDI_WIDTH | HDI_LPARAM;
+                Header_GetItem(hColumnHeader, i, &hdi);
+                hdi.cxy = max(30, (int)(hdi.cxy * scale));
+                hdi.mask = HDI_WIDTH;
+                Header_SetItem(hColumnHeader, i, &hdi);
+            }
+        }
+        InvalidateRect(hListBox, NULL, FALSE);
+        SaveSettings();
+    } else if (cmd >= 10000 && cmd < 10000 + COL_COUNT) {
+        int cid = cmd - 10000;
+        if (cid == COL_NAME) return;
+        g_colVisible[cid] = !g_colVisible[cid];
+        RebuildColumnHeader();
+        InvalidateRect(hListBox, NULL, FALSE);
+        SaveSettings();
+    }
+}
+
+// Column sort state: -1 = no sort, else ColID
+// g_sortCol, g_sortAsc, g_hdrHotItem, g_unsortedPlaylist declared in forward section
+
+// Sort the playlist by a column
+// Helper: rebuild listbox from g_playlist, re-find current track by path
+static void RebuildListboxAfterSort(const wchar_t* curPath)
+{
+    SendMessage(hListBox, WM_SETREDRAW, FALSE, 0);
+    SendMessage(hListBox, LB_RESETCONTENT, 0, 0);
+    for (auto& t : g_playlist) {
+        wchar_t disp[MAX_PATH + 4];
+        if (!g_favActive && IsFavorite(t.path))
+            swprintf_s(disp, L"\u2605 %s", t.display);
+        else
+            wcsncpy_s(disp, t.display, _TRUNCATE);
+        SendMessage(hListBox, LB_ADDSTRING, 0, (LPARAM)disp);
+    }
+    SendMessage(hListBox, WM_SETREDRAW, TRUE, 0);
+    if (curPath && curPath[0]) {
+        for (int i = 0; i < (int)g_playlist.size(); i++) {
+            if (_wcsicmp(g_playlist[i].path, curPath) == 0) {
+                g_currentIndex = i;
+                SendMessage(hListBox, LB_SETCURSEL, i, 0);
+                break;
+            }
+        }
+    }
+    RebuildShuffleOrder();
+    InvalidateRect(hListBox, NULL, FALSE);
+}
+
+static void SortPlaylistByColumn(int colId, bool ascending)
+{
+    if (g_playlist.empty()) return;
+    wchar_t curPath[MAX_PATH] = {};
+    if (g_currentIndex >= 0 && g_currentIndex < (int)g_playlist.size())
+        wcsncpy_s(curPath, g_playlist[g_currentIndex].path, _TRUNCATE);
+
+    // Snapshot original order before first sort
+    if (g_unsortedPlaylist.empty())
+        g_unsortedPlaylist = g_playlist;
+
+    std::sort(g_playlist.begin(), g_playlist.end(),
+        [colId, ascending](const Track& a, const Track& b) {
+            wchar_t ta[MAX_PATH] = {}, tb[MAX_PATH] = {};
+            GetColumnText(colId, 0, a.path, a.display, ta, MAX_PATH);
+            GetColumnText(colId, 0, b.path, b.display, tb, MAX_PATH);
+            int cmp = _wcsicmp(ta, tb);
+            return ascending ? (cmp < 0) : (cmp > 0);
+        });
+    RebuildListboxAfterSort(curPath);
+}
+
+static void RestoreUnsortedPlaylist()
+{
+    if (g_unsortedPlaylist.empty()) return;
+    wchar_t curPath[MAX_PATH] = {};
+    if (g_currentIndex >= 0 && g_currentIndex < (int)g_playlist.size())
+        wcsncpy_s(curPath, g_playlist[g_currentIndex].path, _TRUNCATE);
+    g_playlist = g_unsortedPlaylist;
+    g_unsortedPlaylist.clear();
+    RebuildListboxAfterSort(curPath);
+}
+
+// Subclass for header: dark mode bg, hover tracking
+static WNDPROC g_OldHdrProc = NULL;
+static LRESULT CALLBACK HdrSubProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    // Hover tracking (works in both light and dark mode)
+    if (msg == WM_MOUSEMOVE) {
+        HDHITTESTINFO hht = {}; hht.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int hit = (int)SendMessage(hwnd, HDM_HITTEST, 0, (LPARAM)&hht);
+        if (hit != g_hdrHotItem) {
+            g_hdrHotItem = hit;
+            InvalidateRect(hwnd, NULL, FALSE);
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+            TrackMouseEvent(&tme);
+        }
+    }
+    if (msg == WM_MOUSELEAVE) {
+        g_hdrHotItem = -1;
+        InvalidateRect(hwnd, NULL, FALSE);
+    }
+    if (g_darkMode) {
+        if (msg == WM_ERASEBKGND) {
+            HDC dc = (HDC)wp; RECT rc; GetClientRect(hwnd, &rc);
+            HBRUSH br = CreateSolidBrush(0x383838);
+            FillRect(dc, &rc, br); DeleteObject(br);
+            return 1;
+        }
+        if (msg == WM_PAINT) {
+            LRESULT r = CallWindowProc(g_OldHdrProc, hwnd, msg, wp, lp);
+            HDC dc = GetDC(hwnd); RECT rc; GetClientRect(hwnd, &rc);
+            HBRUSH br = CreateSolidBrush(0x383838);
+            RECT bot = { 0, rc.bottom - 1, rc.right, rc.bottom };
+            FillRect(dc, &bot, br);
+            int n = Header_GetItemCount(hwnd);
+            if (n > 0) {
+                RECT lastRc; Header_GetItemRect(hwnd, n - 1, &lastRc);
+                if (lastRc.right < rc.right) {
+                    RECT gap = { lastRc.right, rc.top, rc.right, rc.bottom };
+                    FillRect(dc, &gap, br);
+                }
+            }
+            DeleteObject(br);
+            ReleaseDC(hwnd, dc);
+            return r;
+        }
+    }
+    return CallWindowProc(g_OldHdrProc, hwnd, msg, wp, lp);
+}
+
+static void CreateColumnHeader(HWND hwnd)
+{
+    HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
+    hColumnHeader = CreateWindowEx(0, WC_HEADER, NULL,
+        WS_CHILD | HDS_HORZ | HDS_BUTTONS | HDS_DRAGDROP | HDS_FULLDRAG | CCS_NORESIZE,
+        0, 0, 0, 0, hwnd, (HMENU)ID_COLUMNVIEW, hInst, NULL);
+    SendMessage(hColumnHeader, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+    g_OldHdrProc = (WNDPROC)SetWindowLongPtr(hColumnHeader, GWLP_WNDPROC, (LONG_PTR)HdrSubProc);
+    RebuildColumnHeader();
+}
+
+static void ToggleColumnView()
+{
+    g_columnView = !g_columnView;
+    // Column view needs owner-draw — recreate listbox if needed
+    RecreateListbox();
+    ShowWindow(hColumnHeader, g_columnView ? SW_SHOW : SW_HIDE);
+    LayoutControls(g_hwnd);
+    HMENU hm = GetMenu(g_hwnd);
+    if (hm) CheckMenuItem(hm, IDM_VIEW_COLUMNS,
+        MF_BYCOMMAND | (g_columnView ? MF_CHECKED : MF_UNCHECKED));
 }
 
 // ============================================================
@@ -9373,11 +10214,23 @@ void LayoutControls(HWND hwnd)
     int volBot = ty + th;
     MoveWindow(hVolumeCanvas, vx, volTop, vw, volBot - volTop, TRUE);
 
-    // Playlist
+    // Playlist + optional column header
     int ly = ty + th + 2;
+    int lw = rc.right - 2 * m;
+    if (g_columnView && hColumnHeader) {
+        // Use WINDOWPOS/HDM_LAYOUT to get proper header height
+        HDLAYOUT hdl = {};
+        WINDOWPOS wp = {};
+        RECT hdrRc = { m, ly, m + lw, ly + 200 };
+        hdl.prc = &hdrRc;
+        hdl.pwpos = &wp;
+        Header_Layout(hColumnHeader, &hdl);
+        MoveWindow(hColumnHeader, wp.x, wp.y, wp.cx, wp.cy, TRUE);
+        ly += wp.cy;
+    }
     int lh = rc.bottom - sbh - ly - m;
     if (lh < 60) lh = 60;
-    MoveWindow(hListBox, m, ly, rc.right - 2 * m, lh, TRUE);
+    MoveWindow(hListBox, m, ly, lw, lh, TRUE);
 }
 
 // ============================================================
@@ -9469,10 +10322,10 @@ bool HandleGlobalKey(WPARAM vk)
             MF_BYCOMMAND | (g_shuffle ? MF_CHECKED : MF_UNCHECKED));
         InvalidateRect(hShuffleBtn, NULL, TRUE); return true;
     case 'R':
-        g_repeatMode = (g_repeatMode + 1) % 3; // cycle: off -> track -> playlist -> off
+        g_repeatMode = (g_repeatMode + 1) % 4; // cycle: off -> track -> playlist -> once -> off
         CheckMenuItem(GetMenu(g_hwnd), IDM_PLAY_REPEAT,
             MF_BYCOMMAND | (g_repeatMode ? MF_CHECKED : MF_UNCHECKED));
-        InvalidateRect(hRepeatBtn, NULL, TRUE);  return true;
+        InvalidateRect(hRepeatBtn, NULL, TRUE); PreloadNext(); return true;
     case VK_UP:
         if (!(GetKeyState(VK_CONTROL) & 0x8000)) return false; // only Ctrl+Up for volume
         currentVolume = min(1.0f, currentVolume + 0.05f);
@@ -9677,7 +10530,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         SendMessage(hVolPct, WM_SETFONT, (WPARAM)g_fontMono, TRUE);
 
         hListBox = CreateWindowEx(0, L"LISTBOX", NULL,
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_EXTENDEDSEL,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_EXTENDEDSEL
+            | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
             0, 0, 0, 0, hwnd, (HMENU)ID_LISTBOX, hInst, NULL);
         SendMessage(hListBox, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
         SendMessage(hListBox, LB_SETITEMHEIGHT, 0, 20);
@@ -9707,6 +10561,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         // Subclass for dark mode text color
         g_OldStatusProc = (WNDPROC)SetWindowLongPtr(hStatus, GWLP_WNDPROC, (LONG_PTR)StatusBarProc);
 
+        // Column header (real Win32 Header control, supports drag-reorder)
+        InitColOrder();
+        CreateColumnHeader(hwnd);
+
         LoadSettings();
         LoadFavorites();
         ApplyTheme();  // re-apply after LoadSettings so dark mode is applied on startup
@@ -9714,6 +10572,28 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         LayoutControls(hwnd);
         UpdateVolume();
         UpdateStatusBar();
+
+        // Apply loaded column layout — rebuild header without saving (would overwrite loaded values)
+        if (hColumnHeader) {
+            while (Header_GetItemCount(hColumnHeader) > 0)
+                Header_DeleteItem(hColumnHeader, 0);
+            int pos = 0;
+            for (int i = 0; i < COL_COUNT; i++) {
+                int cid = g_colOrder[i];
+                if (!g_colVisible[cid]) continue;
+                HDITEM hdi = {};
+                hdi.mask = HDI_TEXT | HDI_WIDTH | HDI_FORMAT | HDI_LPARAM;
+                hdi.pszText = (LPWSTR)COL_HDR_LABELS[cid];
+                hdi.cxy = g_colWidth[cid];
+                hdi.fmt = COL_FMT[cid] | HDF_STRING;
+                hdi.lParam = cid;
+                Header_InsertItem(hColumnHeader, pos++, &hdi);
+            }
+        }
+        if (g_columnView) {
+            ShowWindow(hColumnHeader, SW_SHOW);
+            RecreateListbox();
+        }
 
         // Register global media key hotkeys
         RegisterHotKey(hwnd, ID_HOTKEY_PLAYPAUSE, 0, VK_MEDIA_PLAY_PAUSE);
@@ -9781,7 +10661,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_MEASUREITEM: {
         MEASUREITEMSTRUCT* ms = (MEASUREITEMSTRUCT*)lParam;
         if (ms->CtlType == ODT_LISTBOX && ms->CtlID == ID_LISTBOX) {
-            ms->itemHeight = THUMB_SZ + 4;
+            ms->itemHeight = g_modernStyle ? (THUMB_SZ + 4) : 20;
             return TRUE;
         }
         if (ms->CtlType == ODT_MENU) {
@@ -9865,7 +10745,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             SelectObject(dis->hDC, fntOld);
             return TRUE;
         }
-        // Owner-draw listbox — favorites highlight + Modern Style artwork
+        // Owner-draw listbox — favorites highlight + Modern Style artwork + Column View
         if (dis->CtlType == ODT_LISTBOX && dis->CtlID == ID_LISTBOX) {
             int idx = (int)dis->itemID;
             int lbCount = (int)SendMessage(dis->hwndItem, LB_GETCOUNT, 0, 0);
@@ -9888,24 +10768,82 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             else if (!g_browserActive && idx < (int)g_playlist.size())
                 trackPath = g_playlist[idx].path;
             bool isFav = !g_favActive && trackPath && IsFavorite(trackPath);
+            // Check if this item is the currently playing track
+            bool isPlaying = false;
+            if (!g_browserActive && g_currentIndex >= 0 && currentStream) {
+                isPlaying = (idx == g_currentIndex);
+            }
 
-            // Colors with favorite tint
+            // Colors: playing track gets a distinct tint, separate from selection
             COLORREF bgCol, txCol;
             if (g_darkMode) {
-                bgCol = selected ? RGB(30, 80, 160) : (isFav ? RGB(38, 55, 60) : g_theme.bgList);
-                txCol = selected ? RGB(255, 255, 255) : (isFav ? RGB(140, 200, 220) : g_theme.text);
+                if (selected)
+                    { bgCol = RGB(30, 80, 160); txCol = RGB(255, 255, 255); }
+                else if (isPlaying)
+                    { bgCol = RGB(34, 38, 46); txCol = g_theme.accent; }
+                else if (isFav)
+                    { bgCol = RGB(38, 55, 60); txCol = RGB(140, 200, 220); }
+                else
+                    { bgCol = g_theme.bgList; txCol = g_theme.text; }
             } else {
-                bgCol = selected ? GetSysColor(COLOR_HIGHLIGHT) : (isFav ? RGB(220, 235, 250) : GetSysColor(COLOR_WINDOW));
-                txCol = selected ? GetSysColor(COLOR_HIGHLIGHTTEXT) : (isFav ? RGB(30, 80, 140) : GetSysColor(COLOR_WINDOWTEXT));
+                if (selected)
+                    { bgCol = GetSysColor(COLOR_HIGHLIGHT); txCol = GetSysColor(COLOR_HIGHLIGHTTEXT); }
+                else if (isPlaying)
+                    { bgCol = RGB(235, 242, 252); txCol = RGB(30, 80, 160); }
+                else if (isFav)
+                    { bgCol = RGB(220, 235, 250); txCol = RGB(30, 80, 140); }
+                else
+                    { bgCol = GetSysColor(COLOR_WINDOW); txCol = GetSysColor(COLOR_WINDOWTEXT); }
             }
 
             HBRUSH br = CreateSolidBrush(bgCol);
             FillRect(dc, &rc, br); DeleteObject(br);
             SetBkMode(dc, TRANSPARENT);
             SetTextColor(dc, txCol);
-            HFONT oldFont = (HFONT)SelectObject(dc, g_fontUI);
+            HFONT oldFont = (HFONT)SelectObject(dc, isPlaying ? g_fontBold : g_fontUI);
 
             int textLeft = rc.left + 4;
+
+            // Column View: draw columns using the Header control layout
+            // Skip for browser items (folders, go-back) — draw those as plain text
+            if (g_columnView && !g_browserActive) {
+                RECT colRects[COL_COUNT]; int colIDs[COL_COUNT];
+                int nCols = GetColumnRects(rc, colRects, colIDs, COL_COUNT);
+
+                for (int c = 0; c < nCols; c++) {
+                    RECT cr = colRects[c];
+                    cr.top = rc.top; cr.bottom = rc.bottom;
+
+                    // For COL_NAME with modern style: draw thumbnail then text
+                    if (colIDs[c] == COL_NAME && g_modernStyle) {
+                        int thumbX = cr.left + 2;
+                        int thumbY = cr.top + (cr.bottom - cr.top - THUMB_SZ) / 2;
+                        HBITMAP thumb = trackPath ? GetThumbForPath(trackPath) : g_thumbPlaceholder;
+                        if (!thumb) thumb = g_thumbPlaceholder;
+                        if (thumb) {
+                            HDC mdc = CreateCompatibleDC(dc);
+                            HBITMAP ob = (HBITMAP)SelectObject(mdc, thumb);
+                            BitBlt(dc, thumbX, thumbY, THUMB_SZ, THUMB_SZ, mdc, 0, 0, SRCCOPY);
+                            SelectObject(mdc, ob); DeleteDC(mdc);
+                        }
+                        cr.left += THUMB_SZ + 6;
+                    } else {
+                        cr.left += 4;
+                    }
+                    cr.right -= 2;
+
+                    wchar_t colText[MAX_PATH] = L"";
+                    GetColumnText(colIDs[c], idx, trackPath, text, colText, MAX_PATH);
+
+                    UINT fmt = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
+                    fmt |= (COL_FMT[colIDs[c]] == HDF_RIGHT) ? DT_RIGHT : DT_LEFT;
+                    DrawText(dc, colText, -1, &cr, fmt);
+                }
+
+                if (dis->itemState & ODS_FOCUS) DrawFocusRect(dc, &rc);
+                SelectObject(dc, oldFont);
+                return TRUE;
+            }
 
             // Modern Style: draw artwork thumbnail on the left
             if (g_modernStyle) {
@@ -9959,6 +10897,110 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_DROPFILES:
         HandleDrop((HDROP)wParam);
         break;
+
+    case WM_NOTIFY: {
+        NMHDR* nm = (NMHDR*)lParam;
+        // Dark mode custom-draw for the Header control
+        if (g_darkMode && hColumnHeader && nm->hwndFrom == hColumnHeader && nm->code == NM_CUSTOMDRAW) {
+            NMCUSTOMDRAW* cd = (NMCUSTOMDRAW*)lParam;
+            switch (cd->dwDrawStage) {
+            case CDDS_PREPAINT: {
+                RECT hrc; GetClientRect(hColumnHeader, &hrc);
+                HBRUSH bgBr = CreateSolidBrush(0x383838);
+                FillRect(cd->hdc, &hrc, bgBr); DeleteObject(bgBr);
+                return CDRF_NOTIFYITEMDRAW;
+            }
+            case CDDS_ITEMPREPAINT: {
+                HDC hdc = cd->hdc;
+                int itemIdx = (int)cd->dwItemSpec;
+                bool isHot = (itemIdx == g_hdrHotItem);
+                HDITEM hdiLp = {}; hdiLp.mask = HDI_LPARAM;
+                Header_GetItem(hColumnHeader, itemIdx, &hdiLp);
+                int cid = (int)hdiLp.lParam;
+                bool isSorted = (cid == g_sortCol && g_sortCol >= 0);
+
+                COLORREF bgc = isHot ? 0x484848 : (isSorted ? 0x404040 : 0x383838);
+                HBRUSH br = CreateSolidBrush(bgc);
+                FillRect(hdc, &cd->rc, br); DeleteObject(br);
+                HPEN pen = CreatePen(PS_SOLID, 1, 0x585858);
+                HPEN op = (HPEN)SelectObject(hdc, pen);
+                MoveToEx(hdc, cd->rc.left, cd->rc.bottom - 1, NULL);
+                LineTo(hdc, cd->rc.right, cd->rc.bottom - 1);
+                MoveToEx(hdc, cd->rc.right - 1, cd->rc.top + 2, NULL);
+                LineTo(hdc, cd->rc.right - 1, cd->rc.bottom - 2);
+                SelectObject(hdc, op); DeleteObject(pen);
+                SetTextColor(hdc, isHot ? 0xFFFFFF : g_theme.text);
+                SetBkMode(hdc, TRANSPARENT);
+                HFONT oldF = (HFONT)SelectObject(hdc, g_fontUI);
+                wchar_t txt[64] = {};
+                HDITEM hdi = {}; hdi.mask = HDI_TEXT | HDI_FORMAT;
+                hdi.pszText = txt; hdi.cchTextMax = 64;
+                Header_GetItem(hColumnHeader, itemIdx, &hdi);
+                RECT tr = cd->rc; tr.left += 6;
+                tr.right -= isSorted ? 16 : 4;
+                UINT dtFmt = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
+                dtFmt |= (hdi.fmt & HDF_RIGHT) ? DT_RIGHT : DT_LEFT;
+                DrawText(hdc, txt, -1, &tr, dtFmt);
+                if (isSorted) {
+                    const wchar_t* arrow = g_sortAsc ? L"\u25B2" : L"\u25BC";
+                    SetTextColor(hdc, g_theme.accent);
+                    RECT ar = { cd->rc.right - 14, cd->rc.top, cd->rc.right - 2, cd->rc.bottom };
+                    DrawText(hdc, arrow, 1, &ar, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+                }
+                SelectObject(hdc, oldF);
+                return CDRF_SKIPDEFAULT;
+            }
+            }
+        }
+        if (nm->hwndFrom == hColumnHeader) {
+            switch (nm->code) {
+            case HDN_ITEMCHANGED:   // column resized
+                InvalidateRect(hListBox, NULL, FALSE);
+                break;
+            case HDN_ITEMCLICK: {  // column header clicked — sort
+                NMHEADER* nhdr = (NMHEADER*)lParam;
+                HDITEM hdi = {}; hdi.mask = HDI_LPARAM;
+                Header_GetItem(hColumnHeader, nhdr->iItem, &hdi);
+                int cid = (int)hdi.lParam;
+                if (cid == g_sortCol) {
+                    if (g_sortAsc) {
+                        g_sortAsc = false;                    // asc -> desc
+                        SortPlaylistByColumn(g_sortCol, g_sortAsc);
+                    } else {
+                        g_sortCol = -1; g_sortAsc = true;    // desc -> restore original
+                        RestoreUnsortedPlaylist();
+                    }
+                } else {
+                    g_sortCol = cid; g_sortAsc = true;       // new column -> asc
+                    SortPlaylistByColumn(g_sortCol, g_sortAsc);
+                }
+                InvalidateRect(hColumnHeader, NULL, FALSE);
+                break;
+            }
+            case HDN_TRACK: {      // column being resized — enforce minimum width
+                NMHEADER* nhdr = (NMHEADER*)lParam;
+                if (nhdr->pitem && (nhdr->pitem->mask & HDI_WIDTH)) {
+                    if (nhdr->pitem->cxy < 30) { nhdr->pitem->cxy = 30; return TRUE; }
+                }
+                break;
+            }
+            case HDN_ENDDRAG: {    // column reordered via drag
+                // Let the system apply the drag, then on next tick read back
+                // the new order and rebuild our header to match.
+                // Returning FALSE allows the header to apply the move itself.
+                // We then pick up the result in a deferred message.
+                PostMessage(hwnd, WM_APP + 98, 0, 0);
+                return FALSE;
+            }
+            case NM_RCLICK: {
+                POINT pt; GetCursorPos(&pt);
+                ShowColumnPickerMenu(hwnd, pt);
+                break;
+            }
+            }
+        }
+        break;
+    }
 
     case WM_HOTKEY:
         switch ((int)wParam) {
@@ -10208,10 +11250,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 MF_BYCOMMAND | (g_shuffle ? MF_CHECKED : MF_UNCHECKED));
             InvalidateRect(hShuffleBtn, NULL, TRUE); break;
         case ID_BTN_REPEAT:
-            g_repeatMode = (g_repeatMode + 1) % 3;
+            g_repeatMode = (g_repeatMode + 1) % 4;
             CheckMenuItem(GetMenu(g_hwnd), IDM_PLAY_REPEAT,
                 MF_BYCOMMAND | (g_repeatMode ? MF_CHECKED : MF_UNCHECKED));
-            InvalidateRect(hRepeatBtn, NULL, TRUE); break;
+            InvalidateRect(hRepeatBtn, NULL, TRUE); PreloadNext(); break;
         case ID_BTN_BACK: {
             if (g_browserActive && !g_browserItems.empty() && g_browserItems[0].isDir
                 && wcsstr(g_browserItems[0].display, L"[..]") != NULL) {
@@ -10401,6 +11443,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             ToggleModernStyle();
             SaveSettings();
             break;
+        case IDM_VIEW_COLUMNS:
+            ToggleColumnView();
+            SaveSettings();
+            break;
 
         case IDM_OPTIONS_FILEASSOC: OpenFileAssocDialog(); break;
 
@@ -10413,9 +11459,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             CheckMenuItem(GetMenu(hwnd), IDM_PLAY_SHUFFLE, g_shuffle ? MF_CHECKED : MF_UNCHECKED);
             InvalidateRect(hShuffleBtn, NULL, TRUE); break;
         case IDM_PLAY_REPEAT:
-            g_repeatMode = (g_repeatMode + 1) % 3;
+            g_repeatMode = (g_repeatMode + 1) % 4;
             CheckMenuItem(GetMenu(hwnd), IDM_PLAY_REPEAT, g_repeatMode ? MF_CHECKED : MF_UNCHECKED);
-            InvalidateRect(hRepeatBtn, NULL, TRUE); break;
+            InvalidateRect(hRepeatBtn, NULL, TRUE); PreloadNext(); break;
 
         case IDM_HELP_UPDATE: {
             // Fetch latest release tag from GitHub API with 5s timeout
@@ -10474,7 +11520,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         case IDM_HELP_ABOUT:
             MessageBox(hwnd,
-                L"BillyPro V0.8\n\n"
+                L"BillyPro V0.9\n\n"
                 L"Lightweight Music Player\n\n"
                 L"Created by MRJN/CLD.",
                 L"About BillyPro", MB_ICONINFORMATION);
@@ -10634,6 +11680,43 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             else PlayNext();
         }
         UpdateThumbButtons();
+        break;
+
+    // Deferred: system applied column drag — read back the new order and rebuild
+    case WM_APP + 98: {
+        if (!hColumnHeader) break;
+        int n = Header_GetItemCount(hColumnHeader);
+        if (n <= 0) break;
+        // Read the order array the system applied
+        std::vector<int> order(n);
+        Header_GetOrderArray(hColumnHeader, n, order.data());
+        // Collect items in the new visual order, then rebuild header sequentially
+        struct CI { wchar_t txt[64]; int w; int fmt; LPARAM lp; };
+        std::vector<CI> sorted(n);
+        for (int i = 0; i < n; i++) {
+            int idx = order[i];
+            HDITEM hdi = {}; hdi.mask = HDI_TEXT | HDI_WIDTH | HDI_FORMAT | HDI_LPARAM;
+            hdi.pszText = sorted[i].txt; hdi.cchTextMax = 64;
+            Header_GetItem(hColumnHeader, idx, &hdi);
+            sorted[i].w = hdi.cxy; sorted[i].fmt = hdi.fmt; sorted[i].lp = hdi.lParam;
+        }
+        while (Header_GetItemCount(hColumnHeader) > 0)
+            Header_DeleteItem(hColumnHeader, 0);
+        for (int i = 0; i < n; i++) {
+            HDITEM hdi = {};
+            hdi.mask = HDI_TEXT | HDI_WIDTH | HDI_FORMAT | HDI_LPARAM;
+            hdi.pszText = sorted[i].txt; hdi.cxy = sorted[i].w;
+            hdi.fmt = sorted[i].fmt; hdi.lParam = sorted[i].lp;
+            Header_InsertItem(hColumnHeader, i, &hdi);
+        }
+        if (g_columnView && hListBox) InvalidateRect(hListBox, NULL, FALSE);
+        SaveSettings();
+        break;
+    }
+
+    // Deferred column view redraw after header drag-reorder completes
+    case WM_APP + 99:
+        if (g_columnView && hListBox) InvalidateRect(hListBox, NULL, FALSE);
         break;
 
     case WM_DESTROY:
@@ -10804,6 +11887,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
 
     AppendMenu(hView, MF_STRING, IDM_VIEW_DARKMODE,  L"Dark Mode");
     AppendMenu(hView, MF_STRING, IDM_VIEW_MODERN,   L"Modern Style");
+    AppendMenu(hView, MF_STRING, IDM_VIEW_COLUMNS,  L"Column View");
 
     AppendMenu(hOpts, MF_STRING, IDM_OPTIONS, L"Options...");
 
@@ -10837,7 +11921,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
     SetMenu(hwnd, hMenu);
 
     // Now that the menu exists, apply persisted checkmarks
-    if (g_darkMode)   CheckMenuItem(hMenu, IDM_VIEW_DARKMODE, MF_BYCOMMAND | MF_CHECKED);
+    if (g_darkMode)    CheckMenuItem(hMenu, IDM_VIEW_DARKMODE,  MF_BYCOMMAND | MF_CHECKED);
+    if (g_columnView)  CheckMenuItem(hMenu, IDM_VIEW_COLUMNS,  MF_BYCOMMAND | MF_CHECKED);
     if (g_modernStyle) {
         CheckMenuItem(hMenu, IDM_VIEW_MODERN, MF_BYCOMMAND | MF_CHECKED);
         g_thumbPlaceholder = CreatePlaceholderBitmap();
@@ -10909,6 +11994,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
             }
         }
     }
+
+    // Sync column view now that playlist is loaded
+    if (g_columnView) SyncColumnView();
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
