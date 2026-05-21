@@ -8,7 +8,7 @@
 
 [![Download](https://img.shields.io/badge/Download-Latest%20Release-orange?style=for-the-badge)](../../releases/latest)
 
-![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Language](https://img.shields.io/badge/language-C%2B%2B-informational) ![RAM](https://img.shields.io/badge/RAM-%3C5MB-brightgreen) ![CPU](https://img.shields.io/badge/CPU-~0%25-brightgreen) ![License](https://img.shields.io/badge/license-MIT-lightgrey) [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/4TZTuC57jV)
+![Platform](https://img.shields.io/badge/platform-Windows-blue) ![Language](https://img.shields.io/badge/language-C%2B%2B-informational) ![RAM](https://img.shields.io/badge/RAM-%3C5MB-brightgreen) ![CPU](https://img.shields.io/badge/CPU-~0%25-brightgreen) ![License](https://img.shields.io/badge/license-MIT-lightgrey) [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/tadXB7BaGH)
 
 ---
 
